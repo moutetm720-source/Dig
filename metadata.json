@@ -1,0 +1,6 @@
+{
+  "name": "Digital Product Factory",
+  "description": "Autonomous SaaS platform for discovering market opportunities, generating high-value digital products, marketing, automated pricing, and orchestrating multi-channel sales.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

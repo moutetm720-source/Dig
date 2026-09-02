@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Allow: /store
+Allow: /products/
+Allow: /bundles/
+
+Sitemap: https://nexusdigitallabs.com/sitemap.xml
