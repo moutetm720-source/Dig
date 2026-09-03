@@ -87,3 +87,22 @@ function buildClient() {
 
 const client = buildClient();
 export const db = drizzle({ client, schema });
+
+let schemaReady: Promise<boolean> | null = null;
+export function ensureSchema(): Promise<boolean> {
+  if (!schemaReady) {
+    schemaReady = (async () => {
+      try {
+        await client.unsafe(
+          `CREATE TABLE IF NOT EXISTS key_value_store (key TEXT PRIMARY KEY, value JSONB NOT NULL)`
+        );
+        console.log('[DB] Schéma prêt (table key_value_store présente).');
+        return true;
+      } catch (e: any) {
+        console.error('[DB] ERREUR SCHÉMA — PostgreSQL injoignable ou table impossible à créer. Vérifiez DATABASE_URL (base liée ? sslmode=require ? mot de passe ?).', e?.message || e);
+        return false;
+      }
+    })();
+  }
+  return schemaReady;
+}
