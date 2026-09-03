@@ -101,7 +101,15 @@ export function App() {
       const urlPasscode = searchParams.get('passcode') || searchParams.get('token');
       const activePasscode = localStorage.getItem('df_moderator_passcode') || '2026';
       if (urlPasscode && (urlPasscode === activePasscode || urlPasscode === '2026' || urlPasscode === 'admin')) {
-        localStorage.setItem('df_user_role', 'moderator');
+        try {
+          localStorage.setItem('df_user_role', 'moderator');
+        } catch (quotaError) {
+          localStorage.removeItem('df_broadcast_history');
+          localStorage.removeItem('dpf_app_v2_systemLogs');
+          localStorage.removeItem('df_systemLogs');
+          localStorage.removeItem('df_sales_scout_history_real');
+          localStorage.setItem('df_user_role', 'moderator');
+        }
         setIsModerator(true);
         setIsStorefrontOpen(false);
         const cleanUrl = window.location.pathname;

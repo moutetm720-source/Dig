@@ -25,7 +25,15 @@ export const ModeratorAuthModal: React.FC<ModeratorAuthModalProps> = ({ isOpen, 
       const inputTrimmed = passcode.trim();
 
       if (inputTrimmed === activePasscode || (activePasscode === '2026' && inputTrimmed === 'admin')) {
-        localStorage.setItem('df_user_role', 'moderator');
+        try {
+          localStorage.setItem('df_user_role', 'moderator');
+        } catch (quotaError) {
+          localStorage.removeItem('df_broadcast_history');
+          localStorage.removeItem('dpf_app_v2_systemLogs');
+          localStorage.removeItem('df_systemLogs');
+          localStorage.removeItem('df_sales_scout_history_real');
+          localStorage.setItem('df_user_role', 'moderator');
+        }
         setIsLoading(false);
         setPasscode('');
         onSuccess();
