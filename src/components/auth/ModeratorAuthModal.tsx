@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { ShieldCheck, Lock, Key, AlertCircle, Eye, EyeOff, X } from 'lucide-react';
+import { saveSessionToken } from '../../services/authToken';
 
 interface ModeratorAuthModalProps {
   isOpen: boolean;
@@ -21,26 +22,88 @@ export const ModeratorAuthModal: React.FC<ModeratorAuthModalProps> = ({ isOpen, 
     setError(null);
 
     setTimeout(() => {
-      const activePasscode = localStorage.getItem('df_moderator_passcode') || '2026';
+      // Le passcode saisi est confronté au passcode serveur par l'API (Bearer).
+      // Aucun défaut faible en dur : le premier accès utilise le passcode
+      // auto-généré par le serveur (log serveur) ou MODERATOR_PASSCODE (env).
+      const storedPasscode = (localStorage.getItem('df_moderator_passcode') || '').trim();
       const inputTrimmed = passcode.trim();
 
-      if (inputTrimmed === activePasscode || (activePasscode === '2026' && inputTrimmed === 'admin')) {
+      const persistPasscode = (input: string) => {
         try {
+          localStorage.setItem('df_moderator_passcode', input);
           localStorage.setItem('df_user_role', 'moderator');
         } catch (quotaError) {
           localStorage.removeItem('df_broadcast_history');
           localStorage.removeItem('dpf_app_v2_systemLogs');
           localStorage.removeItem('df_systemLogs');
           localStorage.removeItem('df_sales_scout_history_real');
+          localStorage.setItem('df_moderator_passcode', input);
           localStorage.setItem('df_user_role', 'moderator');
         }
+      };
+
+      const finishUnlock = () => {
         setIsLoading(false);
         setPasscode('');
         onSuccess();
-      } else {
-        setIsLoading(false);
-        setError('Code d’accès incorrect. Vérifiez vos identifiants.');
-      }
+      };
+
+      // Émet un TOKEN DE SESSION signé côté serveur (expiration 7 j).
+      // Si le serveur est injoignable, on continue avec le passcode
+      // (le serveur l'accepte encore en compatibilité).
+      const tryUnlock = async (input: string) => {
+        persistPasscode(input);
+        try {
+          const loginRes = await fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ passcode: input })
+          });
+          if (loginRes.ok) {
+            const data = await loginRes.json();
+            if (data?.token) saveSessionToken(data.token);
+          }
+        } catch (e) {
+          // offline / serveur indisponible : le passcode direct reste valide
+        }
+        finishUnlock();
+      };
+
+      // Si un passcode est déjà connu dans ce navigateur, on le valide d'abord
+      // côté serveur (appel silencieux) ; sinon on tente le passcode saisi.
+      const candidates = storedPasscode && storedPasscode !== inputTrimmed
+        ? [inputTrimmed, storedPasscode]
+        : [inputTrimmed];
+
+      const validateCandidate = (idx: number) => {
+        if (idx >= candidates.length) {
+          setIsLoading(false);
+          setError('Code d’accès incorrect. Vérifiez vos identifiants.');
+          return;
+        }
+        const candidate = candidates[idx];
+        if (!candidate) {
+          validateCandidate(idx + 1);
+          return;
+        }
+        fetch('/api/store/get?key=df_current_geo_v1', {
+          headers: { 'Authorization': `Bearer ${candidate}` }
+        })
+          .then(r => {
+            if (r.ok || r.status === 404) {
+              // Auth acceptée (404 = clé inexistante mais modérateur reconnu)
+              tryUnlock(candidate);
+            } else {
+              validateCandidate(idx + 1);
+            }
+          })
+          .catch(() => {
+            // Serveur injoignable : on laisse la décision locale (le passcode
+            // saisi devient la référence dans ce navigateur).
+            tryUnlock(candidate);
+          });
+      };
+      validateCandidate(0);
     }, 350);
   };
 

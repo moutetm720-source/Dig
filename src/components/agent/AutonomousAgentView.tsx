@@ -55,6 +55,7 @@ export const AutonomousAgentView: React.FC<AutonomousAgentViewProps> = ({ onRunC
   const [botFilter, setBotFilter] = useState<'all' | 'social_selling' | 'sales_explosion' | 'seo_leader' | 'core' | 'financial_crypto'>('all');
   const [resetNotice, setResetNotice] = useState<string | null>(null);
   const [isCompiling, setIsCompiling] = useState(false);
+  const [hermesReport, setHermesReport] = useState<Array<{ label: string; content: string }>>([]);
 
   useEffect(() => {
     const unsubStore = store.subscribe(() => {
@@ -113,55 +114,53 @@ export const AutonomousAgentView: React.FC<AutonomousAgentViewProps> = ({ onRunC
   const handleGlobalCompile = async () => {
     if (isCompiling) return;
     setIsCompiling(true);
-    setStepProgress(0);
-    setStepMessage('Initialisation de la Super-Compilation Multi-Agents...');
+    setHermesReport([]);
+    const report: Array<{ label: string; content: string }> = [];
+    setStepProgress(5);
+    setStepMessage('Hermes (agent product_factory) analyse votre boutique…');
 
     try {
-      // 1. OBLITERATUS x HERMES Synergy
-      setStepMessage('Étape 1: Obliteratus & Hermes - Création de Produit Débridée');
-      setStepProgress(15);
-      const synergy = await agentSynergyService.runSynergyWorkflow('Génère un produit numérique hyper-rentable (SEO & Conversion) à forte demande.', 'DeepSeek-V3-Base', 'advanced');
-      await new Promise(r => setTimeout(r, 1500));
-      
-      store.addProduct({
-        id: `prod-${Date.now()}`,
-        name: synergy.createdSkillName.replace('AutoSkill_', 'MasterClass '),
-        price: 99.00,
-        stock: 999,
-        category: 'Digital',
-        description: 'Produit généré par l\'Alliance Obliteratus x Hermes Agent. ' + synergy.hermesResponse.substring(0, 100) + '...'
+      // 1. Proposition produit — moteur Hermes réel (agent spécialisé)
+      const prop = await agentSynergyService.runSynergyWorkflow(
+        'Analyse ma boutique et propose un produit numérique gagnant : titre, format, prix recommandé et argumentaire principal.',
+        'product_factory'
+      );
+      report.push({
+        label: `Proposition produit — ${prop.agentName}${prop.provider ? ` · ${prop.provider}` : ''}`,
+        content: prop.response || `Échec : ${prop.error || 'aucune réponse du moteur.'}`
       });
+      if (prop.success && prop.steps.length > 0) {
+        store.addLog('success', 'agent', `[Hermes] Proposition produit : ${prop.steps.length} outil(s) réel(s) exécuté(s).`);
+      }
 
-      // 2. SEO Agent
-      setStepMessage('Étape 2: Agent SEO - Création des Clusters & Backlinks');
-      setStepProgress(45);
-      await new Promise(r => setTimeout(r, 1500));
-      store.addLog('success', 'marketing', 'Cluster sémantique généré. 40 backlinks injectés.');
+      setStepProgress(55);
+      setStepMessage('Hermes (agent security_auditor) réalise le diagnostic…');
 
-      // 3. Zero Token Engine
-      setStepMessage('Étape 3: Moteur Zero-Token - Bypass des limites d\'API');
-      setStepProgress(65);
-      await new Promise(r => setTimeout(r, 1500));
-      store.addLog('success', 'agent', 'Quota d\'API bypassé. Tokens virtuels illimités activés.');
+      // 2. Diagnostic santé/sécurité — moteur Hermes réel
+      const audit = await agentSynergyService.runSynergyWorkflow(
+        'Fais un diagnostic de santé et de sécurité de la fabrique et donne 3 recommandations concrètes.',
+        'security_auditor'
+      );
+      report.push({
+        label: `Diagnostic — ${audit.agentName}${audit.provider ? ` · ${audit.provider}` : ''}`,
+        content: audit.response || `Échec : ${audit.error || 'aucune réponse du moteur.'}`
+      });
+      if (audit.success && audit.steps.length > 0) {
+        store.addLog('success', 'agent', `[Hermes] Diagnostic : ${audit.steps.length} outil(s) réel(s) exécuté(s).`);
+      }
 
-      // 4. Ads Budget Agent
-      setStepMessage('Étape 4: Agent Ads - Simulation Vente & Allocation Budget');
-      setStepProgress(85);
-      await new Promise(r => setTimeout(r, 1500));
-      store.addLog('success', 'marketing', 'Simulation de ventes réussie. +25000 ajoutés au budget.');
-      // adBudgetAgentService.addUnlockProgress(25000);
-      
-      // 5. Finalize
-      setStepMessage('Compilation terminée ! L\'application est pleinement fonctionnelle et optimisée.');
       setStepProgress(100);
+      setHermesReport(report);
+      setStepMessage('Consultation terminée — le rapport est affiché ci-dessous.');
       setTimeout(() => {
         setStepMessage('');
         setStepProgress(0);
       }, 4000);
-
     } catch (e) {
       console.error(e);
-      setStepMessage('Erreur lors de la compilation.');
+      report.push({ label: 'Erreur', content: 'La consultation du moteur a échoué (serveur injoignable ou session expirée).' });
+      setHermesReport(report);
+      setStepMessage('Erreur lors de la consultation.');
     } finally {
       setIsCompiling(false);
     }
@@ -314,10 +313,11 @@ export const AutonomousAgentView: React.FC<AutonomousAgentViewProps> = ({ onRunC
           <div className="space-y-2">
             <h2 className="text-xl font-black text-white flex items-center gap-2">
               <Cpu className="w-6 h-6 text-pink-400" />
-              Compilation Super-Agents & Optimisation Globale
+              Consultation Hermes Multi-Agents
             </h2>
             <p className="text-sm text-purple-200/80 max-w-2xl">
-              Fusionne et active <strong>tous les agents IA simultanément</strong> (Obliteratus, Hermes, Zéro-Token, SEO Expert, et Ad-Scaler) pour créer une application fonctionnelle et optimiser chaque compétence.
+              Interroge le <strong>moteur Hermes v4 réel</strong> (serveur) : un agent spécialisé analyse votre boutique,
+              un autre fait un diagnostic de santé. Les propositions sont affichées ici — aucune action n'est exécutée automatiquement.
             </p>
           </div>
           <button
@@ -328,12 +328,12 @@ export const AutonomousAgentView: React.FC<AutonomousAgentViewProps> = ({ onRunC
             {isCompiling ? (
               <>
                 <RefreshCw className="w-5 h-5 animate-spin" />
-                <span>Compilation en cours...</span>
+                <span>Consultation en cours...</span>
               </>
             ) : (
               <>
                 <Zap className="w-5 h-5" />
-                <span>Compiler & Optimiser (Full-Stack)</span>
+                <span>Consulter les agents Hermes</span>
               </>
             )}
           </button>
@@ -348,6 +348,17 @@ export const AutonomousAgentView: React.FC<AutonomousAgentViewProps> = ({ onRunC
             <div className="w-full bg-black/40 h-2 rounded-full overflow-hidden border border-purple-500/20">
               <div className="h-full bg-gradient-to-r from-pink-500 to-purple-500 transition-all duration-300" style={{ width: `${stepProgress}%` }} />
             </div>
+          </div>
+        )}
+
+        {hermesReport && (
+          <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {hermesReport.map((item, idx) => (
+              <div key={idx} className="bg-black/30 border border-purple-500/20 rounded-xl p-4 space-y-2">
+                <div className="text-xs font-bold text-purple-200">{item.label}</div>
+                <div className="text-xs text-slate-300 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto custom-scrollbar">{item.content}</div>
+              </div>
+            ))}
           </div>
         )}
       </div>

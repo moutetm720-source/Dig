@@ -6,6 +6,7 @@ import {
   SearchIndexingRadar
 } from '../types';
 import { store } from './store';
+import { getAuthBearer } from './authToken';
 import { safeSetItem } from '../utils/safeStorage';
 
 const STORAGE_KEY = 'df_traffic_engine_v2_real';
@@ -329,9 +330,13 @@ class TrafficEngine {
     this.state.indexingRadar.googleIndexedPagesCount = store.getProducts().length + 5;
 
     try {
+      const bearer = getAuthBearer();
       const res = await fetch('/api/seo/indexnow-submit', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
+        headers: {
+          'Content-Type': 'application/json',
+          ...(bearer ? { Authorization: bearer } : {})
+        }
       });
       if (res.ok) {
         const data = await res.json();

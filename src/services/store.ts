@@ -960,6 +960,64 @@ class Store {
     return Promise.resolve(newOrder);
   }
 
+  // SÉCURITÉ — Commande livrée CÔTÉ SERVEUR.
+  // Le token de téléchargement (downloadToken) est celui généré par le serveur
+  // (webhook signé / vérification Stripe / confirmation on-chain). Le navigateur
+  // ne génère JAMAIS son propre token de livraison : il ne fait qu'enregistrer
+  // la commande déjà confirmée par le serveur.
+  public completeOrderFromServer(serverOrder: any, customerInfo?: any): Promise<Order> {
+    const items: OrderItem[] = (Array.isArray(serverOrder?.items) ? serverOrder.items : []).map((it: any) => ({
+      productId: it.productId || 'custom',
+      productTitle: it.title || it.productTitle || 'Produit Digital Factory',
+      format: it.format || 'template',
+      price: typeof it.unitPriceCents === 'number' ? it.unitPriceCents / 100 : (it.price || 0),
+      isBundle: Boolean(it.isBundle)
+    }));
+
+    const totalAmount = typeof serverOrder?.totalCents === 'number'
+      ? serverOrder.totalCents / 100
+      : (items.reduce((s, i) => s + (i.price || 0), 0));
+
+    const newOrder: Order = {
+      id: serverOrder.id,
+      orderNumber: serverOrder.orderNumber,
+      customer: {
+        name: customerInfo?.customerName || customerInfo?.name || 'Client Boutique',
+        email: customerInfo?.customerEmail || customerInfo?.email || 'client@digitalfactory.io',
+        country: customerInfo?.country || 'FR'
+      },
+      items,
+      totalAmount,
+      currency: 'EUR',
+      status: 'completed',
+      paymentStatus: 'paid',
+      paymentMethod: serverOrder.paymentMethod || 'card',
+      stripeSessionId: serverOrder.stripeSessionId,
+      // Token de livraison FOURNI PAR LE SERVEUR (jamais généré ici)
+      downloadToken: serverOrder.downloadToken,
+      downloadExpiresAt: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString(),
+      downloadCount: 0,
+      maxDownloads: 5,
+      createdAt: serverOrder.confirmedAt || new Date().toISOString()
+    };
+
+    this.orders = [newOrder, ...this.orders.filter(o => o.id !== newOrder.id)];
+    saveToStorage('orders', this.orders);
+
+    // Statistiques de vente (produits) côté local
+    items.forEach(it => {
+      const p = this.products.find(prod => prod.id === it.productId);
+      if (p) {
+        p.salesCount = (p.salesCount || 0) + 1;
+        p.revenue = (p.revenue || 0) + it.price;
+      }
+    });
+    saveToStorage('products', this.products);
+
+    this.notify();
+    return Promise.resolve(newOrder);
+  }
+
   public createOrder(customerOrOrder: any, items?: any[], totalAmount?: number, source?: string): any {
     if (items && Array.isArray(items)) {
       const finalAmount = totalAmount ?? items.reduce((sum, it) => sum + ((it.price || 47) * (it.quantity || 1)), 0);

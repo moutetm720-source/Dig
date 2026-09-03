@@ -28,6 +28,7 @@ import {
 import { store } from '../../services/store';
 import { currencyAgent } from '../../services/currencyAgent';
 import { cryptoPaymentService, DEFAULT_CRYPTO_SETTINGS } from '../../services/cryptoPaymentService';
+import { getAuthBearer } from '../../services/authToken';
 import { CurrencyCode, CryptoGatewaySettings } from '../../types';
 import { SocialNetworksHub } from './SocialNetworksHub';
 
@@ -129,14 +130,14 @@ export const IntegrationsView: React.FC = () => {
     localStorage.setItem('df_stripe_whsec', webhookSecret.trim());
     localStorage.setItem('df_stripe_currency', currency);
 
-    // Also push to backend KV store
+    // Also push to backend KV store (token de session / passcode du login validé)
     try {
-      const token = localStorage.getItem('df_moderator_passcode') || '2026';
+      const bearer = getAuthBearer();
       await fetch('/api/store', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          ...(bearer ? { Authorization: bearer } : {})
         },
         body: JSON.stringify({
           df_stripe_mode: stripeMode,
@@ -159,14 +160,14 @@ export const IntegrationsView: React.FC = () => {
     if (e) e.preventDefault();
     cryptoPaymentService.updateSettings(cryptoSettings);
     
-    // Push settings directly to server database
+    // Push settings directly to server database (token de session / passcode du login validé)
     try {
-      const token = localStorage.getItem('df_moderator_passcode') || '2026';
+      const bearer = getAuthBearer();
       await fetch('/api/store', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          ...(bearer ? { Authorization: bearer } : {})
         },
         body: JSON.stringify({
           df_crypto_settings_v1: cryptoSettings,
@@ -188,14 +189,14 @@ export const IntegrationsView: React.FC = () => {
     const restored = cryptoPaymentService.restoreModelAddresses();
     setCryptoSettings(restored);
     
-    // Push to server database immediately
+    // Push to server database immediately (token de session / passcode du login validé)
     try {
-      const token = localStorage.getItem('df_moderator_passcode') || '2026';
+      const bearer = getAuthBearer();
       await fetch('/api/store', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          ...(bearer ? { Authorization: bearer } : {})
         },
         body: JSON.stringify({
           df_crypto_settings_v1: restored,
@@ -286,7 +287,7 @@ export const IntegrationsView: React.FC = () => {
     }
   };
 
-  const handleSaveModeratorPasscode = (e: React.FormEvent) => {
+  const handleSaveModeratorPasscode = async (e: React.FormEvent) => {
     e.preventDefault();
     setPassError(null);
     setPassSaveSuccess(null);
@@ -306,11 +307,26 @@ export const IntegrationsView: React.FC = () => {
       return;
     }
 
+    // SÉCURITÉ : synchroniser le nouveau passcode CÔTÉ SERVEUR, en s'authentifiant
+    // avec le credential actuel (avant rotation). Sans ça, le serveur conserverait
+    // l'ancien passcode.
+    const currentBearer = getAuthBearer();
     localStorage.setItem('df_moderator_passcode', newPasscode.trim());
+    try {
+      if (currentBearer) {
+        await fetch('/api/store', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: currentBearer },
+          body: JSON.stringify({ df_moderator_passcode: newPasscode.trim() })
+        });
+      }
+    } catch (err) {
+      console.warn('Could not sync new moderator passcode to server', err);
+    }
     setNewPasscode('');
     setConfirmPasscode('');
     setPassSaveSuccess('Mot de passe modérateur mis à jour avec succès. Il est désormais 100% masqué et sécurisé.');
-    store.addLog('success', 'agent', 'Code secret modérateur modifié par l’administrateur.');
+    store.addLog('success', 'agent', 'Code secret modérateur modifié par l’administrateur (synchronisé serveur).');
     setTimeout(() => setPassSaveSuccess(null), 4000);
   };
 

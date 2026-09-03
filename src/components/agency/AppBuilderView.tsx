@@ -61,7 +61,7 @@ export const AppBuilderView: React.FC = () => {
 
   const steps = [
     { name: 'Hermes Agent: Analyse', icon: Brain, color: 'text-indigo-400' },
-    { name: 'Obliteratus: Idéation', icon: Flame, color: 'text-pink-400' },
+    { name: 'Hermes: Idéation', icon: Flame, color: 'text-pink-400' },
     { name: 'Public-APIs: Intégration', icon: Globe, color: 'text-sky-400' },
     { name: 'Code: Compilation', icon: Code2, color: 'text-emerald-400' }
   ];
@@ -90,7 +90,7 @@ export const AppBuilderView: React.FC = () => {
       setSavedApps(prev => [newApp, ...prev]);
       setActiveAppId(newApp.id);
       
-      store.addLog('success', 'agent', `[AGENCE B2B] Solution digitale "${newApp.name}" générée avec succès via Hermes x Obliteratus.`);
+      store.addLog('success', 'agent', `[AGENCE B2B] Solution digitale "${newApp.name}" générée avec succès via Hermes Agent (moteur v4).`);
     } catch (err) {
       console.error(err);
     } finally {
@@ -192,7 +192,7 @@ export const AppBuilderView: React.FC = () => {
                 Générateur d'Applications d'Entreprise
               </h1>
               <p className="text-sm text-slate-400 max-w-2xl leading-relaxed">
-                Utilisez la synergie <strong className="text-indigo-400">Hermes</strong>, <strong className="text-pink-400">Obliteratus</strong> et <strong className="text-sky-400">Public-APIs</strong> pour générer des sites web et applications sur-mesure.
+                Utilisez le <strong className="text-indigo-400">Hermes Agent</strong> (moteur multi-agents v4) et les <strong className="text-sky-400">Public-APIs</strong> pour générer des sites web et applications sur-mesure.
               </p>
             </div>
             

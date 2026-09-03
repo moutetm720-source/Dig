@@ -1,8 +1,13 @@
 const API_URL = '/api/store';
 
+import { getAuthBearer } from './authToken';
+
 export let serverState: Record<string, any> = {};
 
 // Whitelist of shared business keys that sync across users and server DB
+// SÉCURITÉ : secrets (clé Stripe secrète, whsec) et PII (commandes, clients, factures,
+// leads, paniers abandonnés, logs) ne sont PLUS synchronisés — ils restent en local
+// et/ou sont gérés par les écrans modérateur (écritures authentifiées).
 export const SYNC_WHITELIST = new Set([
   'dpf_app_v2_products',
   'dpf_app_v2_bundles',
@@ -12,20 +17,15 @@ export const SYNC_WHITELIST = new Set([
   'dpf_app_v2_opportunities',
   'dpf_app_v2_approvals',
   'dpf_app_v2_recommendations',
-  'dpf_app_v2_orders',
-  'dpf_app_v2_customers',
   'dpf_app_v2_agentConfig',
   'dpf_app_v2_integrations',
   'dpf_app_v2_promptTemplates',
   'dpf_app_v2_opportunityWeights',
   'dpf_app_v2_onboardingState',
-  'dpf_app_v2_systemLogs',
   'dpf_app_v2_systemJobs',
   'df_github_repositories',
   'df_stripe_mode',
   'df_stripe_pk',
-  'df_stripe_sk',
-  'df_stripe_whsec',
   'df_stripe_currency',
   'df_crypto_settings_v1',
   'df_crypto_btc',
@@ -33,27 +33,19 @@ export const SYNC_WHITELIST = new Set([
   'df_crypto_sol',
   'df_crypto_usdt',
   'df_moderator_passcode',
-  'df_sales_affiliates_real',
-  'df_sales_scout_history_real',
   'df_affiliate_promo_kits_v1',
   'df_affiliate_promo_transmissions_v1',
-  'df_sales_abandoned_carts_real',
-  'df_sales_b2b_leads_real',
   'df_sales_social_proof_real',
-  'df_sales_auto_cart_recovery_real',
   'df_sales_purged',
   'df_sales_reset_real_only',
   'df_global_social_engine_v1',
-  'df_social_selling_state_v1',
   'df_traffic_engine_v2_real',
   'df_company_billing_v1',
-  'df_french_invoices_v1',
   'df_profitability_params_v1',
   'df_current_geo_v1',
   'df_token_manager_config',
   'df_token_manager_records',
   'df_strategic_advisor_state_v1',
-  'df_obliteratus_state_v1',
   'df_storefront_state_v1',
   'df_ad_budget_config_v1',
   'df_ad_budget_campaigns_v1',
@@ -240,11 +232,14 @@ function debouncedSaveToDB(key: string, value: any) {
 export async function saveStateToDB(key: string, value: any) {
   if (!shouldSyncKey(key)) return;
   try {
-    const passcode = storageAvailable ? (originalGetItem('df_moderator_passcode') || '2026') : '2026';
-    
+    // SÉCURITÉ : token de session (login validé) d'abord, passcode local sinon.
+    // Aucun défaut faible en dur — si aucune credential n'existe, on n'écrit pas.
+    const bearer = getAuthBearer();
+    if (!bearer) return;
+
     const headers: HeadersInit = { 
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${passcode}`
+      'Authorization': bearer
     };
 
     const controller = new AbortController();

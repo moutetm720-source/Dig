@@ -3,6 +3,7 @@ import { tokenManager } from './tokenManager';
 import { store } from './store';
 import { safeSetItem, safeGetItem } from '../utils/safeStorage';
 import { socialIntegrationsService } from './socialIntegrationsService';
+import { getAuthBearer } from './authToken';
 
 export interface OrchestraPerformanceMetrics {
   healthScore: number;
@@ -384,9 +385,13 @@ class ChannelOrchestratorService {
         try {
           const originUrl = typeof window !== 'undefined' ? window.location.origin : 'https://nexusdigitallabs.com';
           const prodUrl = `${originUrl}/?product=${product.id}&utm_source=${channel.platform}&utm_medium=orchestra_broadcast`;
+          const bearer = getAuthBearer();
           fetch('/api/channels/dispatch-webhook', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...(bearer ? { Authorization: bearer } : {})
+            },
             body: JSON.stringify({
               endpointUrl: channel.endpointUrl,
               platform: channel.platform,

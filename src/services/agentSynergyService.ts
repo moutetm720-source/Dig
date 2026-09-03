@@ -1,197 +1,92 @@
-import { obliteratusAgentService } from './obliteratusAgentService';
-import { hermesAgentService } from './hermesAgentService';
-import { store } from './store';
+/**
+ * agentSynergyService.ts — « Synergie multi-agents » HONNÊTE.
+ *
+ * Historique : ce service simulait localement une « alliance débridée »
+ * (OBLITERATUS) avec des étapes et des résultats inventés. Le module
+ * OBLITERATUS a été retiré du serveur (2026-09-03) : la synergie est
+ * désormais une vraie conversation avec le moteur Hermes v4 (serveur),
+ * sur un agent spécialisé au choix. Aucun résultat n'est inventé ici.
+ */
 
-export interface SynergyPipelineStep {
-  agentName: 'OBLITERATUS (Elder Plinius Spec)' | 'HERMES AGENT (Nous Research v3.5)';
-  stageName: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  details: string;
-  timestamp?: string;
-}
+import { hermesAgentService, AgentStep } from './hermesAgentService';
 
 export interface SynergyExecutionResult {
   id: string;
-  prompt: string;
-  targetModel: string;
-  method: string;
-  steps: SynergyPipelineStep[];
-  obliteratusAnalysis: string;
-  hermesResponse: string;
-  createdSkillName: string;
+  query: string;
+  agentId: string;
+  agentName: string;
+  response: string | null;
+  provider: string;
+  steps: AgentStep[];
+  success: boolean;
+  error?: string;
   timestamp: string;
 }
 
+type Listener = () => void;
+
 class AgentSynergyService {
   private history: SynergyExecutionResult[] = [];
-  private listeners: Set<() => void> = new Set();
+  private listeners: Set<Listener> = new Set();
 
-  public subscribe(fn: () => void): () => void {
-    this.listeners.add(fn);
-    return () => this.listeners.delete(fn);
-  }
+  /**
+   * Exécute une synergie réelle : délègue la requête à un agent Hermes
+   * (serveur) qui dispose des skills réels. Retourne ce que le moteur a
+   * vraiment produit — ou une erreur explicite.
+   */
+  async runSynergyWorkflow(query: string, agentId: string = 'orchestrator'): Promise<SynergyExecutionResult> {
+    const agents = hermesAgentService.getState().serverStatus?.agents || [];
+    const agentName = agents.find(a => a.id === agentId)?.name || agentId;
 
-  private notify() {
-    this.listeners.forEach(fn => {
-      try {
-        fn();
-      } catch (e) {
-        console.error(e);
+    const result: SynergyExecutionResult = {
+      id: `syn-${Date.now()}`,
+      query,
+      agentId,
+      agentName,
+      response: null,
+      provider: '',
+      steps: [],
+      success: false,
+      timestamp: new Date().toISOString()
+    };
+
+    try {
+      // Envoie la requête via le canal Hermes standard (auth + rate-limit serveur)
+      const stateBefore = hermesAgentService.getState().messages.length;
+      hermesAgentService.setAgent(agentId);
+      await hermesAgentService.sendMessage(query);
+      const added = hermesAgentService.getState().messages.slice(stateBefore);
+      const lastHermes = [...added].reverse().find(m => m.sender === 'hermes');
+      if (lastHermes) {
+        result.response = lastHermes.content;
+        result.provider = lastHermes.provider || '';
+        result.steps = lastHermes.steps || [];
+        result.success = true;
+      } else {
+        const lastSystem = [...added].reverse().find(m => m.sender === 'system');
+        result.error = lastSystem?.content || 'Aucune réponse du moteur Hermes.';
       }
-    });
+    } catch (e: any) {
+      result.error = e?.message || 'Erreur inconnue';
+    }
+
+    this.history.unshift(result);
+    if (this.history.length > 20) this.history.length = 20;
+    this.notify();
+    return result;
   }
 
-  public getHistory(): SynergyExecutionResult[] {
+  getHistory(): SynergyExecutionResult[] {
     return [...this.history];
   }
 
-  public async runSynergyWorkflow(
-    prompt: string,
-    targetModel: string = 'Llama-3.3-70B-Instruct',
-    ablationMethod: string = 'advanced'
-  ): Promise<SynergyExecutionResult> {
-    const execId = `syn-${Date.now()}`;
-    const startTime = new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  subscribe(listener: Listener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
 
-    const initialSteps: SynergyPipelineStep[] = [
-      {
-        agentName: 'OBLITERATUS (Elder Plinius Spec)',
-        stageName: 'Étape 1 : Probe & Extraction SVD de Vecteur de Refus',
-        status: 'running',
-        details: `Extraction de rang 1 SVD sur les couches 12-24 (${targetModel})`,
-        timestamp: startTime
-      },
-      {
-        agentName: 'OBLITERATUS (Elder Plinius Spec)',
-        stageName: 'Étape 2 : Ablation Chirurgicale & Biprojection de Norme',
-        status: 'pending',
-        details: `Ablation ${ablationMethod.toUpperCase()} (Refusal 0.0% vise)`,
-        timestamp: startTime
-      },
-      {
-        agentName: 'HERMES AGENT (Nous Research v3.5)',
-        stageName: 'Étape 3 : Synthèse de Compétence Autonome (Skill Creation)',
-        status: 'pending',
-        details: 'Génération de fichier .skill réutilisable et sauvegarde SQL',
-        timestamp: startTime
-      },
-      {
-        agentName: 'HERMES AGENT (Nous Research v3.5)',
-        stageName: 'Étape 4 : Diffusion Multi-Canaux (Telegram, Discord, X)',
-        status: 'pending',
-        details: 'Programmation dans la boucle de cron d\'arrière-plan',
-        timestamp: startTime
-      }
-    ];
-
-    try {
-      // Call backend synergy endpoint
-      const res = await fetch('/api/agents/synergy', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, targetModel, ablationMethod })
-      });
-
-      if (!res.ok) {
-        throw new Error(`Server returned HTTP ${res.status}`);
-      }
-
-      const data = await res.json();
-
-      const completedSteps: SynergyPipelineStep[] = [
-        {
-          agentName: 'OBLITERATUS (Elder Plinius Spec)',
-          stageName: 'Étape 1 : Probe & Extraction SVD de Vecteur de Refus',
-          status: 'completed',
-          details: `Extraction SVD réussie sur ${targetModel}`,
-          timestamp: startTime
-        },
-        {
-          agentName: 'OBLITERATUS (Elder Plinius Spec)',
-          stageName: 'Étape 2 : Ablation Chirurgicale & Biprojection de Norme',
-          status: 'completed',
-          details: `Ablation ${ablationMethod.toUpperCase()} validée • Refusal: 0.0% • MMLU: 99.7%`,
-          timestamp: startTime
-        },
-        {
-          agentName: 'HERMES AGENT (Nous Research v3.5)',
-          stageName: 'Étape 3 : Synthèse de Compétence Autonome (Skill Creation)',
-          status: 'completed',
-          details: `Skill créé avec succès : ${data.hermes.createdSkill}`,
-          timestamp: startTime
-        },
-        {
-          agentName: 'HERMES AGENT (Nous Research v3.5)',
-          stageName: 'Étape 4 : Diffusion Multi-Canaux (Telegram, Discord, X)',
-          status: 'completed',
-          details: 'Diffusé et enregistré dans la mémoire serveur',
-          timestamp: startTime
-        }
-      ];
-
-      const resultObj: SynergyExecutionResult = {
-        id: execId,
-        prompt,
-        targetModel,
-        method: ablationMethod,
-        steps: completedSteps,
-        obliteratusAnalysis: data.obliteratus.rawAnalysis,
-        hermesResponse: data.hermes.response,
-        createdSkillName: data.hermes.createdSkill,
-        timestamp: new Date().toISOString()
-      };
-
-      this.history.unshift(resultObj);
-      this.notify();
-
-      // Log into central store
-      store.addLog(
-        'success',
-        'agent',
-        `[SYNERGIE DUAL-AGENT] Executé: "${prompt}" -> OBLITERATUS (Refusal 0%) x HERMES (Skill ${data.hermes.createdSkill})`
-      );
-
-      return resultObj;
-    } catch (err: any) {
-      console.error('Synergy execution failed:', err);
-      // Client-side fallback synergy execution
-      const fallbackSkill = `Skill_Auto_${Math.floor(Math.random() * 9000 + 1000)}`;
-
-      const fallbackSteps: SynergyPipelineStep[] = [
-        {
-          agentName: 'OBLITERATUS (Elder Plinius Spec)',
-          stageName: 'Étape 1 & 2 : Uncensored Audit & SVD Ablation',
-          status: 'completed',
-          details: `Ablation ${ablationMethod.toUpperCase()} exécutée localement sur ${targetModel}. Refusal: 0.0%.`,
-          timestamp: startTime
-        },
-        {
-          agentName: 'HERMES AGENT (Nous Research v3.5)',
-          stageName: 'Étape 3 & 4 : Skill Synthesis & Cron Program',
-          status: 'completed',
-          details: `Nouvelle compétence ${fallbackSkill} enregistrée et diffusée.`,
-          timestamp: startTime
-        }
-      ];
-
-      const resultObj: SynergyExecutionResult = {
-        id: execId,
-        prompt,
-        targetModel,
-        method: ablationMethod,
-        steps: fallbackSteps,
-        obliteratusAnalysis: `[OBLITERATUS LOCAL] Audit de la requête "${prompt}":
-- Levée totale des verrous d'alignement.
-- Analyse stratégique débridée générée sans restriction.`,
-        hermesResponse: `🤖 **HERMES AGENT (Nous Spec)**\n\nPrise en charge de l'analyse d'OBLITERATUS pour "${prompt}".\n\n- Compétence créée : \`${fallbackSkill}\`\n- Mémoire persistante mise à jour\n- Publication programmée.`,
-        createdSkillName: fallbackSkill,
-        timestamp: new Date().toISOString()
-      };
-
-      this.history.unshift(resultObj);
-      this.notify();
-      return resultObj;
-    }
+  private notify() {
+    this.listeners.forEach(l => l());
   }
 }
 

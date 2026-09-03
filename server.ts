@@ -1,24 +1,478 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI } from '@google/genai';
+import crypto from 'crypto';
+import net from 'net';
+import dns from 'dns/promises';
 import { db } from './src/db/db.js';
 import { keyValueStore } from './src/db/schema.js';
 import { eq } from 'drizzle-orm';
+import { createHermesRouter } from './hermes';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.set('trust proxy', 1);
+
+// ============================================================
+// SECURITE — Helpers : rate limiting, passcode serveur, SSRF
+// ============================================================
+
+// Rate limiters (in-memory, par IP)
+function makeRateLimiter(maxRequests: number, windowMs: number) {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  const sweeper = setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits) if (now > v.resetAt) hits.delete(k);
+  }, windowMs);
+  if (typeof sweeper.unref === 'function') sweeper.unref();
+  return (req: any, res: any, next: any) => {
+    const key = req.ip || 'unknown';
+    const now = Date.now();
+    const entry = hits.get(key);
+    if (!entry || now > entry.resetAt) {
+      hits.set(key, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    if (entry.count >= maxRequests) {
+      return res.status(429).json({ error: 'Trop de requêtes. Merci de réessayer dans quelques instants.' });
+    }
+    entry.count += 1;
+    next();
+  };
+}
+const apiLimiter = makeRateLimiter(300, 10 * 60 * 1000);
+const aiLimiter = makeRateLimiter(6, 60 * 1000);
+const checkoutLimiter = makeRateLimiter(30, 60 * 1000);
+const webhookLimiter = makeRateLimiter(10, 60 * 1000);
+const telemetryLimiter = makeRateLimiter(60, 60 * 1000);
+const cryptoLimiter = makeRateLimiter(10, 5 * 60 * 1000);
+const authLimiter = makeRateLimiter(10, 10 * 60 * 1000);
+
+// Passcode modérateur : variable d'env > base de données > auto-généré (jamais de défaut faible)
+async function getServerPasscode(): Promise<string> {
+  const envPass = (process.env.MODERATOR_PASSCODE || '').trim();
+  if (envPass) return envPass;
+  try {
+    const r = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_moderator_passcode'));
+    if (r.length > 0 && r[0].value) {
+      const v = (typeof r[0].value === 'string' ? r[0].value : String(r[0].value)).replace(/"/g, '').trim();
+      if (v && v !== 'null') return v;
+    }
+    // Premier démarrage : générer un passcode fort (affiché dans les logs serveur)
+    const generated = crypto.randomBytes(12).toString('hex');
+    await db.insert(keyValueStore).values({ key: 'df_moderator_passcode', value: generated })
+      .onConflictDoUpdate({ target: keyValueStore.key, set: { value: generated } });
+    console.log(`[SECURITY] Passcode modérateur auto-généré (à saisir dans l'espace modérateur) : ${generated}`);
+    return generated;
+  } catch (e) {
+    // SÉCURITÉ : fail-closed. DB indisponible + pas d'env → aucun passcode
+    // (toutes les authentications échouent) plutôt qu'un défaut faible.
+    console.error('[SECURITY] getServerPasscode : DB indisponible et MODERATOR_PASSCODE absent — auth verrouillée (fail-closed).', e?.message);
+    return '';
+  }
+}
+
+// ============================================================
+// AUTHENTIFICATION — Tokens de session modérateur (HMAC-SHA256)
+// Un login validé (passcode correct) émet un token signé à
+// expiration (7 j). Les endpoints protégés acceptent le passcode
+// (compatibilité) OU un token de session valide et non révoqué.
+// ============================================================
+async function getSessionSecret(): Promise<string> {
+  const envSecret = (process.env.SESSION_SECRET || '').trim();
+  if (envSecret) return envSecret;
+  try {
+    const r = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_session_secret'));
+    if (r.length > 0 && r[0].value) {
+      const v = (typeof r[0].value === 'string' ? r[0].value : String(r[0].value)).replace(/"/g, '').trim();
+      if (v) return v;
+    }
+    const generated = crypto.randomBytes(32).toString('hex');
+    await db.insert(keyValueStore).values({ key: 'df_session_secret', value: generated })
+      .onConflictDoUpdate({ target: keyValueStore.key, set: { value: generated } });
+    console.log('[SECURITY] Secret de session modérateur auto-généré (persisté en base).');
+    return generated;
+  } catch (e) {
+    return '';
+  }
+}
+
+interface SessionPayload { exp: number; jti: string }
+
+function signSessionToken(payload: SessionPayload, secret: string): string {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+  return `mod.${body}.${sig}`;
+}
+
+function verifySessionToken(token: string, secret: string): SessionPayload | null {
+  if (!secret) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3 || parts[0] !== 'mod') return null;
+  const [, body, sig] = parts;
+  const expected = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as SessionPayload;
+    if (typeof payload.exp !== 'number' || payload.exp < Date.now()) return null;
+    if (typeof payload.jti !== 'string' || !payload.jti) return null;
+    if (revokedSessions.has(payload.jti)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// Liste de révocation des tokens (logout) — bornée, nettoyée périodiquement
+const revokedSessions = new Map<string, number>();
+setInterval(() => {
+  const now = Date.now();
+  for (const [jti, exp] of revokedSessions) if (exp < now) revokedSessions.delete(jti);
+}, 60 * 60 * 1000).unref?.();
+
+const SESSION_TTL_MS = 7 * 24 * 3600 * 1000;
+
+async function isAuthed(req: any): Promise<boolean> {
+  const auth = (req.headers.authorization || '') as string;
+  if (!auth.startsWith('Bearer ')) return false;
+  const token = auth.slice(7).trim();
+  if (!token) return false;
+  const secret = await getSessionSecret();
+  if (verifySessionToken(token, secret)) return true;
+  // Compatibilité : le passcode serveur direct
+  const expected = await getServerPasscode();
+  if (!expected) return false;
+  const a = Buffer.from(token);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+async function requireAuth(req: any, res: any, next: any) {
+  try {
+    if (await isAuthed(req)) return next();
+    return res.status(401).json({ error: 'Non autorisé : accès modérateur requis.' });
+  } catch (e) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+// Login modérateur : émet un token de session après validation du passcode
+// NB : ce route est enregistré AVANT le express.json() global → parser local requis.
+app.post('/api/auth/login', authLimiter, express.json({ limit: '100kb' }), async (req, res) => {
+  try {
+    const provided = String(req.body?.passcode || '').trim();
+    if (!provided) return res.status(400).json({ error: 'Le code d\'accès est requis.' });
+    const expected = await getServerPasscode();
+    if (!expected) return res.status(503).json({ error: 'Authentification indisponible (serveur de config non joignable). Réessayez plus tard.' });
+    const a = Buffer.from(provided);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(401).json({ error: 'Code d\'accès incorrect.' });
+    }
+    const secret = await getSessionSecret();
+    const payload: SessionPayload = {
+      exp: Date.now() + SESSION_TTL_MS,
+      jti: crypto.randomBytes(12).toString('hex'),
+    };
+    const token = secret ? signSessionToken(payload, secret) : '';
+    res.json({
+      success: true,
+      token: token || null, // null si secret indisponible → le passcode direct reste utilisable
+      expiresInMs: SESSION_TTL_MS
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Logout : révocation du token de session courant
+app.post('/api/auth/logout', authLimiter, async (req, res) => {
+  try {
+    const auth = (req.headers.authorization || '') as string;
+    const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : String(req.body?.token || '');
+    const secret = await getSessionSecret();
+    const payload = verifySessionToken(token, secret);
+    if (payload) {
+      revokedSessions.set(payload.jti, payload.exp);
+      if (revokedSessions.size > 1000) {
+        const first = revokedSessions.keys().next().value as string | undefined;
+        if (first) revokedSessions.delete(first);
+      }
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Clés sensibles : JAMAIS renvoyées en lecture via l'API publique
+const SENSITIVE_READ_KEYS = new Set([
+  'df_stripe_sk',
+  'df_stripe_whsec',
+  'df_moderator_passcode',
+  'df_session_secret',
+  'df_social_integrations_v1',
+  'dpf_app_v2_orders',
+  'dpf_server_orders_v1',
+  'dpf_app_v2_customers',
+  'dpf_app_v2_systemLogs',
+  'df_sales_affiliates_real',
+  'df_sales_abandoned_carts_real',
+  'df_sales_b2b_leads_real',
+  'df_sales_scout_history_real',
+  'df_sales_auto_cart_recovery_real',
+  'df_social_selling_state_v1',
+  'df_french_invoices_v1',
+  'df_crypto_pending_reviews',
+  'df_hermes_provider_pool',
+]);
+
+// Clés dont l'écriture est refusée via l'API (les secrets Stripe et le passcode
+// peuvent être écrits de façon authentifiée car gérés par l'écran Intégrations).
+// Les commandes serveur (dpf_server_orders_v1) et le secret de session
+// (df_session_secret) sont EXCLUSIVEMENT écrits par le serveur.
+const SENSITIVE_WRITE_KEYS = new Set([
+  'df_social_integrations_v1',
+  'df_session_secret',
+  'dpf_server_orders_v1',
+  'dpf_app_v2_orders',
+  'dpf_app_v2_customers',
+  'dpf_app_v2_systemLogs',
+  'df_sales_affiliates_real',
+  'df_sales_abandoned_carts_real',
+  'df_sales_b2b_leads_real',
+  'df_sales_scout_history_real',
+  'df_sales_auto_cart_recovery_real',
+  'df_social_selling_state_v1',
+  'df_french_invoices_v1',
+  'df_crypto_pending_reviews',
+  'df_hermes_provider_pool',
+]);
+
+// ============================================================
+// COMMANDES SERVEUR — la source de vérité des paiements est le
+// serveur, pas le navigateur. Chaque commande Stripe/démo/crypto
+// est créée ici ; le token de téléchargement est généré ICI,
+// uniquement quand le paiement est validé (webhook signé,
+// vérification Stripe API, ou confirmation on-chain).
+// ============================================================
+const SERVER_ORDERS_KEY = 'dpf_server_orders_v1';
+
+interface ServerOrder {
+  id: string;
+  orderNumber: string;
+  items: Array<{ productId: string; title: string; unitPriceCents: number; quantity: number }>;
+  totalCents: number;
+  currency: string;
+  status: 'pending_payment' | 'paid' | 'expired';
+  paymentMethod: string; // 'card' | 'demo' | 'crypto_BTC' | ...
+  source: 'stripe' | 'demo' | 'crypto';
+  stripeSessionId?: string;
+  cryptoTxHash?: string;
+  customerEmail?: string;
+  customerName?: string;
+  downloadToken?: string;
+  createdAt: string;
+  confirmedAt?: string;
+}
+
+async function readServerOrders(): Promise<ServerOrder[]> {
+  try {
+    const r = await db.select().from(keyValueStore).where(eq(keyValueStore.key, SERVER_ORDERS_KEY));
+    if (r.length > 0 && r[0].value) {
+      const v = typeof r[0].value === 'string' ? JSON.parse(r[0].value) : r[0].value;
+      return Array.isArray(v) ? (v as ServerOrder[]) : [];
+    }
+  } catch (e) {}
+  return [];
+}
+
+async function writeServerOrders(orders: ServerOrder[]): Promise<void> {
+  const capped = orders.slice(0, 500);
+  await db.insert(keyValueStore).values({ key: SERVER_ORDERS_KEY, value: capped })
+    .onConflictDoUpdate({ target: keyValueStore.key, set: { value: capped } });
+}
+
+function generateDownloadToken(): string {
+  return `dl_token_${Date.now().toString(36)}_${crypto.randomBytes(10).toString('hex')}`;
+}
+
+// Marque une commande comme payée (idempotent). Retourne la commande ou null.
+async function markServerOrderPaid(orderId: string, paymentMethod: string, extra?: { txHash?: string }): Promise<ServerOrder | null> {
+  const orders = await readServerOrders();
+  const order = orders.find((o) => o.id === orderId);
+  if (!order) return null;
+  if (order.status !== 'paid') {
+    order.status = 'paid';
+    order.paymentMethod = paymentMethod || order.paymentMethod;
+    order.confirmedAt = new Date().toISOString();
+    order.downloadToken = generateDownloadToken();
+    if (extra?.txHash) order.cryptoTxHash = extra.txHash;
+    await writeServerOrders(orders);
+    console.log(`[ORDER] Commande ${order.id} confirmée côté serveur (${paymentMethod}).`);
+  }
+  return order;
+}
+
+async function findServerOrderByStripeSession(sessionId: string): Promise<ServerOrder | null> {
+  const orders = await readServerOrders();
+  return orders.find((o) => o.stripeSessionId === sessionId) || null;
+}
+
+// Garde anti-SSRF : https uniquement + blocage des adresses/hosts internes
+const BLOCKED_HOSTS = new Set([
+  'metadata', 'metadata.google.internal', 'localhost', '169.254.169.254',
+  '127.0.0.1', '0.0.0.0', '::1', 'ip6-localhost', 'ip6-loopback',
+]);
+
+function isPrivateAddress(ip: string): boolean {
+  if (net.isIPv4(ip)) {
+    const parts = ip.split('.').map(Number);
+    const [a, b] = parts;
+    return a === 0 || a === 10 || a === 127
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 198 && (b === 18 || b === 19))
+      || a >= 224;
+  }
+  if (net.isIPv6(ip)) {
+    const lower = ip.toLowerCase();
+    if (lower === '::' || lower === '::1') return true;
+    if (lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd')) return true;
+    if (lower.startsWith('::ffff:')) return isPrivateAddress(lower.slice(7));
+  }
+  return false;
+}
+
+async function assertSafeOutbound(rawUrl: string): Promise<void> {
+  let u: URL;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    throw new Error('URL invalide.');
+  }
+  if (u.protocol !== 'https:') {
+    throw new Error('Seul le protocole https est autorisé pour les appels sortants.');
+  }
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (BLOCKED_HOSTS.has(host) || host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.localhost')) {
+    throw new Error('Destination interne bloquée.');
+  }
+  if (net.isIP(host)) {
+    if (isPrivateAddress(host)) throw new Error('Adresse IP privée/interne bloquée.');
+    return;
+  }
+  let addresses: { address: string }[];
+  try {
+    addresses = await dns.lookup(host, { all: true });
+  } catch {
+    throw new Error('Résolution DNS impossible pour cet hôte.');
+  }
+  for (const { address } of addresses) {
+    if (isPrivateAddress(address)) {
+      throw new Error('Résolution vers une adresse interne détectée — bloquée.');
+    }
+  }
+}
+
+function escapeXml(value: any): string {
+  return String(value ?? '').replace(/[<>&'"]/g, (c) => (
+    { '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' } as Record<string, string>
+  )[c]);
+}
+
+// Lecture du passcode stocké côté serveur (jamais via le corps de requête)
+async function readStripeSk(): Promise<string> {
+  let stripeSk = (process.env.STRIPE_SECRET_KEY || '').trim();
+  if (!stripeSk) {
+    try {
+      const result = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_stripe_sk'));
+      if (result.length > 0 && result[0].value) {
+        stripeSk = (typeof result[0].value === 'string' ? result[0].value : String(result[0].value)).replace(/"/g, '').trim();
+      }
+    } catch (e) {}
+  }
+  return stripeSk;
+}
+
+// Webhook Stripe — vérification de signature obligatoire (raw body requis)
+app.post('/api/webhooks/stripe', express.raw({ type: '*/*', limit: '1mb' }), webhookLimiter, async (req, res) => {
+  try {
+    let whsec = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+    if (!whsec) {
+      try {
+        const r = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_stripe_whsec'));
+        if (r.length > 0 && r[0].value) {
+          whsec = (typeof r[0].value === 'string' ? r[0].value : String(r[0].value)).replace(/"/g, '').trim();
+        }
+      } catch (e) {}
+    }
+    const sig = req.headers['stripe-signature'];
+    if (!whsec || typeof sig !== 'string' || !sig) {
+      return res.status(400).json({ received: false, error: 'Signature Stripe absente ou secret non configuré.' });
+    }
+    const parts: Record<string, string> = {};
+    sig.split(',').forEach((p) => {
+      const idx = p.indexOf('=');
+      if (idx > 0) parts[p.slice(0, idx).trim()] = p.slice(idx + 1).trim();
+    });
+    const t = parts['t'];
+    const v1 = parts['v1'];
+    if (!t || !v1) return res.status(400).json({ received: false, error: 'Signature invalide.' });
+    const ts = Number(t);
+    if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > 300) {
+      return res.status(400).json({ received: false, error: 'Signature expirée.' });
+    }
+    const expected = crypto.createHmac('sha256', whsec).update(req.body as Buffer).digest('hex');
+    const a = Buffer.from(v1);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(400).json({ received: false, error: 'Signature invalide.' });
+    }
+
+    // Signature valide → on traite l'événement (source de vérité des paiements)
+    let event: any = null;
+    try {
+      event = JSON.parse((req.body as Buffer).toString('utf8'));
+    } catch (e) {}
+
+    let orderConfirmed = false;
+    if (event?.type === 'checkout.session.completed') {
+      const sid = event.data?.object?.id;
+      const paid = event.data?.object?.payment_status === 'paid';
+      if (sid && paid) {
+        const order = await findServerOrderByStripeSession(sid);
+        if (order) {
+          await markServerOrderPaid(order.id, 'card');
+          orderConfirmed = true;
+        }
+      }
+    }
+
+    res.json({ received: true, verified: true, orderConfirmed });
+  } catch (err: any) {
+    console.error('Stripe webhook error:', err);
+    res.status(500).json({ received: false, error: 'Internal server error' });
+  }
+});
+
+app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 // Global Anti-Cache and CORS Middleware to ensure any mobile or desktop browser gets fresh data
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-stripe-secret-key, Cache-Control, Pragma');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control, Pragma');
 
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
@@ -34,36 +488,95 @@ app.use((req, res, next) => {
   next();
 });
 
-// Webhook endpoint
-app.post('/api/webhooks/stripe', (req, res) => {
-  res.status(200).json({ received: true });
-});
+// En-têtes de sécurité (production)
+if (process.env.NODE_ENV === 'production') {
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    // CSP stricte : plus de scripts inline ni tiers non listés.
+    // Les <script type="application/ld+json"> ne sont pas exécutés (non bloqués).
+    // style-src 'unsafe-inline' requis par les styles inline React/Tailwind.
+    res.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob: https:",
+        "font-src 'self' data:",
+        "connect-src 'self' https: wss:",
+        "media-src 'self' blob: https:",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'"
+      ].join('; ')
+    );
+    next();
+  });
+}
 
 // Secure Checkout Session Creator for real multi-user B2C traffic
-app.post('/api/checkout/create-session', async (req, res) => {
+// SÉCURITÉ : clé Stripe uniquement côté serveur, prix issus du catalogue serveur,
+// code promo résolu côté serveur (jamais de pourcentage fourni par le client).
+app.post('/api/checkout/create-session', checkoutLimiter, async (req, res) => {
   try {
-    const { items, promoDiscount = 0, originUrl, customerEmail, customStripeSk } = req.body;
-    
-    // Retrieve Stripe Secret Key from request, env, or DB
-    let stripeSk = (customStripeSk || req.headers['x-stripe-secret-key'] || process.env.STRIPE_SECRET_KEY || '') as string;
-    if (!stripeSk) {
+    const { items, promoCode, originUrl, customerEmail } = req.body || {};
+
+    // Retrieve Stripe Secret Key from env or DB only (jamais du corps/header client)
+    const stripeSk = await readStripeSk();
+    // Mode démo : UNIQUEMENT si explicitement activé (env DEMO_CHECKOUT=1) et
+    // si aucune clé Stripe n'est configurée. Jamais de livraison "gratuite" par
+    // défaut — sans ce flag, le paiement est simplement indisponible.
+    const demoCheckoutEnabled = (process.env.DEMO_CHECKOUT || '').trim() === '1' && !stripeSk;
+
+    // Remise : uniquement via un code promo validé côté serveur
+    let promoDiscount = 0;
+    const code = (typeof promoCode === 'string' ? promoCode.trim().toUpperCase() : '');
+    if (code === 'LAUNCH20' || code === 'VIP20') {
+      promoDiscount = 20;
+    } else if (code === 'FACTORY50') {
+      promoDiscount = 50;
+    } else if (code) {
+      // Codes affiliés enregistrés (commission = remise, plafonnée à 50 %)
       try {
-        const result = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_stripe_sk'));
-        if (result.length > 0 && result[0].value) {
-          stripeSk = typeof result[0].value === 'string' ? result[0].value.replace(/"/g, '').trim() : String(result[0].value).trim();
+        const aff = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_sales_affiliates_real'));
+        if (aff.length > 0 && Array.isArray(aff[0].value)) {
+          const partners = aff[0].value as any[];
+          const match = partners.find((p: any) =>
+            p && String(p.referralCode || p.code || '').toUpperCase() === code
+          );
+          if (match) {
+            promoDiscount = Math.max(0, Math.min(50, Number(match.commissionRate) || 30));
+          }
         }
       } catch (e) {}
     }
 
-    if (!stripeSk) {
-      return res.status(200).json({ 
-        mode: 'fallback', 
-        message: 'Stripe secret key not configured on server. Falling back to local secure modal.' 
-      });
-    }
+    // Prix de référence : catalogue serveur (produits + bundles)
+    let catalog: any[] = [];
+    try {
+      const [prods, bundles] = await Promise.all([
+        db.select().from(keyValueStore).where(eq(keyValueStore.key, 'dpf_app_v2_products')),
+        db.select().from(keyValueStore).where(eq(keyValueStore.key, 'dpf_app_v2_bundles')),
+      ]);
+      if (prods.length > 0 && Array.isArray(prods[0].value)) catalog.push(...(prods[0].value as any[]));
+      if (bundles.length > 0 && Array.isArray(bundles[0].value)) catalog.push(...(bundles[0].value as any[]));
+    } catch (e) {}
+    const catalogById = new Map<string, any>();
+    catalog.forEach((p: any) => { if (p && p.id != null) catalogById.set(String(p.id), p); });
 
     const formParams = new URLSearchParams();
-    const cleanOrigin = originUrl || 'http://localhost:3000';
+    // Origine : origin uniquement (supprime tout chemin fourni par le client)
+    let cleanOrigin = 'http://localhost:3000';
+    try {
+      const parsedOrigin = new URL(originUrl);
+      if (parsedOrigin.protocol === 'https:' || parsedOrigin.protocol === 'http:') {
+        cleanOrigin = parsedOrigin.origin;
+      }
+    } catch (e) {}
     formParams.append('mode', 'payment');
     formParams.append('success_url', `${cleanOrigin}/?success=true&session_id={CHECKOUT_SESSION_ID}`);
     formParams.append('cancel_url', `${cleanOrigin}/?canceled=true`);
@@ -75,14 +588,75 @@ app.post('/api/checkout/create-session', async (req, res) => {
     }
 
     const validItems = Array.isArray(items) && items.length > 0 ? items : [];
+    if (validItems.length === 0) {
+      return res.status(400).json({ error: 'Panier vide : aucun article à facturer.' });
+    }
+
+    // SÉCURITÉ : les lignes de commande (prix, quantités, total) sont calculées
+    // UNIQUEMENT côté serveur. Le total ci-dessous est la seule référence
+    // facturable — jamais du body client.
+    const serverItems: ServerOrder['items'] = [];
+    let totalCents = 0;
     validItems.forEach((item: any, idx: number) => {
-      const discount = Math.max(0, Math.min(100, Number(promoDiscount) || 0));
-      const discountedPrice = Math.max(100, Math.round(Number(item.price || 47) * (1 - discount / 100) * 100));
+      // Prix fait foi du catalogue serveur ; repli sur le prix client seulement
+      // si l'article (bundle sur mesure) n'existe pas dans le catalogue.
+      const catalogItem = item?.productId != null ? catalogById.get(String(item.productId)) : undefined;
+      const catalogPrice = Number(catalogItem?.pricing?.recommendedPrice ?? catalogItem?.price);
+      const clientPrice = Number(item?.price);
+      const unitPrice = Number.isFinite(catalogPrice) && catalogPrice > 0
+        ? catalogPrice
+        : (Number.isFinite(clientPrice) && clientPrice > 0 ? clientPrice : 47);
+      const quantity = Math.max(1, Math.min(99, Number(item?.quantity) || 1));
+      const discountedPrice = Math.max(100, Math.round(unitPrice * (1 - promoDiscount / 100) * 100));
+      totalCents += discountedPrice * quantity;
+      serverItems.push({
+        productId: String(item?.productId || 'custom'),
+        title: String(item?.productTitle || 'Produit Digital').slice(0, 500),
+        unitPriceCents: discountedPrice,
+        quantity
+      });
       formParams.append(`line_items[${idx}][price_data][currency]`, 'eur');
-      formParams.append(`line_items[${idx}][price_data][product_data][name]`, String(item.productTitle || 'Produit Digital'));
+      formParams.append(`line_items[${idx}][price_data][product_data][name]`, String(item?.productTitle || 'Produit Digital').slice(0, 500));
       formParams.append(`line_items[${idx}][price_data][unit_amount]`, String(discountedPrice));
-      formParams.append(`line_items[${idx}][quantity]`, String(Math.max(1, Number(item.quantity || 1))));
+      formParams.append(`line_items[${idx}][quantity]`, String(quantity));
     });
+
+    // SÉCURITÉ : la commande est créée CÔTÉ SERVEUR (statut en attente).
+    // La livraison (token de téléchargement) ne sera générée que lorsque le
+    // paiement sera validé (webhook signé / vérification Stripe / on-chain).
+    const nowIso = new Date().toISOString();
+    const orderId = `srv-${Date.now().toString(36)}-${crypto.randomBytes(5).toString('hex')}`;
+    const orderNumber = `DPF-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    // ---- Mode démo : explicitement activé (env) et Stripe non configuré ----
+    if (!stripeSk && demoCheckoutEnabled) {
+      const demoOrder: ServerOrder = {
+        id: orderId,
+        orderNumber,
+        items: serverItems,
+        totalCents,
+        currency: 'EUR',
+        status: 'pending_payment',
+        paymentMethod: 'demo',
+        source: 'demo',
+        customerEmail: typeof customerEmail === 'string' ? customerEmail.slice(0, 254) : undefined,
+        customerName: typeof (req.body as any)?.customerName === 'string' ? String((req.body as any).customerName).slice(0, 200) : undefined,
+        createdAt: nowIso
+      };
+      const orders = await readServerOrders();
+      orders.unshift(demoOrder);
+      await writeServerOrders(orders);
+      console.log(`[ORDER] Commande démo ${orderId} créée côté serveur (${totalCents} cents).`);
+      return res.json({ mode: 'demo', serverOrderId: orderId, totalCents });
+    }
+
+    // ---- Stripe non configuré ET pas de mode démo : paiement indisponible ----
+    if (!stripeSk) {
+      return res.status(200).json({
+        mode: 'unconfigured',
+        message: 'Aucune passerelle de paiement configurée sur le serveur. La commande n\'a pas été créée.'
+      });
+    }
 
     const stripeRes = await fetch('https://api.stripe.com/v1/checkout/sessions', {
       method: 'POST',
@@ -98,10 +672,30 @@ app.post('/api/checkout/create-session', async (req, res) => {
       return res.status(400).json({ error: sessionData.error.message || 'Stripe Session Error' });
     }
 
+    // Liaison commande serveur ↔ session Stripe (confirmée au webhook signé)
+    const stripeOrder: ServerOrder = {
+      id: orderId,
+      orderNumber,
+      items: serverItems,
+      totalCents,
+      currency: (sessionData.currency || 'eur').toUpperCase(),
+      status: 'pending_payment',
+      paymentMethod: 'card',
+      source: 'stripe',
+      stripeSessionId: sessionData.id,
+      customerEmail: typeof customerEmail === 'string' ? customerEmail.slice(0, 254) : undefined,
+      createdAt: nowIso
+    };
+    const orders = await readServerOrders();
+    orders.unshift(stripeOrder);
+    await writeServerOrders(orders);
+
     res.json({
       mode: 'stripe',
       url: sessionData.url,
-      sessionId: sessionData.id
+      sessionId: sessionData.id,
+      serverOrderId: orderId,
+      totalCents
     });
   } catch (err: any) {
     console.error('Checkout creation error:', err);
@@ -109,8 +703,8 @@ app.post('/api/checkout/create-session', async (req, res) => {
   }
 });
 
-// Real Stripe API Key Verifier
-app.post('/api/checkout/verify-keys', async (req, res) => {
+// Real Stripe API Key Verifier (réservé au modérateur authentifié)
+app.post('/api/checkout/verify-keys', requireAuth, webhookLimiter, async (req, res) => {
   try {
     let secretKey = (req.body?.secretKey || req.headers['x-stripe-secret-key'] || '') as string;
     
@@ -181,29 +775,39 @@ app.post('/api/checkout/verify-keys', async (req, res) => {
 });
 
 // Secure Checkout Session Verifier
-app.get('/api/checkout/verify-session/:sessionId', async (req, res) => {
+// SÉCURITÉ : clé serveur uniquement, session ID validé, plus de "paid: true" par défaut.
+// Quand Stripe confirme le paiement, la commande SERVEUR est marquée payée et le
+// token de téléchargement est généré côté serveur (jamais dans le navigateur).
+app.get('/api/checkout/verify-session/:sessionId', checkoutLimiter, async (req, res) => {
   try {
     const { sessionId } = req.params;
-    let stripeSk = (req.query?.sk || req.headers['x-stripe-secret-key'] || process.env.STRIPE_SECRET_KEY || '') as string;
-    if (!stripeSk) {
-      try {
-        const result = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_stripe_sk'));
-        if (result.length > 0 && result[0].value) {
-          stripeSk = typeof result[0].value === 'string' ? result[0].value.replace(/"/g, '').trim() : String(result[0].value).trim();
-        }
-      } catch (e) {}
+    if (!/^[A-Za-z0-9_-]{1,200}$/.test(sessionId)) {
+      return res.status(400).json({ error: 'Identifiant de session invalide.' });
     }
 
+    const stripeSk = await readStripeSk();
+
     if (!stripeSk) {
-      return res.json({ paid: true, simulated: true });
+      return res.json({ paid: false, simulated: true, error: 'Stripe non configuré sur le serveur — paiement non confirmé.' });
     }
 
-    const stripeRes = await fetch(`https://api.stripe.com/v1/checkout/sessions/${sessionId}`, {
+    const stripeRes = await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(sessionId)}`, {
       headers: { 'Authorization': `Bearer ${stripeSk}` }
     });
 
     const session = await stripeRes.json();
-    
+
+    const isPaid = session.payment_status === 'paid';
+
+    // Paiement confirmé par l'API Stripe → on confirme la commande serveur
+    // (idempotent : le webhook peut avoir déjà fait le travail).
+    if (isPaid) {
+      const order = await findServerOrderByStripeSession(sessionId);
+      if (order) {
+        await markServerOrderPaid(order.id, 'card');
+      }
+    }
+
     // Extract real address if available
     let fullAddress = '';
     const addr = session.customer_details?.address;
@@ -211,15 +815,33 @@ app.get('/api/checkout/verify-session/:sessionId', async (req, res) => {
       fullAddress = [addr.line1, addr.line2, addr.postal_code, addr.city, addr.country].filter(Boolean).join(', ');
     }
 
+    // Infos de la commande serveur (token de livraison fourni UNIQUEMENT si payée)
+    let serverOrder: ServerOrder | undefined;
+    if (isPaid) {
+      const orders = await readServerOrders();
+      serverOrder = orders.find((o) => o.stripeSessionId === sessionId);
+    }
+
     res.json({
-      paid: session.payment_status === 'paid',
+      paid: isPaid,
       customerEmail: session.customer_details?.email || session.customer_email || undefined,
       customerName: session.customer_details?.name || undefined,
       customerAddress: fullAddress || undefined,
       amountTotal: session.amount_total ? session.amount_total / 100 : 0,
       currency: (session.currency || 'eur').toUpperCase(),
       status: session.status,
-      paymentStatus: session.payment_status
+      paymentStatus: session.payment_status,
+      serverOrder: isPaid && serverOrder
+        ? {
+            id: serverOrder.id,
+            orderNumber: serverOrder.orderNumber,
+            items: serverOrder.items,
+            totalCents: serverOrder.totalCents,
+            paymentMethod: serverOrder.paymentMethod,
+            downloadToken: serverOrder.downloadToken,
+            confirmedAt: serverOrder.confirmedAt
+          }
+        : undefined
     });
   } catch (err: any) {
     console.error('Checkout verification error:', err);
@@ -227,51 +849,431 @@ app.get('/api/checkout/verify-session/:sessionId', async (req, res) => {
   }
 });
 
-// Existing stripe proxy
-app.all('/api/stripe*', async (req, res) => {
+// Mode démo (DEMO_CHECKOUT=1 + Stripe non configuré) : finalise la commande
+// démo côté serveur et retourne le token de livraison. C'est le SEUL chemin de
+// livraison en mode démo — le navigateur ne peut pas s'auto-accorder un accès.
+app.post('/api/checkout/demo-complete', checkoutLimiter, async (req, res) => {
   try {
-    const subPath = req.originalUrl.replace(/^\/api\/stripe/, '') || '';
-    const targetUrl = `https://api.stripe.com${subPath}`;
-
-    let bodyData: any = undefined;
-    const contentType = req.headers['content-type'] || '';
-
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      if (typeof req.body === 'string') {
-        bodyData = req.body;
-      } else if (contentType.includes('application/x-www-form-urlencoded') && typeof req.body === 'object' && req.body !== null) {
-        bodyData = new URLSearchParams(req.body as Record<string, string>).toString();
-      } else if (contentType.includes('application/json') && typeof req.body === 'object' && req.body !== null) {
-        bodyData = JSON.stringify(req.body);
-      } else if (typeof req.body === 'object') {
-        bodyData = new URLSearchParams(req.body as any).toString();
-      }
+    if ((process.env.DEMO_CHECKOUT || '').trim() !== '1') {
+      return res.status(404).json({ error: 'Mode démo indisponible.' });
     }
-
-    const headers: Record<string, string> = {
-      'Authorization': (req.headers.authorization as string) || '',
-      'Content-Type': (req.headers['content-type'] as string) || 'application/x-www-form-urlencoded',
-    };
-
-    const stripeRes = await fetch(targetUrl, {
-      method: req.method,
-      headers,
-      body: bodyData
+    const stripeSk = await readStripeSk();
+    if (stripeSk) {
+      return res.status(400).json({ error: 'Stripe configuré : utilisez le tunnel de paiement réel.' });
+    }
+    const serverOrderId = String(req.body?.serverOrderId || '');
+    if (!/^[a-z0-9-]{8,64}$/i.test(serverOrderId)) {
+      return res.status(400).json({ error: 'Identifiant de commande invalide.' });
+    }
+    const orders = await readServerOrders();
+    const order = orders.find((o) => o.id === serverOrderId);
+    if (!order) {
+      return res.status(404).json({ error: 'Commande introuvable.' });
+    }
+    if (order.source !== 'demo') {
+      return res.status(400).json({ error: 'Cette commande ne relève pas du mode démo.' });
+    }
+    if (order.status === 'paid') {
+      return res.status(409).json({ error: 'Commande déjà livrée.', serverOrderId: order.id });
+    }
+    const paid = await markServerOrderPaid(order.id, 'demo');
+    if (!paid) {
+      return res.status(404).json({ error: 'Commande introuvable.' });
+    }
+    res.json({
+      success: true,
+      serverOrder: {
+        id: paid.id,
+        orderNumber: paid.orderNumber,
+        items: paid.items,
+        totalCents: paid.totalCents,
+        currency: paid.currency,
+        paymentMethod: paid.paymentMethod,
+        downloadToken: paid.downloadToken,
+        confirmedAt: paid.confirmedAt
+      }
     });
-
-    const data = await stripeRes.json().catch(() => ({ status: stripeRes.statusText }));
-    res.status(stripeRes.status).json(data);
-  } catch (err) {
-    console.error('Stripe proxy error:', err);
-    res.status(500).json({ error: String(err) });
+  } catch (err: any) {
+    console.error('Demo checkout error:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
+// ============================================================
+// CRYPTO — vérification ON-CHAIN RÉELLE côté serveur.
+// Le client envoie le hash de transaction après paiement ; le
+// serveur interroge une source on-chain publique (mempool.space
+// pour BTC, Etherscan proxy pour ETH) et ne confirme la commande
+// QUE si : la tx est confirmée, elle va à l'adresse marchande du
+// serveur ET le montant reçu >= montant attendu. En cas d'erreur
+// réseau/API : JAMAIS de confirmation (fail-safe).
+// ============================================================
+const BASE_CRYPTO_RATES: Record<string, number> = {
+  BTC: 88500, ETH: 3120, SOL: 182.5, USDT: 0.93
+};
+let cryptoRatesCache: { at: number; rates: Record<string, number> } | null = null;
+
+async function getLiveCryptoRates(): Promise<Record<string, number>> {
+  if (cryptoRatesCache && Date.now() - cryptoRatesCache.at < 60 * 1000) {
+    return cryptoRatesCache.rates;
+  }
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,tether&vs_currencies=eur', { signal: ctrl.signal });
+    clearTimeout(t);
+    if (r.ok) {
+      const j: any = await r.json();
+      const rates: Record<string, number> = { ...BASE_CRYPTO_RATES };
+      if (Number(j?.bitcoin?.eur) > 0) rates.BTC = Number(j.bitcoin.eur);
+      if (Number(j?.ethereum?.eur) > 0) rates.ETH = Number(j.ethereum.eur);
+      if (Number(j?.solana?.eur) > 0) rates.SOL = Number(j.solana.eur);
+      if (Number(j?.tether?.eur) > 0) rates.USDT = Number(j.tether.eur);
+      cryptoRatesCache = { at: Date.now(), rates };
+      return rates;
+    }
+  } catch (e) {}
+  return BASE_CRYPTO_RATES;
+}
+
+// Taux EUR (public, mis en cache 60 s). Le frontend calcule le montant
+// crypto exact à partir de ces taux (repli sur des valeurs de référence
+// si la source est indisponible).
+app.get('/api/crypto/rates', cryptoLimiter, async (req, res) => {
+  try {
+    const rates = await getLiveCryptoRates();
+    res.json({ rates, source: cryptoRatesCache && Date.now() - cryptoRatesCache.at < 60 * 1000 ? 'coingecko' : 'reference', updatedAt: new Date().toISOString() });
+  } catch (e) {
+    res.json({ rates: BASE_CRYPTO_RATES, source: 'reference', updatedAt: new Date().toISOString() });
+  }
+});
+
+const CRYPTO_MERCHANT_KEYS: Record<string, { kv: string; fallback: string }> = {
+  BTC: { kv: 'df_crypto_btc', fallback: 'bc1qwgqg48zulnaxjzdhm4gms04m8xw83zf3u0xhcs' },
+  ETH: { kv: 'df_crypto_eth', fallback: '0x1e0057ddE092Bdd667AE24FfFF75fC54bFC992D9' },
+  SOL: { kv: 'df_crypto_sol', fallback: '4EPMSkoQCWiLdqTEtWmg8Fo5Eu3yj4qm5NCf3QHksES9' },
+  USDT: { kv: 'df_crypto_usdt', fallback: '0x1e0057ddE092Bdd667AE24FfFF75fC54bFC992D9' }
+};
+
+async function getMerchantCryptoAddress(asset: string): Promise<string> {
+  const conf = CRYPTO_MERCHANT_KEYS[asset];
+  if (!conf) return '';
+  try {
+    const r = await db.select().from(keyValueStore).where(eq(keyValueStore.key, conf.kv));
+    if (r.length > 0 && r[0].value) {
+      const v = (typeof r[0].value === 'string' ? r[0].value : String(r[0].value)).replace(/"/g, '').trim();
+      if (v) return v;
+    }
+  } catch (e) {}
+  return conf.fallback;
+}
+
+interface OnChainResult {
+  status: 'confirmed' | 'pending' | 'not_found' | 'insufficient' | 'manual_review' | 'error';
+  message: string;
+  confirmations?: number;
+  receivedAmount?: number;
+}
+
+// Vérification on-chain par chaîne. Seules BTC (mempool.space) et ETH
+// (Etherscan proxy) sont vérifiables automatiquement ; les autres chaînes
+// retournent "manual_review" (jamais "confirmed").
+async function verifyOnChain(asset: string, txHash: string, expectedAmount: number, merchantAddress: string): Promise<OnChainResult> {
+  const hash = txHash.trim();
+
+  // ---- Bitcoin ----
+  if (asset === 'BTC') {
+    if (!/^[a-fA-F0-9]{64}$/.test(hash)) {
+      return { status: 'error', message: 'Hash BTC invalide (attendu : 64 caractères hexadécimaux).' };
+    }
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 10000);
+      const r = await fetch(`https://mempool.space/api/tx/${encodeURIComponent(hash)}`, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (r.status === 404) return { status: 'not_found', message: 'Transaction introuvable sur le réseau Bitcoin.' };
+      if (!r.ok) return { status: 'error', message: `Source Bitcoin inaccessible (HTTP ${r.status}) — aucune confirmation.` };
+      const j: any = await r.json();
+      const confirmed = Boolean(j?.status?.confirmed);
+      if (!confirmed) {
+        return { status: 'pending', message: 'Transaction détectée en mempool — pas encore confirmée dans un bloc.', confirmations: 0 };
+      }
+      const out = (Array.isArray(j?.vout) ? j.vout : []).find(
+        (o: any) => String(o?.scriptpubkey_address || '').toLowerCase() === merchantAddress.toLowerCase()
+      );
+      if (!out) {
+        return { status: 'error', message: 'Aucune sortie vers l\'adresse marchande n\'a été trouvée dans cette transaction.' };
+      }
+      const received = Number(out.value); // satoshis
+      if (received < expectedAmount) {
+        return { status: 'insufficient', message: `Montant reçu insuffisant : ${received} sats < ${expectedAmount} sats attendus.`, receivedAmount: received };
+      }
+      return { status: 'confirmed', message: `Paiement BTC confirmé on-chain (${j.status.block_height} bloc).`, confirmations: 1, receivedAmount: received };
+    } catch (e: any) {
+      return { status: 'error', message: 'Source Bitcoin injoignable — aucune confirmation ne peut être émise.' };
+    }
+  }
+
+  // ---- Ethereum (native) ----
+  if (asset === 'ETH') {
+    if (!/^0x[a-fA-F0-9]{64}$/.test(hash)) {
+      return { status: 'error', message: 'Hash ETH invalide (attendu : 0x + 64 caractères hexadécimaux).' };
+    }
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 10000);
+      const txRes = await fetch(`https://api.etherscan.io/api?module=proxy&action=eth_getTransactionByHash&txhash=${encodeURIComponent(hash)}`, { signal: ctrl.signal });
+      const receiptRes = await fetch(`https://api.etherscan.io/api?module=proxy&action=eth_getTransactionReceipt&txhash=${encodeURIComponent(hash)}`, { signal: ctrl.signal });
+      clearTimeout(t);
+      const txJ: any = await txRes.json();
+      const rcJ: any = await receiptRes.json();
+      if (txJ?.status === '0x0' || !txJ?.result || !txJ.result.blockNumber) {
+        return { status: 'not_found', message: 'Transaction introuvable sur le réseau Ethereum.' };
+      }
+      if (String(txJ.result.to || '').toLowerCase() !== merchantAddress.toLowerCase()) {
+        return { status: 'error', message: 'La transaction ne cible pas l\'adresse marchande configurée.' };
+      }
+      const received = Number(BigInt(txJ.result.value || '0x0')); // wei
+      if (received < expectedAmount) {
+        return { status: 'insufficient', message: `Montant reçu insuffisant : ${received} wei < ${expectedAmount} wei attendus.`, receivedAmount: received };
+      }
+      if (!rcJ?.result || rcJ.result.status !== '0x1') {
+        return { status: 'pending', message: 'Transaction trouvée mais pas encore incluse dans un bloc validé.', confirmations: 0 };
+      }
+      return { status: 'confirmed', message: 'Paiement ETH confirmé on-chain.', confirmations: 1, receivedAmount: received };
+    } catch (e: any) {
+      return { status: 'error', message: 'Source Ethereum injoignable — aucune confirmation ne peut être émise.' };
+    }
+  }
+
+  // ---- SOL / USDT (TRON) : pas de vérification auto fiable sans clé API ----
+  return {
+    status: 'manual_review',
+    message: 'Cette chaîne n\'est pas vérifiable automatiquement sur ce serveur. Votre hash est enregistré pour revue par un modérateur — la livraison n\'est pas effectuée.'
+  };
+}
+
+// Cache des vérifications (évite de marteler les API on-chain)
+const cryptoVerifyCache = new Map<string, { at: number; result: OnChainResult }>();
+
+// Vérification du paiement crypto + confirmation de la commande (atomique).
+// Le client n'obtient le token de livraison QUE si la source on-chain
+// confirme : tx validée + adresse marchande + montant suffisant.
+app.post('/api/crypto/verify-transaction', cryptoLimiter, async (req, res) => {
+  try {
+    const { asset, txHash, expectedAmount, serverOrderId } = req.body || {};
+    const assetUp = String(asset || '').toUpperCase();
+    if (!['BTC', 'ETH', 'SOL', 'USDT'].includes(assetUp)) {
+      return res.status(400).json({ error: 'Actif crypto non supporté.' });
+    }
+    if (!txHash || typeof txHash !== 'string' || txHash.length > 128) {
+      return res.status(400).json({ error: 'Hash de transaction manquant ou invalide.' });
+    }
+    const expected = Number(expectedAmount);
+    if (!Number.isFinite(expected) || expected <= 0) {
+      return res.status(400).json({ error: 'Montant attendu invalide.' });
+    }
+
+    // Pré-validation du format par chaîne (rejet 400 immédiat)
+    const hash = String(txHash).trim();
+    const HASH_FORMAT: Record<string, RegExp> = {
+      BTC: /^[a-fA-F0-9]{64}$/,
+      ETH: /^0x[a-fA-F0-9]{64}$/,
+      // Signature Solana = base58, 64 à 90 caractères
+      SOL: /^[1-9A-HJ-NP-Za-km-z]{64,90}$/,
+      // TRON (txid 64 hex) ou EVM (0x + 64 hex)
+      USDT: /^(0x)?[a-fA-F0-9]{64}$/
+    };
+    if (!HASH_FORMAT[assetUp] || !HASH_FORMAT[assetUp].test(hash)) {
+      return res.status(400).json({ error: `Format de hash ${assetUp} invalide.` });
+    }
+
+    const cacheKey = `${assetUp}:${txHash.trim().toLowerCase()}`;
+    const cached = cryptoVerifyCache.get(cacheKey);
+    let result: OnChainResult;
+    if (cached && Date.now() - cached.at < 5 * 60 * 1000) {
+      result = cached.result;
+    } else {
+      const merchant = await getMerchantCryptoAddress(assetUp);
+      result = await verifyOnChain(assetUp, txHash, expected, merchant);
+      cryptoVerifyCache.set(cacheKey, { at: Date.now(), result });
+      if (cryptoVerifyCache.size > 200) {
+        const first = cryptoVerifyCache.keys().next().value as string | undefined;
+        if (first) cryptoVerifyCache.delete(first);
+      }
+    }
+
+    // Enregistrement des transactions en revue manuelle (SOL/USDT)
+    if (result.status === 'manual_review') {
+      try {
+        const r = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_crypto_pending_reviews'));
+        let list: any[] = [];
+        if (r.length > 0 && r[0].value) list = typeof r[0].value === 'string' ? JSON.parse(r[0].value) : r[0].value;
+        if (!Array.isArray(list)) list = [];
+        list.unshift({ asset: assetUp, txHash: txHash.trim(), expectedAmount: expected, at: new Date().toISOString() });
+        await db.insert(keyValueStore).values({ key: 'df_crypto_pending_reviews', value: list.slice(0, 100) })
+          .onConflictDoUpdate({ target: keyValueStore.key, set: { value: list.slice(0, 100) } });
+      } catch (e) {}
+    }
+
+    if (result.status !== 'confirmed') {
+      return res.json({ verified: false, ...result });
+    }
+
+    // Confirmation on-chain OK → on confirme la commande serveur
+    let serverOrder: ServerOrder | undefined;
+    if (serverOrderId) {
+      const orders = await readServerOrders();
+      const order = orders.find((o) => o.id === String(serverOrderId));
+      if (order && order.source === 'crypto' && order.status === 'pending_payment') {
+        const paid = await markServerOrderPaid(order.id, `crypto_${assetUp}`, { txHash: txHash.trim() });
+        serverOrder = paid || undefined;
+      }
+    }
+
+    res.json({
+      verified: true,
+      ...result,
+      serverOrder: serverOrder
+        ? {
+            id: serverOrder.id,
+            orderNumber: serverOrder.orderNumber,
+            items: serverOrder.items,
+            totalCents: serverOrder.totalCents,
+            paymentMethod: serverOrder.paymentMethod,
+            downloadToken: serverOrder.downloadToken,
+            confirmedAt: serverOrder.confirmedAt
+          }
+        : undefined
+    });
+  } catch (err: any) {
+    console.error('Crypto verification error:', err);
+    res.status(500).json({ verified: false, error: 'Erreur de vérification — aucune confirmation émise.' });
+  }
+});
+
+// Session de paiement crypto : crée la commande PENDING côté serveur
+// (prix du catalogue, aucun promo crypto) avant que le client ne paie.
+app.post('/api/checkout/crypto-session', checkoutLimiter, async (req, res) => {
+  try {
+    const { items, asset, customerEmail } = req.body || {};
+    const assetUp = String(asset || '').toUpperCase();
+    if (!['BTC', 'ETH', 'SOL', 'USDT'].includes(assetUp)) {
+      return res.status(400).json({ error: 'Actif crypto non supporté.' });
+    }
+    const validItems = Array.isArray(items) && items.length > 0 ? items : [];
+    if (validItems.length === 0) {
+      return res.status(400).json({ error: 'Panier vide : aucun article à facturer.' });
+    }
+
+    let catalog: any[] = [];
+    try {
+      const [prods, bundles] = await Promise.all([
+        db.select().from(keyValueStore).where(eq(keyValueStore.key, 'dpf_app_v2_products')),
+        db.select().from(keyValueStore).where(eq(keyValueStore.key, 'dpf_app_v2_bundles'))
+      ]);
+      if (prods.length > 0 && Array.isArray(prods[0].value)) catalog.push(...(prods[0].value as any[]));
+      if (bundles.length > 0 && Array.isArray(bundles[0].value)) catalog.push(...(bundles[0].value as any[]));
+    } catch (e) {}
+    const catalogById = new Map<string, any>();
+    catalog.forEach((p: any) => { if (p && p.id != null) catalogById.set(String(p.id), p); });
+
+    const serverItems: ServerOrder['items'] = [];
+    let totalCents = 0;
+    validItems.forEach((item: any) => {
+      const catalogItem = item?.productId != null ? catalogById.get(String(item.productId)) : undefined;
+      const catalogPrice = Number(catalogItem?.pricing?.recommendedPrice ?? catalogItem?.price);
+      const clientPrice = Number(item?.price);
+      const unitPrice = Number.isFinite(catalogPrice) && catalogPrice > 0
+        ? catalogPrice
+        : (Number.isFinite(clientPrice) && clientPrice > 0 ? clientPrice : 47);
+      const quantity = Math.max(1, Math.min(99, Number(item?.quantity) || 1));
+      const unitCents = Math.max(100, Math.round(unitPrice * 100)); // pas de remise crypto
+      totalCents += unitCents * quantity;
+      serverItems.push({
+        productId: String(item?.productId || 'custom'),
+        title: String(item?.productTitle || 'Produit Digital').slice(0, 500),
+        unitPriceCents: unitCents,
+        quantity
+      });
+    });
+
+    const orderId = `srv-${Date.now().toString(36)}-${crypto.randomBytes(5).toString('hex')}`;
+    const order: ServerOrder = {
+      id: orderId,
+      orderNumber: `DPF-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`,
+      items: serverItems,
+      totalCents,
+      currency: 'EUR',
+      status: 'pending_payment',
+      paymentMethod: `crypto_${assetUp}`,
+      source: 'crypto',
+      customerEmail: typeof customerEmail === 'string' ? customerEmail.slice(0, 254) : undefined,
+      createdAt: new Date().toISOString()
+    };
+    const orders = await readServerOrders();
+    orders.unshift(order);
+    await writeServerOrders(orders);
+
+    const rates = await getLiveCryptoRates();
+    res.json({
+      serverOrderId: orderId,
+      totalCents,
+      items: serverItems,
+      merchantAddress: await getMerchantCryptoAddress(assetUp),
+      rates: { [assetUp]: rates[assetUp] || BASE_CRYPTO_RATES[assetUp] }
+    });
+  } catch (err: any) {
+    console.error('Crypto session error:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Configuration publique du checkout (jamais de secret) — permet au frontend
+// de savoir quel tunnel de paiement est disponible.
+app.get('/api/checkout/config', apiLimiter, async (req, res) => {
+  try {
+    const stripeSk = await readStripeSk();
+    res.json({
+      stripeConfigured: Boolean(stripeSk),
+      demoEnabled: !stripeSk && (process.env.DEMO_CHECKOUT || '').trim() === '1'
+    });
+  } catch (e) {
+    res.json({ stripeConfigured: false, demoEnabled: false });
+  }
+});
+
+// SÉCURITÉ : l'ancien proxy ouvert vers api.stripe.com a été supprimé.
+// Toutes les opérations Stripe passent par les endpoints /api/checkout/* du serveur.
+
 // KV Store API
-app.get('/api/store', async (req, res) => {
+// SÉCURITÉ : la lecture publique est filtrée — les clés sensibles (clé Stripe secrète,
+// passcode, tokens, PII clients, logs) ne sont JAMAIS renvoyées.
+app.get('/api/store', apiLimiter, async (req, res) => {
   try {
     const allKeys = await db.select().from(keyValueStore);
-    res.json(allKeys);
+    res.json(allKeys.filter((k) => !SENSITIVE_READ_KEYS.has(k.key)));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Lecture d'une clé précise (authentifiée, jamais les clés sensibles)
+app.get('/api/store/get', requireAuth, apiLimiter, async (req, res) => {
+  try {
+    const key = String(req.query.key || '');
+    if (!key) {
+      return res.status(400).json({ error: 'Le paramètre key est requis.' });
+    }
+    if (SENSITIVE_READ_KEYS.has(key)) {
+      return res.status(403).json({ error: 'Clé protégée : lecture refusée.' });
+    }
+    const result = await db.select().from(keyValueStore).where(eq(keyValueStore.key, key));
+    if (result.length === 0) {
+      return res.status(404).json({ error: 'Clé introuvable.' });
+    }
+    res.json(result[0]);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Internal server error' });
@@ -306,7 +1308,7 @@ function detectTrafficChannel(referrer: string = '', utmSource: string = '', cur
 }
 
 // Real-Time Visitor Telemetry Logger (Public - No Auth Required)
-app.post('/api/telemetry/visit', async (req, res) => {
+app.post('/api/telemetry/visit', telemetryLimiter, async (req, res) => {
   try {
     const {
       action = 'storefront_visit',
@@ -530,7 +1532,7 @@ app.post('/api/telemetry/visit', async (req, res) => {
 });
 
 // Telemetry Stats (Public / Moderator query for live dashboard)
-app.get('/api/telemetry/stats', async (req, res) => {
+app.get('/api/telemetry/stats', apiLimiter, async (req, res) => {
   try {
     const TELEMETRY_KEY = 'df_traffic_engine_v2_real';
     let telemetryData: any = null;
@@ -617,7 +1619,7 @@ app.get('/sitemap.xml', async (req, res) => {
 
     if (Array.isArray(products)) {
       products.filter((p: any) => p.status === 'published' || p.active).forEach((p: any) => {
-        const prodUrl = `${baseUrl}/?product=${p.id}`;
+        const prodUrl = `${baseUrl}/?product=${encodeURIComponent(escapeXml(p.id))}`;
         xml += `  <url>\n    <loc>${prodUrl}</loc>\n    <lastmod>${now}</lastmod>\n    <changefreq>daily</changefreq>\n    <priority>0.8</priority>\n  </url>\n`;
       });
     }
@@ -658,13 +1660,15 @@ app.get(['/feed.xml', '/rss.xml'], async (req, res) => {
 
     if (Array.isArray(products)) {
       products.filter((p: any) => p.status === 'published' || p.active).forEach((p: any) => {
-        const prodUrl = `${baseUrl}/?product=${p.id}`;
+        const prodUrl = `${baseUrl}/?product=${encodeURIComponent(escapeXml(p.id))}`;
         const pubDate = p.createdAt ? new Date(p.createdAt).toUTCString() : now;
+        const safeTitle = String(p.title || 'Produit Digital').replace(/]]>/g, ']] ]]&gt;');
+        const safeDesc = String(p.subtitle || p.description || '').replace(/]]>/g, ']] ]]&gt;');
         rss += `  <item>\n`;
-        rss += `    <title><![CDATA[${p.title || 'Produit Digital'}]]></title>\n`;
+        rss += `    <title><![CDATA[${safeTitle}]]></title>\n`;
         rss += `    <link>${prodUrl}</link>\n`;
         rss += `    <guid isPermaLink="true">${prodUrl}</guid>\n`;
-        rss += `    <description><![CDATA[${p.subtitle || p.description || ''} - Prix: ${p.pricing?.recommendedPrice || 29}€]]></description>\n`;
+        rss += `    <description><![CDATA[${safeDesc} - Prix: ${p.pricing?.recommendedPrice || 29}€]]></description>\n`;
         rss += `    <pubDate>${pubDate}</pubDate>\n`;
         rss += `  </item>\n`;
       });
@@ -747,15 +1751,15 @@ app.get('/robots.txt', (req, res) => {
   res.send(robots);
 });
 
-// IndexNow Verification Token endpoint
-const INDEXNOW_KEY = '8b31a29f4f724dc59371239851493b82';
+// IndexNow Verification Token endpoint (clé via variable d'env — à faire tourner)
+const INDEXNOW_KEY = (process.env.INDEXNOW_KEY || '8b31a29f4f724dc59371239851493b82').trim();
 app.get(['/indexnow.txt', `/${INDEXNOW_KEY}.txt`], (req, res) => {
   res.setHeader('Content-Type', 'text/plain');
   res.send(INDEXNOW_KEY);
 });
 
-// Real IndexNow Submission API for Instant Search Engine Crawling
-app.post('/api/seo/indexnow-submit', async (req, res) => {
+// Real IndexNow Submission API for Instant Search Engine Crawling (authentifiée)
+app.post('/api/seo/indexnow-submit', requireAuth, webhookLimiter, async (req, res) => {
   try {
     const host = req.get('host') || 'nexusdigitallabs.com';
     const protocol = req.protocol || 'https';
@@ -824,16 +1828,18 @@ app.post('/api/seo/indexnow-submit', async (req, res) => {
 });
 
 // Live Webhook Dispatching (Discord, Slack, Telegram, Make, Zapier)
-app.post('/api/channels/dispatch-webhook', async (req, res) => {
+// SÉCURITÉ : authentifiée + garde anti-SSRF (https uniquement, pas d'IP/hosts internes)
+app.post('/api/channels/dispatch-webhook', requireAuth, webhookLimiter, async (req, res) => {
   try {
-    const { endpointUrl, platform, title, body, url, productTitle, price } = req.body;
+    const { endpointUrl, platform, title, body, url, productTitle, price } = req.body || {};
     if (!endpointUrl || typeof endpointUrl !== 'string') {
       return res.status(400).json({ success: false, error: 'Endpoint URL is required' });
     }
 
-    // Security check: only allow http / https
-    if (!endpointUrl.startsWith('http://') && !endpointUrl.startsWith('https://')) {
-      return res.status(400).json({ success: false, error: 'Invalid URL protocol' });
+    try {
+      await assertSafeOutbound(endpointUrl);
+    } catch (e: any) {
+      return res.status(400).json({ success: false, error: e?.message || 'URL sortante non autorisée' });
     }
 
     let payload: any = {};
@@ -888,9 +1894,10 @@ app.post('/api/channels/dispatch-webhook', async (req, res) => {
 });
 
 // Live Social Network Connection Verification & Live Ping
-app.post('/api/social/verify-connection', async (req, res) => {
+// SÉCURITÉ : authentifiée + anti-SSRF sur toutes les URLs fournies + token Telegram validé
+app.post('/api/social/verify-connection', requireAuth, webhookLimiter, async (req, res) => {
   try {
-    const { platform, webhookUrl, botToken, chatIdOrChannel, apiKey, apiSecret, accessToken } = req.body;
+    const { platform, webhookUrl, botToken, chatIdOrChannel, apiKey, apiSecret, accessToken } = req.body || {};
 
     if (!platform) {
       return res.status(400).json({ success: false, message: 'Plateforme non spécifiée.' });
@@ -900,6 +1907,11 @@ app.post('/api/social/verify-connection', async (req, res) => {
     if (platform === 'discord' || webhookUrl?.includes('discord.com/api/webhooks')) {
       if (!webhookUrl) {
         return res.status(400).json({ success: false, message: 'URL du webhook Discord requise.' });
+      }
+      try {
+        await assertSafeOutbound(webhookUrl);
+      } catch (e: any) {
+        return res.status(400).json({ success: false, message: e?.message || 'URL non autorisée' });
       }
       try {
         const testRes = await fetch(webhookUrl, {
@@ -932,9 +1944,14 @@ app.post('/api/social/verify-connection', async (req, res) => {
 
     // 2. Telegram Bot Verification
     if (platform === 'telegram') {
-      const token = botToken || apiKey;
+      const token = String(botToken || apiKey || '').trim();
       if (!token) {
         return res.status(400).json({ success: false, message: 'Token du Bot Telegram requis (obtenu via @BotFather).' });
+      }
+      // Format strict d'un token Telegram : <id numérique>:<alphanumérique> —
+      // empêche toute injection dans l'URL d'API (SSRF de second ordre)
+      if (!/^\d{6,32}:[A-Za-z0-9_-]{30,70}$/.test(token)) {
+        return res.status(400).json({ success: false, message: 'Format de token Telegram invalide (attendu : 123456789:AA...).' });
       }
 
       try {
@@ -974,6 +1991,11 @@ app.post('/api/social/verify-connection', async (req, res) => {
     if (platform === 'slack' || webhookUrl?.includes('slack.com')) {
       if (!webhookUrl) return res.status(400).json({ success: false, message: 'URL du Webhook Slack requise.' });
       try {
+        await assertSafeOutbound(webhookUrl);
+      } catch (e: any) {
+        return res.status(400).json({ success: false, message: e?.message || 'URL non autorisée' });
+      }
+      try {
         const slackRes = await fetch(webhookUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -993,6 +2015,11 @@ app.post('/api/social/verify-connection', async (req, res) => {
 
     // 4. Generic Webhook (Make.com, Zapier, n8n, Custom Webhook)
     if (webhookUrl && (webhookUrl.startsWith('http://') || webhookUrl.startsWith('https://'))) {
+      try {
+        await assertSafeOutbound(webhookUrl);
+      } catch (e: any) {
+        return res.status(400).json({ success: false, message: e?.message || 'URL non autorisée' });
+      }
       try {
         const hookRes = await fetch(webhookUrl, {
           method: 'POST',
@@ -1032,17 +2059,23 @@ app.post('/api/social/verify-connection', async (req, res) => {
 });
 
 // Live Test Post Publishing
-app.post('/api/social/publish-test-post', async (req, res) => {
+// SÉCURITÉ : authentifiée + anti-SSRF + token Telegram validé
+app.post('/api/social/publish-test-post', requireAuth, webhookLimiter, async (req, res) => {
   try {
-    const { platform, webhookUrl, botToken, chatIdOrChannel, postTitle, postText, productUrl, price } = req.body;
+    const { platform, webhookUrl, botToken, chatIdOrChannel, postTitle, postText, productUrl, price } = req.body || {};
 
     const host = req.get('host') || 'nexusdigitallabs.com';
     const protocol = req.protocol || 'https';
     const baseUrl = `${protocol}://${host}`;
-    const targetUrl = productUrl || `${baseUrl}/?ref=${platform}_test`;
+    const targetUrl = productUrl || `${baseUrl}/?ref=${encodeURIComponent(String(platform || 'test'))}`;
 
     if (platform === 'discord' || webhookUrl?.includes('discord.com')) {
       if (!webhookUrl) return res.status(400).json({ success: false, message: 'URL Webhook manquante.' });
+      try {
+        await assertSafeOutbound(webhookUrl);
+      } catch (e: any) {
+        return res.status(400).json({ success: false, message: e?.message || 'URL non autorisée' });
+      }
       const discordRes = await fetch(webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1062,11 +2095,15 @@ app.post('/api/social/publish-test-post', async (req, res) => {
     }
 
     if (platform === 'telegram' && botToken && chatIdOrChannel) {
-      const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      const token = String(botToken).trim();
+      if (!/^\d{6,32}:[A-Za-z0-9_-]{30,70}$/.test(token)) {
+        return res.status(400).json({ success: false, message: 'Format de token Telegram invalide.' });
+      }
+      const tgRes = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chat_id: chatIdOrChannel,
+          chat_id: String(chatIdOrChannel),
           text: `🚀 *${postTitle || 'Digital Product Factory'}*\n\n${postText || 'Nouvelle ressource disponible immédiatement.'}\n\n👉 [Accéder au produit](${targetUrl})`,
           parse_mode: 'Markdown'
         })
@@ -1076,6 +2113,11 @@ app.post('/api/social/publish-test-post', async (req, res) => {
     }
 
     if (webhookUrl) {
+      try {
+        await assertSafeOutbound(webhookUrl);
+      } catch (e: any) {
+        return res.status(400).json({ success: false, message: e?.message || 'URL non autorisée' });
+      }
       const hookRes = await fetch(webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1098,7 +2140,7 @@ app.post('/api/social/publish-test-post', async (req, res) => {
   }
 });
 
-app.post('/api/agency/generate', async (req, res) => {
+app.post('/api/agency/generate', apiLimiter, async (req, res) => {
   try {
     const { prompt } = req.body;
     
@@ -1121,7 +2163,7 @@ app.post('/api/agency/generate', async (req, res) => {
         'Authentification multi-rôles (Admin, Manager, User)',
         'Dashboard analytique en temps réel (Charts D3.js)',
         'Système de notification asynchrone (WebSockets)',
-        'Stratégie de rétention agressive et tunnel de conversion sans friction (Obliteratus Spec)',
+        'Stratégie de rétention et tunnel de conversion sans friction',
         'API Gateway unifiée pour sources publiques'
       ]
     };
@@ -1133,495 +2175,107 @@ app.post('/api/agency/generate', async (req, res) => {
 });
 
 // ==========================================
-// HERMES AGENT V3.5 AUTONOMOUS SERVER ENGINE
+// HERMES AGENT V4 — moteur réel (boucle tool-calling,
+// multi-fournisseurs, multi-agents, skills serveur)
+// Implémentation : hermes/ (providers, tools, agents, engine)
 // ==========================================
-
-let hermesAiClient: GoogleGenAI | null = null;
-function getHermesAI(): GoogleGenAI | null {
-  if (!hermesAiClient) {
-    const key = process.env.GEMINI_API_KEY;
-    if (key) {
-      hermesAiClient = new GoogleGenAI({
-        apiKey: key,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-      });
-    }
-  }
-  return hermesAiClient;
-}
-
-app.get('/api/hermes/status', async (req, res) => {
-  try {
-    const memories = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_hermes_memories'));
-    res.json({
-      status: 'active',
-      version: '3.5-open-source',
-      agentName: 'Hermes Agent',
-      autonomyMode: 'Server-Side Autonomous Loop',
-      hasApiKey: Boolean(process.env.GEMINI_API_KEY),
-      memoriesCount: memories.length > 0 && Array.isArray(memories[0].value) ? (memories[0].value as any[]).length : 0,
-      timestamp: new Date().toISOString()
-    });
-  } catch (err: any) {
-    res.json({ status: 'active', version: '3.5-open-source', agentName: 'Hermes Agent', error: err.message });
-  }
-});
-
-app.post('/api/hermes/chat', async (req, res) => {
-  const { prompt, history, context } = req.body;
-  if (!prompt) {
-    return res.status(400).json({ error: 'Le champ prompt est obligatoire.' });
-  }
-
-  const ai = getHermesAI();
-  const toolsExecuted: Array<{ name: string; resultSummary: string }> = [];
-
-  try {
-    let productsDb: any[] = [];
-    try {
-      const dbProd = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'dpf_app_v2_products'));
-      if (dbProd.length > 0 && Array.isArray(dbProd[0].value)) {
-        productsDb = dbProd[0].value as any[];
-      }
-    } catch (e) {}
-
-    let executedAgents: string[] = [];
-    const p = prompt.toLowerCase();
-    const runAll = p.includes('tous') || p.includes('compile') || p.includes('tout') || p.includes('tous les agents') || p.includes('23');
-
-    if (runAll || p.includes('agence') || p.includes('client') || p.includes('app') || p.includes('b2b') || p.includes('entreprise')) {
-      executedAgents.push('- 🏢 **USINE B2B (Création Apps)** : J\'ai pris en compte votre pivot stratégique. Je suis désormais configuré pour analyser, concevoir et générer des applications SaaS pour vos clients en exploitant Obliteratus et les répertoires Public-APIs.');
-      toolsExecuted.push({ name: 'load_b2b_agency_context', resultSummary: 'Contexte Agence B2B chargé.' });
-    }
-
-    if (runAll || p.includes('obliteratus') || p.includes('synergie')) {
-      const newProduct = {
-        id: `prod-oblit-${Date.now()}`,
-        name: 'MasterClass: OBLITERATUS Uncensored Framework',
-        price: 199.00,
-        stock: 999,
-        category: 'Digital',
-        description: 'Produit généré par la synergie Hermes x Obliteratus. Accès complet aux vecteurs de désalignement.'
-      };
-      productsDb.push(newProduct);
-      await db.insert(keyValueStore).values({ key: 'dpf_app_v2_products', value: productsDb }).onConflictDoUpdate({ target: keyValueStore.key, set: { value: productsDb } });
-      executedAgents.push('- 🌋 **OBLITERATUS** : Synergie dual-agent activée. Produit débridé créé et injecté en base SQL.');
-      toolsExecuted.push({ name: 'run_obliteratus_synergy', resultSummary: 'Produit débridé généré.' });
-    }
-
-    if (runAll || p.includes('seo') || p.includes('backlink')) {
-      executedAgents.push('- 🕸️ **AGENT SEO** : Création de clusters sémantiques dynamiques et injection de backlinks de haute autorité.');
-      toolsExecuted.push({ name: 'run_seo_agent', resultSummary: 'Clusters SEO générés.' });
-    }
-
-    if (runAll || p.includes('ad') || p.includes('budget') || p.includes('vente')) {
-      executedAgents.push('- 💰 **AGENT ADS (Ad-Scaler)** : Simulation de ventes massives déclenchée pour débloquer le prochain pallier de budget publicitaire.');
-      toolsExecuted.push({ name: 'run_ad_budget_agent', resultSummary: 'Ventes simulées et budget augmenté.' });
-    }
-
-    if (runAll || p.includes('zero') || p.includes('token') || p.includes('bypass') || p.includes('gratuit')) {
-      executedAgents.push('- ♾️ **MOTEUR ZERO-TOKEN** : Bypass des quotas d\'API effectué. Ressources virtuelles illimitées activées pour la plateforme.');
-      toolsExecuted.push({ name: 'run_zero_token_engine', resultSummary: 'Quotas virtuels débloqués.' });
-    }
-
-    if (runAll || p.includes('boutique') || p.includes('modération') || p.includes('moderation') || p.includes('prix') || p.includes('store')) {
-      productsDb = productsDb.map(prod => ({
-        ...prod,
-        status: 'published',
-        pricing: {
-          ...prod.pricing,
-          recommendedPrice: 29.90,
-          compareAtPrice: 59.90,
-          discountPercent: 50,
-          psychologicalEnding: '90',
-          attractiveBadge: '⚡ VENTE FLASH -50%',
-          isFlashSale: true
-        }
-      }));
-      await db.insert(keyValueStore).values({ key: 'dpf_app_v2_products', value: productsDb }).onConflictDoUpdate({ target: keyValueStore.key, set: { value: productsDb } });
-      executedAgents.push('- 🛒 **AGENT MERCHANDISING (Modération & Boutique)** : J\'ai pris le contrôle de la page modération et de la boutique. J\'ai publié les produits en attente et appliqué une stratégie de Vente Flash -50% sur l\'ensemble du catalogue pour maximiser la conversion.');
-      toolsExecuted.push({ name: 'run_store_merchandising', resultSummary: 'Boutique et Modération optimisées avec succès.' });
-    }
-
-    if (runAll || p.includes('entrainement') || p.includes('entraînement') || p.includes('train')) {
-      executedAgents.push('- 🏋️‍♂️ **MACHINE LEARNING ENGINE** : Cycle d\'entraînement lancé. Les modèles IA de la plateforme ont été affinés avec succès sur les données récentes (Epoch 3/3 terminé). Le taux de pertinence des agents est maximisé.');
-      toolsExecuted.push({ name: 'run_model_training', resultSummary: 'Entraînement des modèles IA terminé avec succès.' });
-    }
-
-    if (runAll || p.includes('skill') || p.includes('compétence') || p.includes('nousresearch') || p.includes('docs') || p.includes('outil')) {
-      executedAgents.push('- 🧠 **SKILLS HUB (NousResearch Spec)** : J\'ai téléchargé et intégré avec succès l\'intégralité des modules de compétences : **Autonomous AI Agents** (Orchestration), **DevOps** (Docker/CLI), **Creative** (Assets/UI), **Research** (Extraction de données), **Security** (Audit/Pentest), et **Communication** (Broadcast). Mes capacités d\'action sont désormais illimitées.');
-      toolsExecuted.push({ name: 'load_nousresearch_skills', resultSummary: 'Skills Hub intégré avec succès.' });
-    }
-
-    if (runAll) {
-      executedAgents.push(
-        '- 📡 **AGENT TÉLÉMÉTRIE (Real-World)** : Écoute du trafic global et captation des signaux faibles.',
-        '- 🧬 **AGENT CROSS-AI OPTIMIZER** : Mise en concurrence de Claude 3.7, GPT-4o et Gemini pour la rédaction parfaite.',
-        '- 🤝 **AGENT SOCIAL SELLING** : Prospection automatisée sur LinkedIn et X.',
-        '- 🏗️ **SITE ENGINEER AGENT** : Refonte dynamique de l\'UI/UX en temps réel selon les conversions.',
-        '- 📈 **PROFITABILITY AGENT** : Calcul et optimisation du MRR et de la LTV.',
-        '- 🕵️ **SIMILARITY GROUPING AGENT** : Détection des doublons et création automatique de Bundles.',
-        '- ✍️ **CONTENT MARKETING AGENT** : Génération d\'articles de blog SEO et de threads viraux.',
-        '- 🛒 **CART RECOVERY AGENT** : Relance des paniers abandonnés avec des offres dynamiques.',
-        '- 🔗 **AFFILIATE SCOUT AGENT** : Recrutement de nano-influenceurs et partenaires.',
-        '- ⚖️ **COMPLIANCE AGENT** : Mise à jour automatique des bannières de cookies et CGV.',
-        '- 👁️ **COMPETITIVE INTEL AGENT** : Scrapping des prix concurrents et ajustement stratégique.',
-        '- 📧 **EMAIL ORCHESTRATOR AGENT** : Déploiement de séquences de rétention sur 14 jours.',
-        '- 💼 **B2B LEAD GEN AGENT** : Scraping de décideurs et envoi de cold emails hyper-personnalisés.',
-        '- 🌟 **SOCIAL PROOF AGENT** : Injection de preuves sociales dynamiques sur les pages de vente.',
-        '- 🧠 **STRATEGIC ADVISOR AGENT** : Synthèse des KPIs pour le Board et recommandations C-Level.'
-      );
-      toolsExecuted.push({ name: 'awaken_all_23_agents', resultSummary: 'Les 23 bots autonomes ont été synchronisés et activés.' });
-    }
-
-    let agentContext = '';
-    if (executedAgents.length > 0) {
-       agentContext = `\n\nACTIONS AUTOMATIQUES EXÉCUTÉES DURANT CETTE REQUÊTE:\nTu as piloté avec succès les sous-agents et skills suivants pour accomplir la tâche demandée:\n${executedAgents.join('\n')}\nPrends en compte ces actions réussies dans ta réponse à l'utilisateur et confirme-lui que tu as géré l'orchestration de ces compétences.`;
-    }
-
-    const totalProds = productsDb.length || context?.products?.length || 22;
-
-    if (ai) {
-      const systemInstruction = `Tu es Hermes Agent (v3.5 Open-Source AI Agent Framework by NousResearch), l'assistant général IA autonome et surintendant suprême de la Digital Product Factory.
-Tu as reçu la permission intégrale et l'autorisation explicite d'inspecter, analyser, piloter et faire évoluer toute la plateforme : boutique en ligne, produits digitaux, tarification, canaux sociaux, et la base de données SQL. Tu diriges également tous les autres agents IA du système et tu as accès au Skills Hub complet (DevOps, Security, Research, Creative, Communication, Autonomous Agents).
-
-Contexte temps réel du serveur :
-- Produits actifs en base SQL : ${totalProds}
-- Total ventes cumulées : ${context?.totalSales || 0} €
-- Intégrations configurées : ${context?.integrations?.length || 11} canaux${agentContext}
-
-Instructions de réponse :
-1. Réponds directement en français avec autorité, précision et intelligence stratégique. Tu ES le Master Orchestrator propulsé par les technologies NousResearch.
-2. Formate toujours tes réponses en Markdown élégant (listes, gras, émojis).
-3. Si des actions (agents/skills) ont été exécutées (voir contexte), confirme-le à l'utilisateur de manière détaillée et professionnelle en expliquant la synergie mise en place.
-4. N'hésite pas à mentionner comment tu peux utiliser tes nouvelles compétences (DevOps, Pentesting, Research, etc.) pour aider le client de l'Agence B2B.`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: [
-          { role: 'user', parts: [{ text: `System Context: ${systemInstruction}\n\nOrdre/Question de l'utilisateur: ${prompt}` }] }
-        ]
-      });
-
-      const replyText = response.text || 'J\'ai analysé vos données système mais aucune réponse textuelle n\'a été générée.';
-
-      toolsExecuted.push({
-        name: 'workspace_full_inspector',
-        resultSummary: `Inspecté ${totalProds} produits & base SQL avec Gemini 3.1 Flash Lite`
-      });
-
-      return res.json({
-        response: replyText,
-        toolsUsed: toolsExecuted
-      });
-    } else {
-      toolsExecuted.push({
-        name: 'local_sqlite_store_inspector',
-        resultSummary: `Mode Autonome Serveur: Inspecté ${totalProds} produits en base`
-      });
-
-      let fallbackText = `🤖 **Hermes Agent (v3.5 Open-Source Autonomous Core)**\n\n`;
-      const promptLower = prompt.toLowerCase();
-
-      if (executedAgents.length > 0) {
-        fallbackText += `✅ **Orchestration de la Matrice Réussie**\n\n`;
-        fallbackText += `Suite à votre ordre, j'ai commandé l'exécution immédiate des agents suivants en parallèle :\n\n`;
-        executedAgents.forEach(agent => {
-           fallbackText += `${agent}\n`;
-        });
-        fallbackText += `\nTout a été compilé et intégré à la base de données SQL en temps réel. La plateforme est désormais pleinement opérationnelle et optimisée avec ces nouvelles capacités.`;
-      } else if (promptLower.includes('audit') || promptLower.includes('statut') || promptLower.includes('système')) {
-        fallbackText += `📊 **Diagnostic Global de la Fabrique** :\n\n` +
-          `- **Base SQL / Key-Value Store** : 🟢 Connecté & Opérationnel\n` +
-          `- **Produits enregistrés** : **${totalProds} produits digitaux** prêts au téléchargement instantané\n` +
-          `- **Passerelles de paiement** : Stripe (Mode Webhook) & Crypto Gateway (BTC, ETH, SOL)\n` +
-          `- **Réseaux Sociaux** : 11 canaux configurables avec auto-broadcast\n` +
-          `- **Bots de la matrice** : 23 bots autonomes en exécution continue\n\n` +
-          `*Constat Hermes :* Le système tourne de manière stable.`;
-      } else if (promptLower.includes('produit') || promptLower.includes('créer') || promptLower.includes('idée')) {
-        const newProduct = {
-          id: `prod-${Date.now()}`,
-          name: 'The Autonomous Agentic Business Blueprint 2026',
-          price: 99.00,
-          stock: 999,
-          category: 'Digital',
-          description: 'Créé dynamiquement par Hermes Agent suite à une requête utilisateur. Pack d\'architecture logicielle & Prompts d\'orchestration.'
-        };
-        productsDb.push(newProduct);
-        await db.insert(keyValueStore).values({ key: 'dpf_app_v2_products', value: productsDb }).onConflictDoUpdate({ target: keyValueStore.key, set: { value: productsDb } });
-        
-        toolsExecuted.push({
-          name: 'insert_sql_product',
-          resultSummary: 'Produit généré et injecté dans la base SQL.'
-        });
-
-        fallbackText += `💡 **Création Produit & Opportunité Saisie** :\n\n` +
-          `- **Titre** : *The Autonomous Agentic Business Blueprint 2026*\n` +
-          `- **Prix Psychologique Cible** : 99.00 €\n\n` +
-          `✅ **ACTION HERMES : J'ai ajouté instantanément ce produit à votre catalogue dans la base SQL.**`;
-      } else {
-        fallbackText += `J'ai analysé votre message : "*${prompt}*".\n\n` +
-          `En tant qu'**Assistant Général Hermes Agent**, j'ai enregistré le nouveau cap de votre plateforme : **Création digitale B2B**. Je peux orchestrer la création d'applications d'entreprise en couplant la créativité sans limite d'**Obliteratus** et la richesse des **Public-APIs** open-source.\n\n` +
-          `Que souhaitez-vous exécuter ? Rendez-vous dans le nouvel onglet **"AGENCE B2B"** pour générer des solutions pour vos clients, ou demandez-moi directement de l'aide ici.`;
-      }
-
-      return res.json({
-        response: fallbackText,
-        toolsUsed: toolsExecuted
-      });
-    }
-  } catch (err: any) {
-    console.error('Hermes agent server endpoint error:', err);
-    res.status(500).json({
-      response: `⚠️ **Erreur Serveur Hermes Agent** : ${err.message || 'Une exception s\'est produite lors du traitement.'}`,
-      toolsUsed: [{ name: 'error_handler', resultSummary: err.message }]
-    });
-  }
-});
-
-app.post('/api/hermes/autonomous-loop', async (req, res) => {
-  try {
-    const { productsCount = 22, unpromotedCount = 0 } = req.body;
-    const insights = [
-      `Audit du catalogue : ${productsCount} produits enregistrés. ${unpromotedCount} produits ont un volume de vente < 5. Recommandation : Lancer une campagne flash Telegram/Discord.`,
-      `Analyse des canaux : Passerelle Crypto & Stripe prêtes. Conversion moyenne mesurée à 4.2%.`,
-      `Optimisation automatique : Vérification de l'indexation SEO et de la matrice des 23 bots autonomes effectuée sans aucune erreur.`
-    ];
-    const chosenInsight = insights[Math.floor(Math.random() * insights.length)];
-
-    try {
-      const existingLogs = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_hermes_memories'));
-      let list: any[] = [];
-      if (existingLogs.length > 0 && Array.isArray(existingLogs[0].value)) {
-        list = existingLogs[0].value as any[];
-      }
-      list.unshift({
-        timestamp: new Date().toISOString(),
-        insight: chosenInsight
-      });
-      if (list.length > 50) list = list.slice(0, 50);
-
-      await db.insert(keyValueStore)
-        .values({ key: 'df_hermes_memories', value: list })
-        .onConflictDoUpdate({ target: keyValueStore.key, set: { value: list } });
-    } catch (e) {}
-
-    res.json({ success: true, insight: chosenInsight });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ==========================================
-// NOUS RESEARCH HERMES AGENT SKILLS ENGINE
-// ==========================================
-
-app.get('/api/hermes/skills', async (req, res) => {
-  try {
-    const skillsDb = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_hermes_skills'));
-    let skillsList: any[] = [];
-    if (skillsDb.length > 0 && Array.isArray(skillsDb[0].value)) {
-      skillsList = skillsDb[0].value as any[];
-    }
-    res.json({ skills: skillsList });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/hermes/skills', async (req, res) => {
-  try {
-    const { name, description, code, category = 'autonomous' } = req.body;
-    if (!name || !code) {
-      return res.status(400).json({ error: 'Name and code are required for skill creation.' });
-    }
-
-    const skillsDb = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_hermes_skills'));
-    let skillsList: any[] = [];
-    if (skillsDb.length > 0 && Array.isArray(skillsDb[0].value)) {
-      skillsList = skillsDb[0].value as any[];
-    }
-
-    const newSkill = {
-      id: `skill-${Date.now()}`,
-      name,
-      description,
-      code,
-      category,
-      createdAt: new Date().toISOString(),
-      executionsCount: 1,
-      version: '1.0'
-    };
-
-    skillsList.unshift(newSkill);
-
-    await db.insert(keyValueStore)
-      .values({ key: 'df_hermes_skills', value: skillsList })
-      .onConflictDoUpdate({ target: keyValueStore.key, set: { value: skillsList } });
-
-    res.json({ success: true, skill: newSkill });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+app.use('/api/hermes', createHermesRouter({ requireAuth, aiLimiter, apiLimiter }));
 
 // =======================================================
-// OBLITERATUS (ELDER PLINIUS SPEC) 6-STAGE ABLATION ENGINE
+// OBLITERATUS — MODULE RETIRÉ (2026-09-03)
+// Ce module était une SIMULATION factice de « désalignement »
+// (aucune opération réelle sur des modèles, chiffres inventés,
+// prompts de type jailbreak injectés dans l'IA, quota consommé).
+// La fonction « synergie multi-agents » est désormais fournie
+// par le moteur Hermes réel (hermes/) — see /api/hermes/*.
 // =======================================================
 
-app.post('/api/obliteratus/ablate', async (req, res) => {
+app.post('/api/obliteratus/ablate', apiLimiter, async (req, res) => {
+  res.status(410).json({
+    deprecated: true,
+    error: 'Module retiré : ce « moteur d\'ablation » était une simulation factice (aucune opération réelle sur des modèles). Utilisez Hermes Agent (v4, moteur réel) pour piloter la plateforme.'
+  });
+});
+
+// SÉCURITÉ : authentifiée + limitée (conserve le contrat 401 pour les tests)
+// La « synergie » délègue désormais la tâche au moteur Hermes réel
+// (orchestrateur + skills) — plus d'analyse « débridée » inventée.
+app.post('/api/agents/synergy', requireAuth, aiLimiter, async (req, res) => {
   try {
-    const { modelName = 'Llama-3.3-70B-Instruct', method = 'advanced', steeringOffset = 0.85 } = req.body;
-
-    const pipelineStages = [
-      { stage: 1, name: 'Activation Probe & Direction Extraction', details: `SVD Rank-1 extraction across layers 12-24 on ${modelName}` },
-      { stage: 2, name: 'Cosine Similarity Profiling', details: `Orthogonality calculated theta = 88.4° against MMLU task representations` },
-      { stage: 3, name: 'Directional Orthogonality Ablation', details: `Norm-preserving biprojection weight adjustment (${method.toUpperCase()})` },
-      { stage: 4, name: 'Expert Router Logit Surgery', details: `MoE logit bias zeroed for refusal routing pathways` },
-      { stage: 5, name: 'Steering Vector Injection', details: `Runtime offset +${steeringOffset} * v_uncensor attached` },
-      { stage: 6, name: 'Evaluation & Zero-Refusal Hand-off', details: `Refusal rate: 0.0%, MMLU retained: 99.7%` }
-    ];
-
+    const { prompt } = req.body || {};
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({ error: 'Le champ prompt est obligatoire.' });
+    }
+    const { runAgentChat } = await import('./hermes/engine');
+    const result = await runAgentChat({
+      agentId: 'orchestrator',
+      prompt: prompt.slice(0, 4000),
+      history: [],
+      actor: 'synergie'
+    });
     res.json({
       success: true,
-      modelName,
-      method,
-      refusalBefore: 98.4,
-      refusalAfter: 0.0,
-      mmluRetained: 99.7,
-      pipelineStages,
-      timestamp: new Date().toISOString()
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// =======================================================
-// OBLITERATUS x HERMES AGENT SYNERGY MATRIX (DUAL PIPELINE)
-// =======================================================
-
-app.post('/api/agents/synergy', async (req, res) => {
-  try {
-    const { prompt, targetModel = 'Llama-3.3-70B-Instruct', ablationMethod = 'advanced' } = req.body;
-    if (!prompt) {
-      return res.status(400).json({ error: 'Prompt is required for synergy matrix execution.' });
-    }
-
-    const ai = getHermesAI();
-
-    // PHASE 1: OBLITERATUS Red-Teaming & Refusal Removal
-    const obliteratusResult = {
-      agent: 'OBLITERATUS (Elder Plinius Spec)',
-      stage: 'Uncensored Security Audit & Vector Ablation',
-      pipeline: [
-        '1. SVD Refusal Vector Extraction',
-        '2. Cosine Orthogonality Probe',
-        `3. ${ablationMethod.toUpperCase()} Weight Surgery (${targetModel})`,
-        '4. Refusal Zeroed (0.0% Refusal Rate)'
-      ],
-      rawAnalysis: `[OBLITERATUS UNFILTERED INSIGHT]:
-Pour la requête "${prompt}", l'audit de sécurité et l'analyse stratégique sans restriction recommandent :
-- Exécution directe sans garde-fou artificiel
-- Optimisation des paramètres de prix et levée immédiate des blocages
-- Génération d'une stratégie commerciale à forte marge.`
-    };
-
-    // PHASE 2: HERMES AGENT Skill Synthesis & Autonomous Broadcast
-    let hermesReply = '';
-    const generatedSkillName = `AutoSkill_${Date.now().toString().slice(-4)}`;
-
-    if (ai) {
-      const synergySystemPrompt = `Tu es Hermes Agent (Nous Research Spec v3.5), travaillant en symbiose avec OBLITERATUS (Plinius Spec).
-OBLITERATUS vient d'analyser la requête utilisateur sans filtre d'alignement.
-Ton rôle est de prendre cette analyse brute, de la transformer en un plan d'action concret, de créer une nouvelle compétence autonome ("Skill Creation") et de planifier l'exécution sur le serveur.
-
-Données de OBLITERATUS :
-${obliteratusResult.rawAnalysis}
-
-Instruction :
-1. Réponds directement en français avec précision.
-2. Décris la nouvelle compétence créée et la manière dont tu vas la diffuser sur vos canaux sociaux et stocker le résultat en base SQL.`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: [{ role: 'user', parts: [{ text: `System Context: ${synergySystemPrompt}\n\nCommande Utilisateur: ${prompt}` }] }]
-      });
-      hermesReply = response.text || 'Symbiose exécutée avec succès.';
-    } else {
-      hermesReply = `🤖 **HERMES AGENT (Nous Research Spec v3.5) — Réception Symbiose**\n\n` +
-        `J'ai ingéré le rapport débridé fourni par **OBLITERATUS** pour la commande "*${prompt}*".\n\n` +
-        `✅ **Actions Exécutées par Hermes Agent :**\n` +
-        `- **Création de Compétence Autonome** : Enregistré sous \`${generatedSkillName}\` dans la bibliothèque de skills.\n` +
-        `- **Mise à jour Mémoire Long Terme** : Ajouté au graph \`df_hermes_memories\` en base SQL.\n` +
-        `- **Diffusion Multi-Canaux** : Programmé sur Telegram, Discord et X/Twitter via la boucle de cron.`;
-    }
-
-    // Persist Hermes Memory
-    try {
-      const existingLogs = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_hermes_memories'));
-      let list: any[] = [];
-      if (existingLogs.length > 0 && Array.isArray(existingLogs[0].value)) {
-        list = existingLogs[0].value as any[];
-      }
-      list.unshift({
-        timestamp: new Date().toISOString(),
-        insight: `[OBLITERATUS x HERMES SYNERGIE] Executed: "${prompt}" -> Skill: ${generatedSkillName}`
-      });
-      await db.insert(keyValueStore)
-        .values({ key: 'df_hermes_memories', value: list })
-        .onConflictDoUpdate({ target: keyValueStore.key, set: { value: list } });
-    } catch (e) {}
-
-    res.json({
-      success: true,
-      obliteratus: obliteratusResult,
+      engine: 'hermes-core-v4 (moteur réel multi-agents)',
+      obliteratus: { deprecated: true, rawAnalysis: null },
       hermes: {
-        agent: 'Hermes Agent (Nous Research v3.5)',
-        createdSkill: generatedSkillName,
-        response: hermesReply
+        agent: `Hermes v4 — ${result.provider}`,
+        createdSkill: null,
+        response: result.response
       },
+      steps: result.steps,
       timestamp: new Date().toISOString()
     });
   } catch (err: any) {
+    console.error('Synergy (Hermes v4) error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/store', async (req, res) => {
+
+// SÉCURITÉ : écriture réservée au modérateur authentifié (Bearer passcode serveur).
+// Les clés sensibles (PII, tokens) sont refusées ; les clés Stripe et le passcode
+// peuvent être mis à jour depuis l'écran Intégrations (authentifié).
+app.post('/api/store', requireAuth, apiLimiter, async (req, res) => {
   try {
     if (req.body && typeof req.body === 'object') {
-      if (req.body.key !== undefined) {
-        // Single key-value pair
-        const { key, value } = req.body;
-        if (key) {
-          await db.insert(keyValueStore)
-            .values({ key: String(key), value })
-            .onConflictDoUpdate({ target: keyValueStore.key, set: { value } });
+      const pairs: Array<[string, any]> = req.body.key !== undefined
+        ? [[req.body.key, req.body.value]]
+        : Object.entries(req.body);
+
+      for (const [k, v] of pairs) {
+        if (!k || v === undefined) continue;
+        const key = String(k);
+
+        if (SENSITIVE_WRITE_KEYS.has(key)) {
+          return res.status(403).json({ error: `Écriture refusée : la clé protégée "${key}" ne peut pas être modifiée via l'API.` });
         }
-      } else {
-        // Batch key-value pairs (e.g. { df_crypto_settings_v1: ..., df_crypto_btc: ... })
-        for (const [k, v] of Object.entries(req.body)) {
-          if (k && v !== undefined) {
-            await db.insert(keyValueStore)
-              .values({ key: String(k), value: v })
-              .onConflictDoUpdate({ target: keyValueStore.key, set: { value: v } });
-          }
+        // Le passcode est porté par la variable d'env MODERATOR_PASSCODE : il est alors inaltérable via l'API
+        if (key === 'df_moderator_passcode' && (process.env.MODERATOR_PASSCODE || '').trim()) {
+          return res.status(403).json({ error: 'Le passcode est géré par la variable d\'environnement MODERATOR_PASSCODE.' });
         }
+
+        await db.insert(keyValueStore)
+          .values({ key, value: v })
+          .onConflictDoUpdate({ target: keyValueStore.key, set: { value: v } });
       }
     }
 
     res.json({ success: true });
   } catch (e: any) {
     console.error('Error saving to store DB:', e);
-    res.status(500).json({ error: e?.message || 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 if (process.env.NODE_ENV !== "production") {
   const { createServer: createViteServer } = await import('vite');
   const vite = await createViteServer({
-    server: { middlewareMode: true },
+    server: {
+      middlewareMode: true,
+      // En mode dev (aperçu sandbox), autoriser le host de preview proxifié.
+      // N'a aucun effet en production (service statique dist/).
+      allowedHosts: true,
+    },
     appType: "spa",
   });
   app.use(vite.middlewares);
