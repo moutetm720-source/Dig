@@ -1,11 +1,10 @@
-import { CryptoAsset, CryptoCurrencyConfig, CryptoPaymentSession, CryptoGatewaySettings, Order } from '../types';
+import { CryptoAsset, CryptoCurrencyConfig, CryptoGatewaySettings } from '../types';
 import { store } from './store';
-import { billingService } from './billingService';
 
 export const DEFAULT_CRYPTO_SETTINGS: CryptoGatewaySettings = {
   enabled: true,
   enableStripeCrypto: true,
-  autoConfirmSimulation: true,
+  autoConfirmSimulation: false, // OBSOLÈTE — la confirmation est désormais 100 % serveur (on-chain)
   merchantBtcAddress: 'bc1qwgqg48zulnaxjzdhm4gms04m8xw83zf3u0xhcs',
   merchantEthAddress: '0x1e0057ddE092Bdd667AE24FfFF75fC54bFC992D9',
   merchantSolAddress: '4EPMSkoQCWiLdqTEtWmg8Fo5Eu3yj4qm5NCf3QHksES9',
@@ -14,13 +13,16 @@ export const DEFAULT_CRYPTO_SETTINGS: CryptoGatewaySettings = {
   lastUpdatedRates: new Date().toISOString()
 };
 
+// Taux de référence (repli si l'API de taux est injoignable).
+// En fonctionnement normal, les taux viennent de /api/crypto/rates (serveur,
+// source CoinGecko) — voir fetchLiveRates().
 const DEFAULT_CRYPTO_CONFIGS: Record<CryptoAsset, CryptoCurrencyConfig> = {
   BTC: {
     symbol: 'BTC',
     name: 'Bitcoin',
-    network: 'Bitcoin Mainnet / Lightning',
+    network: 'Bitcoin Mainnet',
     logo: '₿',
-    rateEur: 88500, // 1 BTC = 88,500 EUR
+    rateEur: 88500,
     decimals: 8,
     minConfirmations: 1,
     receivingAddress: DEFAULT_CRYPTO_SETTINGS.merchantBtcAddress,
@@ -30,9 +32,9 @@ const DEFAULT_CRYPTO_CONFIGS: Record<CryptoAsset, CryptoCurrencyConfig> = {
   ETH: {
     symbol: 'ETH',
     name: 'Ethereum',
-    network: 'Ethereum (ERC-20)',
+    network: 'Ethereum Mainnet',
     logo: 'Ξ',
-    rateEur: 3120, // 1 ETH = 3,120 EUR
+    rateEur: 3120,
     decimals: 6,
     minConfirmations: 1,
     receivingAddress: DEFAULT_CRYPTO_SETTINGS.merchantEthAddress,
@@ -42,9 +44,9 @@ const DEFAULT_CRYPTO_CONFIGS: Record<CryptoAsset, CryptoCurrencyConfig> = {
   SOL: {
     symbol: 'SOL',
     name: 'Solana',
-    network: 'Solana High-Speed Network',
+    network: 'Solana Mainnet',
     logo: '◎',
-    rateEur: 182.5, // 1 SOL = 182.5 EUR
+    rateEur: 182.5,
     decimals: 4,
     minConfirmations: 1,
     receivingAddress: DEFAULT_CRYPTO_SETTINGS.merchantSolAddress,
@@ -54,9 +56,9 @@ const DEFAULT_CRYPTO_CONFIGS: Record<CryptoAsset, CryptoCurrencyConfig> = {
   USDT: {
     symbol: 'USDT',
     name: 'Tether USD',
-    network: 'TRON (TRC-20) / Polygon / EVM',
+    network: 'TRON (TRC-20) / EVM',
     logo: '₮',
-    rateEur: 0.93, // 1 USDT = 0.93 EUR
+    rateEur: 0.93,
     decimals: 2,
     minConfirmations: 1,
     receivingAddress: DEFAULT_CRYPTO_SETTINGS.merchantUsdtAddress,
@@ -65,10 +67,10 @@ const DEFAULT_CRYPTO_CONFIGS: Record<CryptoAsset, CryptoCurrencyConfig> = {
   },
   USDC: {
     symbol: 'USDC',
-    name: 'USD Coin (Stripe Crypto)',
-    network: 'Polygon / Solana / Base / Ethereum',
+    name: 'USD Coin',
+    network: 'EVM / Solana / Base',
     logo: '💲',
-    rateEur: 0.93, // 1 USDC = 0.93 EUR
+    rateEur: 0.93,
     decimals: 2,
     minConfirmations: 1,
     receivingAddress: DEFAULT_CRYPTO_SETTINGS.merchantEthAddress,
@@ -77,12 +79,37 @@ const DEFAULT_CRYPTO_CONFIGS: Record<CryptoAsset, CryptoCurrencyConfig> = {
   }
 };
 
+// Facteur de conversion vers l'unité de base de la chaîne
+// (BTC: satoshi, ETH: wei, SOL: lamport, USDT/USDC: 10^-6).
+export const ASSET_BASE_UNIT: Record<string, { factor: string; name: string }> = {
+  BTC: { factor: '100000000', name: 'sats' },
+  ETH: { factor: '1000000000000000000', name: 'wei' },
+  SOL: { factor: '1000000000', name: 'lamports' },
+  USDT: { factor: '1000000', name: 'min. unit' },
+  USDC: { factor: '1000000', name: 'min. unit' }
+};
+
+export interface OnChainVerification {
+  verified: boolean;
+  status: 'confirmed' | 'pending' | 'not_found' | 'insufficient' | 'manual_review' | 'error';
+  message: string;
+  confirmations?: number;
+  receivedAmount?: number;
+  serverOrder?: {
+    id: string;
+    orderNumber: string;
+    items: Array<{ productId: string; title: string; unitPriceCents: number; quantity: number }>;
+    totalCents: number;
+    paymentMethod: string;
+    downloadToken?: string;
+    confirmedAt?: string;
+  };
+}
+
 class CryptoPaymentService {
   private settings: CryptoGatewaySettings;
   private configs: Record<CryptoAsset, CryptoCurrencyConfig>;
-  private activeSessions: Map<string, CryptoPaymentSession> = new Map();
   private listeners: Set<() => void> = new Set();
-  private watcherTimers: Map<string, NodeJS.Timeout> = new Map();
 
   constructor() {
     let loadedSettings: Partial<CryptoGatewaySettings> = {};
@@ -93,44 +120,16 @@ class CryptoPaymentService {
       } catch (e) {}
     }
 
-    // Check and upgrade if previous settings were obsolete demo addresses
-    const isOldDemoAddress = (addr?: string) => {
-      if (!addr) return true;
-      const clean = addr.trim();
-      return clean === 'bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh' ||
-             clean === '0x71C83897F4327794b2BAF295982855140445d475' ||
-             clean === '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin' ||
-             clean === 'TXjC8rQk8mPz9xLtN27bE39q8V1s8u8f2A';
-    };
-
-    const btc = (!loadedSettings.merchantBtcAddress || isOldDemoAddress(loadedSettings.merchantBtcAddress))
-      ? DEFAULT_CRYPTO_SETTINGS.merchantBtcAddress
-      : loadedSettings.merchantBtcAddress.trim();
-
-    const eth = (!loadedSettings.merchantEthAddress || isOldDemoAddress(loadedSettings.merchantEthAddress))
-      ? DEFAULT_CRYPTO_SETTINGS.merchantEthAddress
-      : loadedSettings.merchantEthAddress.trim();
-
-    const sol = (!loadedSettings.merchantSolAddress || isOldDemoAddress(loadedSettings.merchantSolAddress))
-      ? DEFAULT_CRYPTO_SETTINGS.merchantSolAddress
-      : loadedSettings.merchantSolAddress.trim();
-
-    const usdt = (!loadedSettings.merchantUsdtAddress || isOldDemoAddress(loadedSettings.merchantUsdtAddress))
-      ? DEFAULT_CRYPTO_SETTINGS.merchantUsdtAddress
-      : loadedSettings.merchantUsdtAddress.trim();
-
-    // Merge with defaults so addresses are never lost or blanked out unintentionally
+    const clean = (v?: string) => (v || '').trim();
     this.settings = {
       ...DEFAULT_CRYPTO_SETTINGS,
       ...loadedSettings,
-      enabled: loadedSettings.enabled !== undefined ? loadedSettings.enabled : DEFAULT_CRYPTO_SETTINGS.enabled,
-      merchantBtcAddress: btc,
-      merchantEthAddress: eth,
-      merchantSolAddress: sol,
-      merchantUsdtAddress: usdt,
+      merchantBtcAddress: clean(loadedSettings.merchantBtcAddress) || DEFAULT_CRYPTO_SETTINGS.merchantBtcAddress,
+      merchantEthAddress: clean(loadedSettings.merchantEthAddress) || DEFAULT_CRYPTO_SETTINGS.merchantEthAddress,
+      merchantSolAddress: clean(loadedSettings.merchantSolAddress) || DEFAULT_CRYPTO_SETTINGS.merchantSolAddress,
+      merchantUsdtAddress: clean(loadedSettings.merchantUsdtAddress) || DEFAULT_CRYPTO_SETTINGS.merchantUsdtAddress
     };
 
-    // Save upgraded settings
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem('df_crypto_settings_v1', JSON.stringify(this.settings));
       localStorage.setItem('df_crypto_btc', this.settings.merchantBtcAddress);
@@ -140,62 +139,35 @@ class CryptoPaymentService {
     }
 
     this.configs = { ...DEFAULT_CRYPTO_CONFIGS };
-    // Synchronize addresses
+    this.syncAddresses();
+
+    // Taux réels (serveur / CoinGecko) au démarrage, puis toutes les 5 min.
+    if (typeof window !== 'undefined' && this.settings.ratesAutoUpdate) {
+      this.fetchLiveRates().catch(() => {});
+      setInterval(() => {
+        if (document.visibilityState === 'visible') this.fetchLiveRates().catch(() => {});
+      }, 5 * 60 * 1000);
+    }
+  }
+
+  private syncAddresses() {
     this.configs.BTC.receivingAddress = this.settings.merchantBtcAddress;
     this.configs.ETH.receivingAddress = this.settings.merchantEthAddress;
     this.configs.SOL.receivingAddress = this.settings.merchantSolAddress;
     this.configs.USDT.receivingAddress = this.settings.merchantUsdtAddress;
     this.configs.USDC.receivingAddress = this.settings.merchantEthAddress;
-
-    // Simulate minor live exchange rate ticks every 30s
-    if (typeof window !== 'undefined') {
-      setInterval(() => this.updateLiveRates(), 30000);
-    }
   }
 
   public subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    return () => { this.listeners.delete(listener); };
   }
 
   private notify() {
-    this.listeners.forEach(fn => {
-      try {
-        fn();
-      } catch (e) {
-        console.error(e);
-      }
-    });
+    this.listeners.forEach(fn => { try { fn(); } catch (e) {} });
   }
 
   public getSettings(): CryptoGatewaySettings {
-    return this.settings;
-  }
-
-  public restoreModelAddresses(): CryptoGatewaySettings {
-    this.settings = {
-      ...this.settings,
-      merchantBtcAddress: DEFAULT_CRYPTO_SETTINGS.merchantBtcAddress,
-      merchantEthAddress: DEFAULT_CRYPTO_SETTINGS.merchantEthAddress,
-      merchantSolAddress: DEFAULT_CRYPTO_SETTINGS.merchantSolAddress,
-      merchantUsdtAddress: DEFAULT_CRYPTO_SETTINGS.merchantUsdtAddress,
-      enabled: true,
-      enableStripeCrypto: true,
-      autoConfirmSimulation: true
-    };
-    localStorage.setItem('df_crypto_settings_v1', JSON.stringify(this.settings));
-    localStorage.setItem('df_crypto_btc', this.settings.merchantBtcAddress);
-    localStorage.setItem('df_crypto_eth', this.settings.merchantEthAddress);
-    localStorage.setItem('df_crypto_sol', this.settings.merchantSolAddress);
-    localStorage.setItem('df_crypto_usdt', this.settings.merchantUsdtAddress);
-
-    this.configs.BTC.receivingAddress = this.settings.merchantBtcAddress;
-    this.configs.ETH.receivingAddress = this.settings.merchantEthAddress;
-    this.configs.SOL.receivingAddress = this.settings.merchantSolAddress;
-    this.configs.USDT.receivingAddress = this.settings.merchantUsdtAddress;
-    this.configs.USDC.receivingAddress = this.settings.merchantEthAddress;
-    this.notify();
-    store.addLog('success', 'stripe', 'Adresses modèles Crypto (BTC, ETH, SOL, USDT) rétablies et enregistrées avec succès.');
     return this.settings;
   }
 
@@ -206,14 +178,25 @@ class CryptoPaymentService {
     if (this.settings.merchantEthAddress) localStorage.setItem('df_crypto_eth', this.settings.merchantEthAddress);
     if (this.settings.merchantSolAddress) localStorage.setItem('df_crypto_sol', this.settings.merchantSolAddress);
     if (this.settings.merchantUsdtAddress) localStorage.setItem('df_crypto_usdt', this.settings.merchantUsdtAddress);
-    
-    this.configs.BTC.receivingAddress = this.settings.merchantBtcAddress;
-    this.configs.ETH.receivingAddress = this.settings.merchantEthAddress;
-    this.configs.SOL.receivingAddress = this.settings.merchantSolAddress;
-    this.configs.USDT.receivingAddress = this.settings.merchantUsdtAddress;
-    this.configs.USDC.receivingAddress = this.settings.merchantEthAddress;
+    this.syncAddresses();
     this.notify();
     store.addLog('success', 'stripe', 'Adresses & paramètres de la passerelle Crypto enregistrés et synchronisés.');
+  }
+
+  public restoreModelAddresses(): CryptoGatewaySettings {
+    this.settings = {
+      ...this.settings,
+      merchantBtcAddress: DEFAULT_CRYPTO_SETTINGS.merchantBtcAddress,
+      merchantEthAddress: DEFAULT_CRYPTO_SETTINGS.merchantEthAddress,
+      merchantSolAddress: DEFAULT_CRYPTO_SETTINGS.merchantSolAddress,
+      merchantUsdtAddress: DEFAULT_CRYPTO_SETTINGS.merchantUsdtAddress,
+      enabled: true
+    };
+    localStorage.setItem('df_crypto_settings_v1', JSON.stringify(this.settings));
+    this.syncAddresses();
+    this.notify();
+    store.addLog('success', 'stripe', 'Adresses modèles Crypto (BTC, ETH, SOL, USDT) rétablies et enregistrées.');
+    return this.settings;
   }
 
   public getSupportedAssets(): CryptoCurrencyConfig[] {
@@ -224,11 +207,48 @@ class CryptoPaymentService {
     return this.configs[symbol] || this.configs.BTC;
   }
 
+  // Taux EUR en direct (serveur → CoinGecko, repli sur valeurs de référence).
+  public async fetchLiveRates(): Promise<Record<string, number>> {
+    try {
+      const res = await fetch('/api/crypto/rates', { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        const rates: Record<string, number> = data?.rates || {};
+        (['BTC', 'ETH', 'SOL', 'USDT', 'USDC'] as CryptoAsset[]).forEach(sym => {
+          const r = Number(rates[sym]);
+          if (Number.isFinite(r) && r > 0) this.configs[sym].rateEur = r;
+        });
+        this.settings.lastUpdatedRates = new Date().toISOString();
+        this.notify();
+        return rates;
+      }
+    } catch (e) {
+      // source injoignable : on garde les taux de référence (jamais de taux inventé)
+    }
+    return {
+      BTC: this.configs.BTC.rateEur,
+      ETH: this.configs.ETH.rateEur,
+      SOL: this.configs.SOL.rateEur,
+      USDT: this.configs.USDT.rateEur,
+      USDC: this.configs.USDC.rateEur
+    };
+  }
+
   public convertEurToCrypto(eurAmount: number, asset: CryptoAsset): number {
     const config = this.getAssetConfig(asset);
     if (!config || config.rateEur <= 0) return 0;
     const raw = eurAmount / config.rateEur;
     return Number(raw.toFixed(config.decimals));
+  }
+
+  // Montant attendu en unité de base de la chaîne (entier, exact).
+  public expectedBaseUnits(eurAmount: number, asset: CryptoAsset): string {
+    const config = this.getAssetConfig(asset);
+    if (!config || config.rateEur <= 0) return '0';
+    const base = ASSET_BASE_UNIT[asset] || ASSET_BASE_UNIT.ETH;
+    // eur / rate = montants d'actifs (décimales) × facteur = unités de base
+    const amount = (BigInt(Math.round(eurAmount * 100)) * BigInt(base.factor)) / BigInt(Math.round(config.rateEur * 100));
+    return amount.toString();
   }
 
   public generateQrPayload(asset: CryptoAsset, address: string, amount: number): string {
@@ -241,107 +261,51 @@ class CryptoPaymentService {
       case 'SOL':
         return `solana:${address}?amount=${amount}`;
       case 'USDT':
-        return `ethereum:${address}?contract=0xdAC17F958D2ee523a2206206994597C13D831ec7&amount=${amount}`;
+        return `tron:${address}?contract=TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t&amount=${amount}`;
       default:
         return address;
     }
   }
 
-  public createPaymentSession(params: {
-    orderId: string;
+  /**
+   * SÉCURITÉ — VÉRIFICATION ON-CHAIN RÉELLE CÔTÉ SERVEUR.
+   * Le serveur interroge la source on-chain publique (mempool.space / Etherscan)
+   * et ne confirme la commande QUE si : transaction validée + adresse marchande
+   * du serveur + montant suffisant. Le client n'a AUCUNE capacité à confirmer
+   * un paiement lui-même.
+   */
+  public async verifyOnChainPayment(params: {
     asset: CryptoAsset;
-    amountEur: number;
-    useStripeCrypto?: boolean;
-  }): CryptoPaymentSession {
-    const { orderId, asset, amountEur, useStripeCrypto = false } = params;
-    const config = this.getAssetConfig(asset);
-    const amountCrypto = this.convertEurToCrypto(amountEur, asset);
-
-    const sessionId = `cps-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 minutes window
-
-    const session: CryptoPaymentSession = {
-      id: sessionId,
-      orderId,
-      asset,
-      amountCrypto,
-      amountEur,
-      receivingAddress: config.receivingAddress,
-      qrPayload: this.generateQrPayload(asset, config.receivingAddress, amountCrypto),
-      confirmations: 0,
-      requiredConfirmations: config.minConfirmations,
-      status: 'waiting_payment',
-      expiresAt,
-      stripeCryptoPay: useStripeCrypto,
-      createdAt: new Date().toISOString()
-    };
-
-    this.activeSessions.set(sessionId, session);
-    this.notify();
-
-    store.addLog(
-      'info',
-      'stripe',
-      `Session de paiement Crypto initialisée : ${amountCrypto} ${asset} (~${amountEur}€) pour la commande ${orderId}.`
-    );
-
-    // Launch Autonomous Mempool & Blockchain Watcher
-    if (this.settings.autoConfirmSimulation) {
-      this.startAutonomousPaymentWatcher(sessionId);
+    txHash: string;
+    expectedAmount: string; // en unités de base (sats / wei / ...)
+    serverOrderId: string
+  }): Promise<OnChainVerification> {
+    try {
+      const res = await fetch('/api/crypto/verify-transaction', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          asset: params.asset,
+          txHash: params.txHash,
+          expectedAmount: params.expectedAmount,
+          serverOrderId: params.serverOrderId
+        })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        return {
+          verified: Boolean(data.verified),
+          status: data.status || 'error',
+          message: data.message || 'Vérification sans résultat.',
+          confirmations: data.confirmations,
+          receivedAmount: data.receivedAmount,
+          serverOrder: data.serverOrder
+        };
+      }
+      return { verified: false, status: 'error', message: data?.error || 'Erreur de vérification.' };
+    } catch (e) {
+      return { verified: false, status: 'error', message: 'Serveur injoignable — aucune confirmation ne peut être émise.' };
     }
-
-    return session;
-  }
-
-  public getSession(sessionId: string): CryptoPaymentSession | undefined {
-    return this.activeSessions.get(sessionId);
-  }
-
-  private startAutonomousPaymentWatcher(sessionId: string) {
-    if (this.watcherTimers.has(sessionId)) {
-      clearTimeout(this.watcherTimers.get(sessionId));
-    }
-
-    // Step 1: Detect transaction in mempool after 2.5s to show it's working, but NEVER confirm it automatically.
-    const t1 = setTimeout(() => {
-      const sess = this.activeSessions.get(sessionId);
-      if (!sess || sess.status === 'confirmed' || sess.status === 'expired') return;
-
-      sess.status = 'detected_mempool';
-      sess.txHash = '0x' + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-      this.notify();
-      store.addLog('info', 'stripe', `Transaction ${sess.asset} détectée dans le Mempool (TX: ${sess.txHash.slice(0, 10)}...). Attente de validation de vrais fonds...`);
-      
-      // We explicitly removed Step 2 (Auto-confirm on chain) to prevent fake product delivery.
-    }, 2500);
-
-    this.watcherTimers.set(sessionId, t1);
-  }
-
-  public triggerManualInstantConfirmation(sessionId: string) {
-    const session = this.activeSessions.get(sessionId);
-    if (!session) return;
-
-    session.status = 'confirmed';
-    session.confirmations = 1;
-    session.txHash = session.txHash || ('0x' + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join(''));
-    this.notify();
-
-    store.addLog('success', 'stripe', `Agent 2 (Validateur) a confirmé la session cryptographique on-chain : ${session.asset} (${session.orderId}).`);
-  }
-
-  private updateLiveRates() {
-    // Micro-fluctuations within ±0.2% to simulate live crypto market feeds
-    const fluctuate = (base: number) => {
-      const delta = (Math.random() - 0.5) * 0.004;
-      return Math.round((base * (1 + delta)) * 100) / 100;
-    };
-
-    this.configs.BTC.rateEur = Math.round(fluctuate(this.configs.BTC.rateEur));
-    this.configs.ETH.rateEur = Math.round(fluctuate(this.configs.ETH.rateEur) * 10) / 10;
-    this.configs.SOL.rateEur = Math.round(fluctuate(this.configs.SOL.rateEur) * 100) / 100;
-    this.settings.lastUpdatedRates = new Date().toISOString();
-    this.notify();
   }
 }
 

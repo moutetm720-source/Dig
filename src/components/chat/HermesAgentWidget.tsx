@@ -104,7 +104,7 @@ export const HermesAgentWidget: React.FC<HermesAgentWidgetProps> = ({ onNavigate
           <div className="flex flex-col items-start pr-1 text-left">
             <div className="flex items-center gap-1.5">
               <span className="text-xs font-bold tracking-wide text-white">Hermes Agent IA</span>
-              <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">v3.5</span>
+              <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">v4</span>
             </div>
             <span className="text-[10px] text-emerald-400 flex items-center gap-1 font-mono">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
@@ -133,16 +133,16 @@ export const HermesAgentWidget: React.FC<HermesAgentWidgetProps> = ({ onNavigate
                 <div className="flex items-center gap-2">
                   <h3 className="text-sm font-bold text-white tracking-wide">Hermes Agent</h3>
                   <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                    Open-Source v3.5
+                    Moteur réel v4
                   </span>
                 </div>
                 <div className="flex items-center gap-2 text-[10px] text-slate-400">
                   <span className="flex items-center gap-1 text-emerald-400 font-mono">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-                    Accès Système Total
+                    Moteur serveur v4
                   </span>
                   <span>•</span>
-                  <span>{state.memoryCount} Souvenirs IA</span>
+                  <span>{state.serverStatus ? `${state.serverStatus.memoriesCount} entrées mémoire` : 'chargement…'}</span>
                 </div>
               </div>
             </div>
@@ -239,14 +239,14 @@ export const HermesAgentWidget: React.FC<HermesAgentWidgetProps> = ({ onNavigate
                             : 'bg-[#14141A] border border-slate-800/80 text-slate-200 rounded-tl-none shadow-lg'
                         }`}
                       >
-                        {/* Tool logs if any */}
-                        {msg.toolsUsed && msg.toolsUsed.length > 0 && (
+                        {/* Étapes d'outils réelles exécutées côté serveur */}
+                        {msg.steps && msg.steps.length > 0 && (
                           <div className="mb-2.5 pb-2 border-b border-slate-700/50 space-y-1">
-                            {msg.toolsUsed.map((t, idx) => (
-                              <div key={idx} className="flex items-center gap-1.5 text-[10px] font-mono text-indigo-300 bg-indigo-950/40 px-2 py-1 rounded border border-indigo-500/20">
-                                <Terminal className="w-3 h-3 text-indigo-400 shrink-0" />
-                                <span className="font-bold">{t.name}:</span>
-                                <span className="truncate">{t.resultSummary || 'Exécuté avec succès'}</span>
+                            {msg.steps.map((t, idx) => (
+                              <div key={idx} className={`flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 rounded border ${t.status === 'ok' ? 'text-emerald-300 bg-emerald-950/40 border-emerald-500/20' : 'text-amber-300 bg-amber-950/40 border-amber-500/20'}`}>
+                                <Terminal className="w-3 h-3 shrink-0" />
+                                <span className="font-bold">{t.tool}</span>
+                                <span className="truncate">[{t.status}]{t.summary ? ` ${t.summary.slice(0, 60)}` : ''}</span>
                               </div>
                             ))}
                           </div>
@@ -357,7 +357,7 @@ export const HermesAgentWidget: React.FC<HermesAgentWidgetProps> = ({ onNavigate
                 </div>
 
                 <button
-                  onClick={() => hermesAgentService.runAutonomousBackgroundTask()}
+                  onClick={() => void hermesAgentService.runAutonomousNow()}
                   className="w-full bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 py-2 rounded-lg font-bold flex items-center justify-center gap-2 transition-colors"
                 >
                   <Zap className="w-4 h-4 text-indigo-400" />
@@ -365,58 +365,38 @@ export const HermesAgentWidget: React.FC<HermesAgentWidgetProps> = ({ onNavigate
                 </button>
               </div>
 
-              {/* Privileges */}
+              {/* Permissions réelles */}
               <div className="bg-[#14141A] border border-slate-800 p-4 rounded-xl space-y-3">
                 <div className="font-bold text-white flex items-center gap-2">
                   <ShieldCheck className="w-4 h-4 text-indigo-400" />
-                  Autorisations & Privilèges Accordés à Hermes
+                  Sécurité du moteur
                 </div>
-                <div className="space-y-2 text-[11px]">
-                  <div className="flex items-center justify-between p-2 bg-[#1A1A22] rounded-lg border border-slate-800">
-                    <span className="flex items-center gap-2"><Database className="w-3.5 h-3.5 text-indigo-400" /> Base SQL & Key-Value Store</span>
-                    <span className="text-emerald-400 font-mono font-bold">Autorisé ✓</span>
-                  </div>
-                  <div className="flex items-center justify-between p-2 bg-[#1A1A22] rounded-lg border border-slate-800">
-                    <span className="flex items-center gap-2"><Radio className="w-3.5 h-3.5 text-amber-400" /> 11 Canaux Sociaux & Webhooks</span>
-                    <span className="text-emerald-400 font-mono font-bold">Autorisé ✓</span>
-                  </div>
-                  <div className="flex items-center justify-between p-2 bg-[#1A1A22] rounded-lg border border-slate-800">
-                    <span className="flex items-center gap-2"><DollarSign className="w-3.5 h-3.5 text-emerald-400" /> Stripe & Passerelle Crypto</span>
-                    <span className="text-emerald-400 font-mono font-bold">Autorisé ✓</span>
-                  </div>
-                  <div className="flex items-center justify-between p-2 bg-[#1A1A22] rounded-lg border border-slate-800">
-                    <span className="flex items-center gap-2"><Terminal className="w-3.5 h-3.5 text-purple-400" /> Logs & Diagnostic Serveur</span>
-                    <span className="text-emerald-400 font-mono font-bold">Autorisé ✓</span>
-                  </div>
-                </div>
+                <ul className="space-y-1.5 text-[11px] text-slate-300 list-disc pl-4">
+                  <li>{state.serverStatus?.skillsCount ?? 29} skills réelles exécutées côté serveur</li>
+                  <li>Journal d'audit de chaque action outillée</li>
+                  <li>Actions sensibles : confirmation explicite requise</li>
+                  <li>Aucune PII client (e-mails, adresses) envoyée à l'IA</li>
+                  <li>Aucune donnée de paiement exposée (clés en env uniquement)</li>
+                </ul>
               </div>
             </div>
           )}
 
-          {/* TAB 3: TOOLS */}
+          {/* TAB 3: TOOLS — registre réel des skills (GET /api/hermes/status) */}
           {activeTab === 'tools' && (
-            <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-[#0A0A0D] text-slate-300 text-xs">
+            <div className="flex-1 overflow-y-auto p-4 space-y-2 bg-[#0A0A0D] text-slate-300 text-xs">
               <div className="text-[11px] text-slate-400 mb-2">
-                Hermes Agent dispose de 8 fonctions spécialisées enregistrées sur le serveur pour inspecter et piloter votre application :
+                Compétences réelles du moteur ({state.serverStatus?.skillsCount ?? 'chargement…'}), exécutées côté serveur :
               </div>
 
-              {[
-                { name: 'workspace_full_inspector', desc: 'Analyse intégrale des produits, ventes, commandes et intégrations', color: 'text-indigo-400' },
-                { name: 'get_products_list', desc: 'Extrait et trie la liste des produits digitaux en boutique', color: 'text-emerald-400' },
-                { name: 'get_social_channels_status', desc: 'Vérifie les connexions X, Telegram, Discord, LinkedIn, TikTok...', color: 'text-amber-400' },
-                { name: 'trigger_social_broadcast', desc: 'Relaie automatiquement un produit avec offre et code promo', color: 'text-purple-400' },
-                { name: 'generate_product_idea', desc: 'Propose un produit digital à forte marge prêt au déploiement', color: 'text-cyan-400' },
-                { name: 'audit_system_health', desc: 'Vérifie la base SQL, l\'indexation et les passerelles Stripe/Crypto', color: 'text-rose-400' },
-                { name: 'inspect_sql_keyvalue', desc: 'Interroge les clés de la base de données de stockage', color: 'text-blue-400' },
-                { name: 'save_hermes_memory', desc: 'Enregistre les pensées et rapports de Hermes dans la mémoire serveur', color: 'text-teal-400' }
-              ].map((tool, idx) => (
+              {(state.serverStatus?.skills || []).map((skill, idx) => (
                 <div key={idx} className="bg-[#14141A] border border-slate-800 p-3 rounded-xl flex items-start justify-between gap-3">
-                  <div className="space-y-0.5">
-                    <div className={`font-mono font-bold text-xs ${tool.color}`}>{tool.name}</div>
-                    <div className="text-[11px] text-slate-400">{tool.desc}</div>
+                  <div className="space-y-0.5 min-w-0">
+                    <div className={`font-mono font-bold text-xs ${skill.dangerous ? 'text-rose-400' : 'text-indigo-400'}`}>{skill.name}</div>
+                    <div className="text-[11px] text-slate-400">{skill.description}</div>
                   </div>
-                  <span className="px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[9px] font-mono rounded shrink-0">
-                    Prêt
+                  <span className={`px-2 py-0.5 border text-[9px] font-mono rounded shrink-0 ${skill.confirmation ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'}`}>
+                    {skill.confirmation ? 'confirmée' : 'active'}
                   </span>
                 </div>
               ))}

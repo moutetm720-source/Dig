@@ -36,10 +36,10 @@ import { RealWorldTelemetryView } from './components/telemetry/RealWorldTelemetr
 import { TrafficAcquisitionView } from './components/telemetry/TrafficAcquisitionView';
 import { OnboardingModal } from './components/onboarding/OnboardingModal';
 import { ModeratorAuthModal } from './components/auth/ModeratorAuthModal';
-import { ObliteratusChatWidget } from './components/chat/ObliteratusChatWidget';
+
 import { HermesAgentView } from './components/agent/HermesAgentView';
 import { HermesAgentWidget } from './components/chat/HermesAgentWidget';
-import { HermesObliteratusSynergyView } from './components/agent/HermesObliteratusSynergyView';
+import { MultiAgentCenterView } from './components/agent/MultiAgentCenterView';
 import { AppBuilderView } from './components/agency/AppBuilderView';
 
 import { store } from './services/store';
@@ -97,10 +97,12 @@ export function App() {
         window.history.replaceState({}, '', newUrl);
       }
 
-      // 2. Direct passcode in URL for instant mobile access (?passcode=2026)
+      // 2. Direct passcode in URL for instant mobile access (?passcode=<code>)
+      // SÉCURITÉ : plus de passcode faibles durcis ('2026', 'admin') — le code de
+      // l'URL doit correspondre au passcode déjà connu dans ce navigateur.
       const urlPasscode = searchParams.get('passcode') || searchParams.get('token');
-      const activePasscode = localStorage.getItem('df_moderator_passcode') || '2026';
-      if (urlPasscode && (urlPasscode === activePasscode || urlPasscode === '2026' || urlPasscode === 'admin')) {
+      const activePasscode = (localStorage.getItem('df_moderator_passcode') || '').trim();
+      if (urlPasscode && activePasscode && urlPasscode === activePasscode) {
         try {
           localStorage.setItem('df_user_role', 'moderator');
         } catch (quotaError) {
@@ -249,7 +251,7 @@ export function App() {
       case 'ads':
         return <AdBudgetAgentView />;
       case 'agents_synergy':
-        return <HermesObliteratusSynergyView />;
+        return <MultiAgentCenterView />;
       case 'app_builder':
         return <AppBuilderView />;
       case 'hermes_agent':
@@ -344,8 +346,7 @@ export function App() {
         <OnboardingModal onComplete={() => setShowOnboarding(false)} />
       )}
 
-      {/* Supreme Agent Obliteratus & Hermes Agent Floating Chat Widgets */}
-      {isModerator && <ObliteratusChatWidget onNavigateToView={setCurrentView} />}
+      {/* Hermes Agent — Floating Chat Widget (moteur réel v4) */}
       <HermesAgentWidget onNavigateToView={setCurrentView} />
     </div>
   );

@@ -46,8 +46,7 @@ import {
   ProductBundle, 
   Order, 
   LegalDocumentType, 
-  FrenchInvoice, 
-  CryptoPaymentSession,
+  FrenchInvoice,
   StorefrontAgentState,
   StorefrontCluster
 } from '../../types';
@@ -103,10 +102,14 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
   const [isCryptoModalOpen, setIsCryptoModalOpen] = useState(false);
   const [completedOrder, setCompletedOrder] = useState<Order | null>(null);
   const [generatedInvoice, setGeneratedInvoice] = useState<FrenchInvoice | null>(null);
+  // Commande PENDING créée côté serveur (mode démo) — la livraison n'est
+  // accordée que par /api/checkout/demo-complete (token serveur).
+  const [pendingServerOrderId, setPendingServerOrderId] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [selectedClusterId, setSelectedClusterId] = useState<string>('all');
   const [promoCode, setPromoCode] = useState('');
   const [promoDiscount, setPromoDiscount] = useState(0);
+  const [appliedPromoCode, setAppliedPromoCode] = useState('');
   const [customerName, setCustomerName] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
   const [customerAddress, setCustomerAddress] = useState('');
@@ -348,43 +351,44 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
             const custEmail = verification.customerEmail || (pending && pending.customerEmail) || '';
             const custName = verification.customerName || (pending && pending.customerName) || (custEmail ? custEmail.split('@')[0] : 'Client Stripe');
             const custAddr = verification.customerAddress || (pending && pending.customerAddress) || '';
-            const orderItems = (pending && pending.items) || [];
             const finalTotal = verification.amountTotal || (pending && pending.cartTotalEur) || 47;
 
-            const order = await store.processCheckout({
-              customerName: custName,
-              customerEmail: custEmail,
-              items: orderItems,
-              totalAmount: finalTotal,
-              discountApplied: pending?.promoDiscount || 0
-            });
-            const invoice = billingService.generateInvoiceForOrder(order, custAddr);
-            setGeneratedInvoice(invoice);
-            setCompletedOrder(order);
-            setCart([]);
-            setIsCheckoutOpen(false);
-            setIsCartOpen(false);
-            store.addLog('success', 'stripe', `Confirmation Stripe : Paiement de ${finalTotal}€ validé avec succès (Session: ${sessionId}, Client: ${custEmail || custName}).`);
+            // SÉCURITÉ : la livraison n'est accordée QUE si le serveur a confirmé
+            // la commande (commande + token de téléchargement fournis par le serveur).
+            if (verification.serverOrder) {
+              const order = await store.completeOrderFromServer(verification.serverOrder, {
+                customerName: custName,
+                customerEmail: custEmail,
+                customerAddress: custAddr
+              });
+              const invoice = billingService.generateInvoiceForOrder(order, custAddr);
+              setGeneratedInvoice(invoice);
+              setCompletedOrder(order);
+              setCart([]);
+              setIsCheckoutOpen(false);
+              setIsCartOpen(false);
+              store.addLog('success', 'stripe', `Confirmation Stripe : Paiement de ${finalTotal}€ validé — commande ${order.orderNumber} livrée par le serveur (Session: ${sessionId}, Client: ${custEmail || custName}).`);
+            } else {
+              // Paiement Stripe confirmé mais commande serveur introuvable :
+              // pas de livraison automatique (fail-closed) — le support régularise.
+              store.addLog(
+                'error',
+                'stripe',
+                `Paiement Stripe confirmé mais commande serveur introuvable (Session: ${sessionId}). Livraison bloquée en attente de vérification. Contactez le support.`
+              );
+              alert('Votre paiement a bien été reçu. La livraison est en cours de vérification par notre équipe — vous recevrez vos accès très rapidement par e-mail.');
+            }
           } else if (attempts < 4) {
             setTimeout(() => verifySession(attempts + 1), 2500);
             return;
           } else {
-            // Fallback confirmation if webhook lagged but customer returned with valid session
-            const custEmail = verification.customerEmail || (pending && pending.customerEmail) || '';
-            const custName = verification.customerName || (pending && pending.customerName) || 'Client Stripe';
-            const order = await store.processCheckout({
-              customerName: custName,
-              customerEmail: custEmail,
-              items: pending?.items || [],
-              totalAmount: pending?.cartTotalEur || 47,
-              discountApplied: pending?.promoDiscount || 0
-            });
-            const invoice = billingService.generateInvoiceForOrder(order, pending?.customerAddress);
-            setGeneratedInvoice(invoice);
-            setCompletedOrder(order);
-            setCart([]);
-            setIsCheckoutOpen(false);
-            setIsCartOpen(false);
+            // SÉCURITÉ : plus de confirmation "au cas où". Sans validation Stripe
+            // définitive (paid === true), le produit n'est PAS délivré.
+            store.addLog(
+              'error',
+              'stripe',
+              `Paiement non confirmé (Session: ${sessionId}). La commande n'a pas été livrée. Si le paiement a bien été effectué, contactez le support.`
+            );
           }
         } catch(e) {
           console.error("Erreur vérification Stripe", e);
@@ -399,12 +403,27 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
     const code = promoCode.trim().toUpperCase();
     if (code === 'LAUNCH20' || code === 'VIP20') {
       setPromoDiscount(20);
+      setAppliedPromoCode(code);
     } else if (code === 'FACTORY50') {
       setPromoDiscount(50);
+      setAppliedPromoCode(code);
     } else if (code.length >= 4) {
-      // Automatic Affiliate Code Recognition (30% discount)
-      setPromoDiscount(30);
+      // Codes affiliés : vérifiés contre les affiliés enregistrés (la remise
+      // effective est toujours recalculée côté serveur à la facturation).
+      const affiliate = salesExplosionAgents.getAffiliates().find(
+        a => a.referralCode?.trim().toUpperCase() === code
+      );
+      if (affiliate) {
+        setPromoDiscount(Math.max(0, Math.min(50, affiliate.commissionRate || 30)));
+        setAppliedPromoCode(code);
+      } else {
+        setPromoDiscount(0);
+        setAppliedPromoCode('');
+        alert('Code promo invalide. Essayez "LAUNCH20" pour 20% de remise.');
+      }
     } else {
+      setPromoDiscount(0);
+      setAppliedPromoCode('');
       alert('Code promo invalide. Essayez "LAUNCH20" pour 20% de remise.');
     }
   };
@@ -421,20 +440,16 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
         quantity: i.quantity
       }));
 
-      const storedSk = localStorage.getItem('df_stripe_sk') || undefined;
-
+      // SÉCURITÉ : la clé Stripe secrète n'est JAMAIS envoyée par le client —
+      // le serveur utilise sa propre clé (env / base) et les prix du catalogue.
       const res = await fetch('/api/checkout/create-session', {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          ...(storedSk ? { 'x-stripe-secret-key': storedSk } : {})
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           items,
-          promoDiscount,
+          promoCode: appliedPromoCode || undefined,
           originUrl: window.location.origin + window.location.pathname,
-          customerEmail: customerEmail.trim() || undefined,
-          customStripeSk: storedSk
+          customerEmail: customerEmail.trim() || undefined
         })
       });
 
@@ -447,39 +462,52 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
         return;
       }
 
-      // Fallback: If Stripe is in test/fallback mode or unconfigured, open modal
+      // SÉCURITÉ : mode démo — la commande PENDING a été créée CÔTÉ SERVEUR.
+      // La livraison n'aura lieu que via /api/checkout/demo-complete (token serveur).
+      if (data.mode === 'demo' && data.serverOrderId) {
+        setPendingServerOrderId(data.serverOrderId);
+        setIsCartOpen(false);
+        setIsCheckoutOpen(true);
+        return;
+      }
+
+      // Paiement indisponible (aucune passerelle configurée, pas de mode démo) :
+      // pas de modal, pas de livraison — message explicite.
       setIsCartOpen(false);
-      setIsCheckoutOpen(true);
+      alert(data.message || 'Paiement indisponible : aucune passerelle de paiement configurée. Contactez le support.');
     } catch (e) {
       console.error("Checkout dispatch error:", e);
       setIsCartOpen(false);
-      setIsCheckoutOpen(true);
+      alert('Erreur lors de la création de la commande. Réessayez.');
     } finally {
       setIsProcessingPayment(false);
     }
   };
 
-  const handleExecuteCheckout = async () => {
+  // Mode démo : la livraison est accordée UNIQUEMENT par le serveur
+  // (commande PENDING créée à l'ouverture du modal + token de téléchargement
+  // généré côté serveur). Le navigateur ne s'auto-accorde plus d'accès.
+  const handleDemoCheckout = async () => {
     if (!customerEmail.trim() || !customerName.trim() || cart.length === 0) return;
-    
+    if (!pendingServerOrderId) {
+      alert('Commande serveur introuvable. Fermez ce modal et relancez le paiement.');
+      return;
+    }
+
     setIsProcessingPayment(true);
-    
+
     try {
-      const items = cart.map(i => ({
-        productId: i.product.id,
-        productTitle: i.product.title,
-        price: i.product.pricing?.recommendedPrice ?? 47,
-        quantity: i.quantity
-      }));
-      
-      // Simulated Checkout for Demo Mode
-      setTimeout(async () => {
-        const order = await store.processCheckout({
+      const res = await fetch('/api/checkout/demo-complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serverOrderId: pendingServerOrderId })
+      });
+      const data = await res.json();
+      if (res.ok && data?.serverOrder) {
+        const order = await store.completeOrderFromServer(data.serverOrder, {
           customerName,
           customerEmail,
-          items,
-          totalAmount: cartTotalEur,
-          discountApplied: promoDiscount
+          customerAddress
         });
         const invoice = billingService.generateInvoiceForOrder(order, customerAddress);
         setGeneratedInvoice(invoice);
@@ -487,44 +515,36 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
         setCart([]);
         setIsCheckoutOpen(false);
         setIsCartOpen(false);
-        store.addLog('success', 'stripe', `Simulation de paiement (Mode Demo) validée pour la commande ${order.orderNumber}.`);
-        setIsProcessingPayment(false);
-      }, 1500);
-
+        setPendingServerOrderId(null);
+        store.addLog('success', 'stripe', `Simulation de paiement (Mode Démo) validée : commande ${order.orderNumber} livrée par le serveur.`);
+      } else {
+        alert(data?.error || "La commande démo n'a pas pu être finalisée côté serveur.");
+      }
     } catch (e) {
       console.error(e);
+      alert("La commande démo n'a pas pu être finalisée (serveur injoignable).");
+    } finally {
       setIsProcessingPayment(false);
     }
   };
 
-  const handleCryptoPaymentSuccess = async (session: CryptoPaymentSession) => {
+  // Crypto : la commande est confirmée CÔTÉ SERVEUR (vérification on-chain).
+  // serverOrder = { id, orderNumber, items, totalCents, paymentMethod, downloadToken }
+  const handleCryptoPaymentSuccess = async (serverOrder: any) => {
     setIsCryptoModalOpen(false);
 
-    const items = cart.map(i => ({
-      productId: i.product.id,
-      productTitle: i.product.title,
-      price: i.product.pricing?.recommendedPrice ?? 47,
-      quantity: i.quantity
-    }));
-
-    const order = await store.processCheckout({
+    const order = await store.completeOrderFromServer(serverOrder, {
       customerName,
       customerEmail,
-      items,
-      totalAmount: cartTotalEur,
-      discountApplied: promoDiscount
+      customerAddress
     });
-
-    order.paymentMethod = session.stripeCryptoPay 
-      ? `Stripe Crypto (${session.asset} USDC)`
-      : `Crypto On-Chain (${session.amountCrypto} ${session.asset})`;
 
     const invoice = billingService.generateInvoiceForOrder(order, customerAddress);
     setGeneratedInvoice(invoice);
-
     setCompletedOrder(order);
     setCart([]);
     setIsCartOpen(false);
+    store.addLog('success', 'stripe', `Paiement crypto ${serverOrder?.paymentMethod || ''} confirmé on-chain — commande ${order.orderNumber} livrée par le serveur.`);
   };
 
   const openLegal = (tab: LegalDocumentType) => {
@@ -1764,7 +1784,7 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
                     className="hover:text-slate-300 transition-colors flex items-center gap-1 text-slate-500 hover:text-indigo-400"
                   >
                     <Lock className="w-3 h-3" />
-                    <span>Espace Modérateur (2026)</span>
+                    <span>Espace Modérateur</span>
                   </button>
                 </div>
               </div>
@@ -2065,7 +2085,7 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
 
             <div className="pt-2 space-y-2">
               <button
-                onClick={handleExecuteCheckout}
+                onClick={handleDemoCheckout}
                 disabled={isProcessingPayment || !agreeTerms}
                 className="w-full py-3.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs shadow-lg shadow-emerald-600/30 flex items-center justify-center gap-2"
               >
@@ -2114,7 +2134,12 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
             });
           }
         }}
-        amountEur={cartTotalEur}
+        items={cart.map(i => ({
+          productId: i.product.id,
+          productTitle: i.product.title,
+          price: i.product.pricing?.recommendedPrice ?? 47,
+          quantity: i.quantity
+        }))}
         customerName={customerName}
         customerEmail={customerEmail}
         customerAddress={customerAddress}

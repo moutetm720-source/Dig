@@ -1,6 +1,7 @@
 import { DigitalProduct } from '../types';
 import { store } from './store';
 import { safeGetItem, safeSetItem } from '../utils/safeStorage';
+import { getAuthBearer } from './authToken';
 
 export type SocialNetworkPlatform = 
   | 'twitter'
@@ -413,9 +414,11 @@ class SocialIntegrationsService {
 
   private async syncFromServer() {
     try {
-      const token = typeof window !== 'undefined' ? localStorage.getItem('df_moderator_passcode') || '2026' : '2026';
+      // SÉCURITÉ : aucun passcode faible en dur — token de session ou passcode
+      // du login validé côté serveur (sinon l'appel est anonyme → 401).
+      const bearer = getAuthBearer();
       const res = await fetch('/api/store/get?key=df_social_integrations_v1', {
-        headers: { 'Authorization': `Bearer ${token}` }
+        headers: { ...(bearer ? { Authorization: bearer } : {}) }
       });
       if (res.ok) {
         const data = await res.json();
@@ -589,12 +592,12 @@ class SocialIntegrationsService {
   public async saveAll(): Promise<boolean> {
     this.save();
     try {
-      const token = typeof window !== 'undefined' ? localStorage.getItem('df_moderator_passcode') || '2026' : '2026';
+      const bearer = getAuthBearer();
       await fetch('/api/store', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          ...(bearer ? { Authorization: bearer } : {})
         },
         body: JSON.stringify({
           df_social_integrations_v1: this.integrations
