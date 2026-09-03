@@ -23,25 +23,52 @@ npm run build      # bundle production (dist/)
 npm start          # production
 ```
 
-### Brancher PostgreSQL (Render)
+### Lancement sur Render — guide pas à pas
 
-`src/db/db.ts` accepte deux formats (les variables d'env du runtime priment sur `.env` —
-`dotenv` ne surcharge pas une variable déjà définie) :
+> **Aucune credential Render n'est dans ce dépôt** (ni `.env`, ni historique git) :
+> le mot de passe de la base, l'URL et les liens n'existent que dans **votre
+> dashboard Render**, où vous les saisissez au moment du lancement. Le fichier
+> `.env` est gitignoré et **jamais lu par Render** — tout se passe dans les
+> variables d'environnement du service.
 
-- **`DATABASE_URL`** (recommandé) : `postgresql://user:pass@host:5432/db?sslmode=require`.
-  C'est ce que Render injecte automatiquement quand la base Postgres est **liée** au service.
-  ⚠️ **Render exige le SSL** → assurez-vous que l'URL contient `?sslmode=require`
-  (ou définissez `DB_SSL=require`).
-- **Variables individuelles** : `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`,
-  `DB_SSL` (repli `SQL_*`).
+1. **Base PostgreSQL** — Render → *New* → *PostgreSQL* :
+   - Région : **Frankfurt** (recommandé, proximité) ; plan *Free* (90 jours) ou *Starter*.
+   - Notez : *Connection String* (contient le mot de passe) + *Host/Port/User/Database*.
+     Vous n'aurez pas à les saisir manuellement si vous **liez** la base (étape 3).
+2. **Service Web** — *New* → *Web Service* → branchez le dépôt GitHub
+   `moutetm720-source/Dig`, branche `arena/01a0680e-dig` (ou `main` une fois fusionné) :
+   - **Build Command** : `npm install && npm run build`
+   - **Start Command** : `npm start` (→ `tsx server.ts`, `tsx` est en `dependencies`)
+   - **Region** : Frankfurt (idéalement la même que la base).
+3. **Lier la base au service** — Web Service → *Settings* → *Advanced* →
+   *Linked Services* → *Add linked service* → choisir la Postgres.
+   → Render **injecte automatiquement `DATABASE_URL`** (mot de passe inclus,
+   `?sslmode=require`) dans les variables du service. C'est LA variable de base.
+4. **Variables d'environnement** (Web Service → *Environment*) — saisissez-les ici :
+   | Variable | Valeur |
+   |---|---|
+   | `DATABASE_URL` | (auto via le lien — **ne pas la recopier à la main**) |
+   | `SESSION_SECRET` | **obligatoire** : `openssl rand -hex 32` (ou 64 hex aléatoires) |
+   | `MODERATOR_PASSCODE` | **obligatoire** : votre code modérateur (jamais `2026`) |
+   | `HERMES_PROVIDER` | `auto` (défaut) — Hermes bascule entre vos fournisseurs IA |
+   | `GEMINI_API_KEY` | optionnel — clé Google AI Studio gratuite |
+   | `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` | optionnel — sans Stripe, posez `DEMO_CHECKOUT=1` |
+5. **Déployer** — *Deploy branch* (première fois : *Create Web Service* lance le build).
+   Vérifiez dans les logs : `Server listening on port` + `postgres connecté`.
+   Le SSL est forcé automatiquement sur un hôte `*.render.com` (`db.ts`).
 
-Le SSL est activé automatiquement pour un hôte `*.render.com` ou en production ; en dev
-local sans SSL, posez `DB_SSL=disable`. Le driver se tait sur les notices de démarrage
-Render (`onnotice`).
+**Après chaque push** : le service se redéploie seul (branch auto-deploy). Pour
+ajouter un fournisseur IA au pool Hermes au runtime, pas de redéploiement :
+parlez à Hermes (« ajoute Groq au pool ») ou `POST /api/hermes/providers`.
 
-> Pour déployer sur Render : créez le service Web, **liez** votre base Postgres
-> (Render ajoute alors `DATABASE_URL` dans l'env du service), et définissez
-> `SESSION_SECRET` + `MODERATOR_PASSCODE` (+ `HERMES_PROVIDER`/`GEMINI_API_KEY` pour l'IA).
+<details>
+<summary>Repli : variables de base individuelles (sans lien)</summary>
+
+`db.ts` accepte aussi `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`,
+`DB_SSL` (repli `SQL_*`) — ex. `postgresql://user:pass@host:5432/db?sslmode=require`
+dans `DATABASE_URL`, ou les champs séparés. Format générique, aucune valeur
+Render n'est fournie ici.
+</details>
 
 ### Configurer l'IA de Hermes (`.env`)
 

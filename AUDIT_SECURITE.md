@@ -497,12 +497,14 @@ export NODE_ENV=production
 npm run build && npm start
 ```
 
-**Déploiement Render (base Postgres liée)** : `db.ts` lit `DATABASE_URL`
-(injectée par Render quand la base est liée au service) ou les variables
-`DB_*`. Render **exige le SSL** → l'URL doit contenir `?sslmode=require`
-(ou `DB_SSL=require` ; `db.ts` le déduit aussi pour un hôte `*.render.com`).
-Les variables d'env du service priment sur `.env` (`dotenv` ne surcharge pas).
-`SESSION_SECRET` + `MODERATOR_PASSCODE` doivent être définis dans l'env du service.
+**Déploiement Render (guide complet dans `README.md`)** : `db.ts` lit `DATABASE_URL`
+(injectée par Render quand la base Postgres est **liée** au service — mot de passe
+inclus, `?sslmode=require`) ou les variables `DB_*` (repli). **Aucune credential
+Render n'est dans le dépôt** (travaillé, `.env` gitignoré, historique git vérifié) :
+tout se saisit dans le dashboard Render au moment du lancement. Le SSL est forcé
+automatiquement pour un hôte `*.render.com`. `SESSION_SECRET` + `MODERATOR_PASSCODE`
+sont **obligatoires** dans l'env du service ; `GEMINI_API_KEY` / `HERMES_PROVIDER`
+optionnels (Hermes tourne aussi sur le pool de fournisseurs géré au runtime).
 
 ## Suite de tests (régression)
 
