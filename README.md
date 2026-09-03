@@ -23,6 +23,26 @@ npm run build      # bundle production (dist/)
 npm start          # production
 ```
 
+### Brancher PostgreSQL (Render)
+
+`src/db/db.ts` accepte deux formats (les variables d'env du runtime priment sur `.env` —
+`dotenv` ne surcharge pas une variable déjà définie) :
+
+- **`DATABASE_URL`** (recommandé) : `postgresql://user:pass@host:5432/db?sslmode=require`.
+  C'est ce que Render injecte automatiquement quand la base Postgres est **liée** au service.
+  ⚠️ **Render exige le SSL** → assurez-vous que l'URL contient `?sslmode=require`
+  (ou définissez `DB_SSL=require`).
+- **Variables individuelles** : `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`,
+  `DB_SSL` (repli `SQL_*`).
+
+Le SSL est activé automatiquement pour un hôte `*.render.com` ou en production ; en dev
+local sans SSL, posez `DB_SSL=disable`. Le driver se tait sur les notices de démarrage
+Render (`onnotice`).
+
+> Pour déployer sur Render : créez le service Web, **liez** votre base Postgres
+> (Render ajoute alors `DATABASE_URL` dans l'env du service), et définissez
+> `SESSION_SECRET` + `MODERATOR_PASSCODE` (+ `HERMES_PROVIDER`/`GEMINI_API_KEY` pour l'IA).
+
 ### Configurer l'IA de Hermes (`.env`)
 
 | Variable | Rôle |

@@ -438,6 +438,13 @@ export NODE_ENV=production
 npm run build && npm start
 ```
 
+**Déploiement Render (base Postgres liée)** : `db.ts` lit `DATABASE_URL`
+(injectée par Render quand la base est liée au service) ou les variables
+`DB_*`. Render **exige le SSL** → l'URL doit contenir `?sslmode=require`
+(ou `DB_SSL=require` ; `db.ts` le déduit aussi pour un hôte `*.render.com`).
+Les variables d'env du service priment sur `.env` (`dotenv` ne surcharge pas).
+`SESSION_SECRET` + `MODERATOR_PASSCODE` doivent être définis dans l'env du service.
+
 ## Suite de tests (régression)
 
 - `scripts/start-test-pg.mjs` — Postgres embarqué de test (5432).
