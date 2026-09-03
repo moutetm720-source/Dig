@@ -4,3 +4,6 @@
 [submodule "references/awesome-llm-apps"]
 	path = references/awesome-llm-apps
 	url = https://github.com/Shubhamsaboo/awesome-llm-apps.git
+[submodule "references/awesome-free-llm-apis"]
+	path = references/awesome-free-llm-apis
+	url = https://github.com/mnfst/awesome-free-llm-apis.git

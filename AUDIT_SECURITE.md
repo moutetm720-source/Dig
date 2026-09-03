@@ -342,7 +342,7 @@ fantaisie). Le client fabriquait aussi des réponses locales
 |--------|------|
 | `hermes/types.ts` | Types + limites (budgets 6 pas / 10 outils, timeouts, tailles) |
 | `hermes/providers.ts` | Fournisseurs : **Gemini** (`@google/genai`, clé env), **compatible OpenAI** (Ollama local / Groq / OpenRouter — fetch natif), **mock** (tests uniquement). Sélection : `HERMES_PROVIDER` (env) > KV `df_hermes_config` ; `auto` = gemini→openai→hors-ligne honnête. **Aucun secret en base** (env uniquement) |
-| `hermes/tools.ts` | **29 skills** = opérations réelles serveur (catalogue, pricing, contenu/SEO, canaux, ventes agrégées, système). Whitelist de clés KV par skill ; aucune PII ni clé de paiement exposée ; egress https + anti-SSRF (`ssrfGuard.ts`) pour webhooks |
+| `hermes/tools.ts` | **34 skills** = opérations réelles serveur (catalogue, pricing, contenu/SEO, canaux, ventes agrégées, système). Whitelist de clés KV par skill ; aucune PII ni clé de paiement exposée ; egress https + anti-SSRF (`ssrfGuard.ts`) pour webhooks |
 | `hermes/agents.ts` | **8 agents** (orchestrateur + 7 spécialistes) avec sous-sets de skills et budget de pas ; dispatch via `dispatch_agent` |
 | `hermes/engine.ts` | Boucle plan→appel d'outil→observation (≤ budget), **confirmation obligatoire** des actions sensibles (actionId, TTL 10 min), journal d'audit `df_hermes_activity` (200), mémoire `df_hermes_memories` (50), résultats d'outils tronqués 4 000 car. |
 | `hermes/index.ts` | Router `/api/hermes` : `status`, `agents`, `skills`, `chat`, `confirm`, `autonomous-loop`, `config` (aucun secret renvoyé), `activity` |
@@ -377,6 +377,7 @@ Nouvel agent **Internet** + 4 skills d'interaction web, mêmes garde-fous que le
 | `web_fetch` | `assertSafeOutbound` (https, anti-SSRF, DNS préalable), **credentials dans l'URL interdits**, 20 s, body plafonné 1,5 Mo → texte ~4 000 car. |
 | `web_link_check` | ≤10 URLs, mêmes gardes, HEAD puis GET si 405/501 |
 | `free_tier_lookup` | **Offline** : snapshot curé de free-for.dev (`hermes/knowledge/free-for.json`, 106 services) — aucun appel sortant |
+| `free_llm_lookup` | **Offline** : snapshot de [awesome-free-llm-apis](https://github.com/mnfst/awesome-free-llm-apis) (`hermes/knowledge/free-llm-apis.json`, ~16 providers / 118 modèles, baseUrl compatibles OpenAI) — aucun appel sortant |
 
 - Aucun credential, aucune destination interne (IP privées, metadata, loopback) — bloqués par
   `ssrfGuard.ts` (vérifié par la suite sécurité, 400 sur 10/8, localhost, metadata GCP).
@@ -393,8 +394,8 @@ factice a été retiré — cf. P3) et `references/awesome-llm-apps`
 de 100+ apps/agents LLM ; patterns *search → fetch → synthétiser* repris par `web_explorer`).
 Exclus du `tsc`/build, jamais importés.
 
-**Tests** : `scripts/verify-hermes.mjs` (fournisseur mock, base seedée) — **24/24 PASS** :
-registres (**33 skills / 9 agents**), 401/400, **re-pricing vérifié en base**,
+**Tests** : `scripts/verify-hermes.mjs` (fournisseur mock, base seedée) — **26/26 PASS** :
+registres (**34 skills / 9 agents**), 401/400, **re-pricing vérifié en base**,
 suppression **bloquée jusqu'à confirmation** puis réellement supprimée,
 création réelle (draft), PII absente des réponses, journal d'audit,
 **agent internet** (KB offline, `web_fetch` réel, `web_search` honnête sans egress),
@@ -452,9 +453,9 @@ Les variables d'env du service priment sur `.env` (`dotenv` ne surcharge pas).
   (2), anti-SSRF (4), webhook signé (3), endpoints modérateur (3), rate-limit
   (1), proxy Stripe (1), **auth token (5)**, **commandes serveur/démo (7)**,
   **crypto on-chain fail-safe (8)**.
-- `scripts/verify-hermes.mjs` — **24 tests** du moteur Hermes v4 (fournisseur
+- `scripts/verify-hermes.mjs` — **26 tests** du moteur Hermes v4 (fournisseur
   `HERMES_PROVIDER=mock`, base seedée par `start-test-pg.mjs`) : registres
-  (33 skills / 9 agents), auth, boucle outil réelle (prix/suppression/création
+  (34 skills / 9 agents), auth, boucle outil réelle (prix/suppression/création
   vérifiés en base), confirmation des actions sensibles, PII, audit,
   **agent internet** (KB free-for.dev offline, web_fetch réel, web_search
   honnête), cycle autonome, 429. Gère les pauses 429 (fenêtre IA 6/min).

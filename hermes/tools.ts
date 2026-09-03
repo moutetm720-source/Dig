@@ -142,7 +142,7 @@ async function netFetch(url: string, init: RequestInit, ms: number, label: strin
   return res;
 }
 
-// ---------- Base de connaissances free-for.dev (snapshot curé) ----------
+// ---------- Bases de connaissances (snapshots curés) ----------
 
 let freeForCache: any = null;
 function loadFreeForKB(): any {
@@ -150,6 +150,14 @@ function loadFreeForKB(): any {
   const p = fileURLToPath(new URL('./knowledge/free-for.json', import.meta.url));
   freeForCache = JSON.parse(fs.readFileSync(p, 'utf-8'));
   return freeForCache;
+}
+
+let freeLLmCache: any = null;
+function loadFreeLLmKB(): any {
+  if (freeLLmCache) return freeLLmCache;
+  const p = fileURLToPath(new URL('./knowledge/free-llm-apis.json', import.meta.url));
+  freeLLmCache = JSON.parse(fs.readFileSync(p, 'utf-8'));
+  return freeLLmCache;
 }
 
 // ---------- Registre ----------
@@ -1045,7 +1053,7 @@ export function buildSkillRegistry(): HermesTool[] {
       },
       async run(args) {
         const kb = loadFreeForKB();
-        const noAccents = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+        const noAccents = (s: any) => String(s ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
         const query = str(args.query, 200).toLowerCase().trim();
         const category = noAccents(str(args.category, 40)).trim();
         if (!query && !category) {
@@ -1078,6 +1086,65 @@ export function buildSkillRegistry(): HermesTool[] {
           note: kb.meta.note,
           matched: scored.length,
           results: scored.map(x => ({ name: x.e.name, category: x.e.category, freeTier: x.e.freeTier, url: x.e.url, tags: x.e.tags }))
+        };
+      }
+    },
+    {
+      name: 'free_llm_lookup',
+      description: "Consulte la base des API LLM GRATUITES (snapshot du repo awesome-free-llm-apis, ~16 providers / 118 modèles) : Gemini, Groq, OpenRouter, Mistral, Ollama Cloud, Cloudflare Workers AI… Renvoie provider, limite gratuite, baseUrl (endpoint API, souvent compatible OpenAI) et modèles. Idéal pour recommander un backend IA à coût zéro.",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Mots-clés : nom (ex "groq"), modèle (ex "llama"), capacité (ex "rapide", "128k", "vision")' },
+          category: { type: 'string', description: 'provider_api | inference_provider — renvoyer sans arguments liste les catégories' }
+        }
+      },
+      async run(args) {
+        const kb = loadFreeLLmKB();
+        const noAccents = (s: any) => String(s ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+        const query = noAccents(str(args.query, 200)).trim();
+        const category = noAccents(str(args.category, 40)).trim();
+        if (!query && !category) {
+          const counts: Record<string, number> = {};
+          for (const e of kb.entries) counts[e.category] = (counts[e.category] || 0) + 1;
+          return { source: kb.meta.source, curatedAt: kb.meta.curatedAt, totalProviders: kb.entries.length, totalModels: kb.entries.reduce((n: number, e: any) => n + e.models.length, 0), categories: counts, hint: 'Appelez à nouveau avec query et/ou category.' };
+        }
+        const tokens = query ? query.split(/[\s,]+/).filter(t => t.length > 1) : [];
+        const scored = kb.entries.map(e => {
+          const name = noAccents(e.name);
+          const ft = noAccents(e.freeTier || '');
+          const base = noAccents(e.baseUrl || '');
+          let score = 0;
+          if (category && noAccents(e.category) === category) score += 10;
+          for (const t of tokens) {
+            if (name.includes(t)) score += 6;
+            if (e.models.some((m: any) => noAccents(m.id).includes(t) || noAccents(m.name || '').includes(t))) score += 5;
+            if (noAccents(e.category).includes(t)) score += 3;
+            if (ft.includes(t) || base.includes(t)) score += 2;
+            if (e.models.some((m: any) => noAccents(`${m.context || ''} ${m.modality || ''} ${m.rateLimit || ''}`).includes(t))) score += 2;
+          }
+          // modèles les plus pertinents d'abord (sinon les N premiers)
+          const models = [...e.models].sort((a: any, b: any) => {
+            if (!query) return 0;
+            const am = tokens.some(t => noAccents(`${a.id} ${a.name || ''}`).includes(t)) ? 1 : 0;
+            const bm = tokens.some(t => noAccents(`${b.id} ${b.name || ''}`).includes(t)) ? 1 : 0;
+            return bm - am;
+          }).slice(0, 5);
+          return { e, models, score };
+        }).filter(x => x.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 8);
+        return {
+          source: kb.meta.source,
+          curatedAt: kb.meta.curatedAt,
+          note: 'Limites susceptibles de changer — vérifier sur le site du provider avant de s\'engager. baseUrl = endpoint API (souvent compatible OpenAI : utilisable directement avec HERMES_OPENAI_BASE_URL).',
+          matched: scored.length,
+          results: scored.map(x => ({
+            name: x.e.name, flag: x.e.flag, category: x.e.category,
+            freeTier: x.e.freeTier, baseUrl: x.e.baseUrl, url: x.e.url,
+            models: x.models
+          }))
         };
       }
     },

@@ -269,7 +269,13 @@ class MockProvider implements LLMProvider {
       return { toolCalls: [{ name: 'metrics_summary', args: {} }] };
     }
 
-    // 7) Base gratuite (free-for.dev) : "quels outils gratuits pour héberger…"
+    // 7) API LLM gratuites (awesome-free-llm-apis) : "quelle API LLM gratuite…"
+    if (/(llm|large language|modèle ia|modele ia|gpt|chatbot|ia)/.test(prompt) && /(gratuit|free|sans coût|sans cout|0 ?€|zéro euro|zero cost)/.test(prompt)) {
+      const args: Record<string, any> = { query: String(lastUser?.text || '').slice(0, 200) };
+      return { toolCalls: [{ name: 'free_llm_lookup', args }] };
+    }
+
+    // 8) Base gratuite (free-for.dev) : "quels outils gratuits pour héberger…"
     if (prompt.includes('free-for') || (/(gratuit|sans coût|sans cout|0 ?€|zero cost)/.test(prompt) && /(outil|service|hébergement|heberg|base|api|infrastructure)/.test(prompt))) {
       const catMatch = prompt.match(/\b(ia|llm|hebergement|hébergement|base|email|e-mail|paiement|monitoring|analytics|cdn|stockage|recherche|authentification|communication|api_divers|dev_ci)\b/);
       const args: Record<string, any> = { query: String(lastUser?.text || '').slice(0, 200) };
@@ -277,19 +283,19 @@ class MockProvider implements LLMProvider {
       return { toolCalls: [{ name: 'free_tier_lookup', args }] };
     }
 
-    // 8) Contrôle de liens : "vérifie les liens…"
+    // 9) Contrôle de liens : "vérifie les liens…"
     if (/(vérifie|verifie|check)[^\n]*(lien|url)/.test(prompt) || prompt.includes('liens cassés') || prompt.includes('liens casses')) {
       const urls = [...String(lastUser?.text || '').matchAll(/https?:\/\/[^\s"'»\]]+/gi)].map(m => m[0]).slice(0, 10);
       if (urls.length > 0) return { toolCalls: [{ name: 'web_link_check', args: { urls } }] };
     }
 
-    // 9) Lecture de page : "lis/analyse cette page https://…"
+    // 10) Lecture de page : "lis/analyse cette page https://…"
     const urlInPrompt = [...String(lastUser?.text || '').matchAll(/https?:\/\/[^\s"'»\]]+/gi)].map(m => m[0])[0];
     if (urlInPrompt && /(lis|lit|page|contenu|analyse cette|résume cette|resume cette)/.test(prompt)) {
       return { toolCalls: [{ name: 'web_fetch', args: { url: urlInPrompt } }] };
     }
 
-    // 10) Recherche web : "cherche/recherche sur internet…"
+    // 11) Recherche web : "cherche/recherche sur internet…"
     if (/(cherch[ée]e|recherche|sur internet|sur le web|veille|tendances web)/.test(prompt)) {
       return { toolCalls: [{ name: 'web_search', args: { query: String(lastUser?.text || '').slice(0, 200), count: 5 } }] };
     }

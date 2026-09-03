@@ -9,7 +9,7 @@ tunnel de démo sans Stripe, et une sécurité durcie (voir [`AUDIT_SECURITE.md`
 - **Serveur** : Node.js + Express (TypeScript, `tsx`), PostgreSQL (drizzle-orm, key-value store), `server.ts`
 - **Client** : React 18 + Vite + Tailwind (`src/`)
 - **IA** : moteur d'agent Hermes (`hermes/`) — boucle tool-calling réelle, multi-fournisseurs
-- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (24 tests, mode mock)
+- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (26 tests, mode mock)
 
 ## Démarrage
 
@@ -61,11 +61,12 @@ exécutent toujours les actions réelles, l'interprétation libre est simplement
 |---|---|
 | `types.ts` | Types + limites (budgets 6 pas / 10 outils, timeouts, tailles) |
 | `providers.ts` | Gemini (`@google/genai`), compatible OpenAI (fetch natif), mock (tests) |
-| `tools.ts` | **33 skills réelles** : catalogue, pricing, contenu/SEO, canaux, ventes agrégées (sans PII), système… et **internet** |
+| `tools.ts` | **34 skills réelles** : catalogue, pricing, contenu/SEO, canaux, ventes agrégées (sans PII), système… et **internet** |
 | `agents.ts` | **9 agents** : orchestrateur + 8 spécialistes (dont l'**Agent Internet** `web_explorer`) |
 | `engine.ts` | Boucle plan → outil → observation, confirmation des actions sensibles (actionId), journal d'audit, mémoire |
 | `index.ts` | Router `/api/hermes` : `status`, `agents`, `skills`, `chat`, `confirm`, `autonomous-loop`, `config`, `activity` |
 | `knowledge/free-for.json` | Base de connaissances **~106 services à tiers gratuit** (snapshot curé de [free-for.dev](https://free-for.dev)) |
+| `knowledge/free-llm-apis.json` | Base des **API LLM gratuites** : ~16 providers / 118 modèles (snapshot de [mnfst/awesome-free-llm-apis](https://github.com/mnfst/awesome-free-llm-apis)) |
 
 ### Agent Internet (`web_explorer`)
 
@@ -76,6 +77,7 @@ Interagit avec internet via 4 skills, toutes gardées (https uniquement, anti-SS
 - `web_fetch` — lecture d'une page (HTML → texte lisible, ~4 000 car.)
 - `web_link_check` — santé de 1 à 10 liens (codes HTTP)
 - `free_tier_lookup` — base gratuite free-for.dev (hébergement, BDD, IA, e-mail, paiement, monitoring…)
+- `free_llm_lookup` — base des API LLM gratuites (provider, limite gratuite, **baseUrl** souvent compatible OpenAI → branchable directement via `HERMES_OPENAI_BASE_URL`)
 
 Le LLM (Gemini/OpenAI-compat) pilote l'agent ; en mode mock, un jeu de règles déterministe
 permet de tester la boucle complète sans réseau ni clé. **Honnêteté** : si le réseau du serveur
@@ -95,6 +97,7 @@ Deux dépôts de référence sont annexés dans `references/` (clones en sous-mo
 |---|---|---|
 | [elder-plinius/OBLITERATUS](https://github.com/elder-plinius/OBLITERATUS) | Projet open-source de **abliteration** : chirurgie fine-tuning de modèles LLM **locaux** (excision du vecteur de refus par SVD, PyTorch/GPU, Gradio, HF Spaces). | Référence technique et historique. ⚠️ **Non intégré au runtime de l'app** : c'est un outil de recherche Python/GPU qui modifie des checkpoints locaux — sans objet sur des LLM d'API (Gemini, etc.). Le « module OBLITERATUS » de l'ancienne UI était une **simulation factice** (chiffres inventés, prompts de type jailbreak) et a été retiré le 2026-09-03 (`/api/obliteratus/ablate` → 410 Gone). |
 | [Shubhamsaboo/awesome-llm-apps](https://github.com/Shubhamsaboo/awesome-llm-apps) | Recensement de **100+ apps/agents LLM** open-source (RAG, agents, skills, MCP, voix). | Inspiration et catalogue de patterns — les skills « internet » de Hermes suivent le schéma classique *search → fetch → extract → synthétiser avec sources* (cf. `starter_ai_agents/web_scraping_ai_agent`, `openai_research_agent`, `ai-deep-research-agent`). |
+| [mnfst/awesome-free-llm-apis](https://github.com/mnfst/awesome-free-llm-apis) | Liste maintenu d'**API LLM gratuites** (data.json : ~16 providers, limites, modèles, baseUrl). | **Intégré à Hermes** : son `data.json` alimente la base `hermes/knowledge/free-llm-apis.json` consultée par la skill `free_llm_lookup` (agent Internet) pour recommander un backend IA à coût zéro. |
 
 > Les références sont en **lecture seule** : exclues du `tsc`/`vite build` du projet, jamais
 > importées par le serveur ou le client. Pour les mettre à jour :

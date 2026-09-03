@@ -95,7 +95,7 @@ async function reseed() {
 
   r = await req('GET', '/api/hermes/skills');
   const skillNames = (r.json.skills || []).map(s => s.name);
-  check('skills → registre complet (catalogue, pricing, contenu, canaux, ventes, système, internet)', ['catalog_create', 'catalog_set_price', 'catalog_delete', 'publish_product', 'pricing_audit', 'content_create', 'seo_update', 'channels_dispatch', 'metrics_summary', 'orders_recent', 'audit_system', 'kv_set', 'dispatch_agent', 'web_search', 'web_fetch', 'web_link_check', 'free_tier_lookup'].every(s => skillNames.includes(s)), `${skillNames.length} skills`);
+  check('skills → registre complet (catalogue, pricing, contenu, canaux, ventes, système, internet)', ['catalog_create', 'catalog_set_price', 'catalog_delete', 'publish_product', 'pricing_audit', 'content_create', 'seo_update', 'channels_dispatch', 'metrics_summary', 'orders_recent', 'audit_system', 'kv_set', 'dispatch_agent', 'web_search', 'web_fetch', 'web_link_check', 'free_tier_lookup', 'free_llm_lookup'].every(s => skillNames.includes(s)), `${skillNames.length} skills`);
 
   console.log('\n═══ HERMES V4 — Sécurité ═══');
 
@@ -157,6 +157,12 @@ async function reseed() {
   const kbStep = (r.json.steps || []).find(s => s.tool === 'free_tier_lookup');
   check('free_tier_lookup → skill exécutée', r.status === 200 && kbStep && kbStep.status === 'ok', JSON.stringify(kbStep || {}).slice(0, 120));
   check('réponse KB → services réels listés (Render/Vercel/Netlify…)', (r.json.response || '').includes('free-for.dev') || /Render|Vercel|Netlify|Cloudflare/i.test(r.json.response || ''), (r.json.response || '').slice(0, 100).replace(/\n/g, ' '));
+
+  // I1b : base des API LLM gratuites (offline, déterministe)
+  r = await aiChat('Quelle API LLM gratuite me recommandes-tu ?', 'web_explorer');
+  const llmStep = (r.json.steps || []).find(s => s.tool === 'free_llm_lookup');
+  check('free_llm_lookup → skill exécutée', r.status === 200 && llmStep && llmStep.status === 'ok', JSON.stringify(llmStep || {}).slice(0, 120));
+  check('réponse KB LLM → providers réels (Groq/OpenRouter/Gemini…)', /awesome-free-llm-apis|Groq|OpenRouter|Gemini|Mistral/i.test(r.json.response || ''), (r.json.response || '').slice(0, 100).replace(/\n/g, ' '));
 
   // I2 : lecture d'une page réelle (host autorisé dans le sandbox : npmjs)
   r = await aiChat('Lis la page https://registry.npmjs.org/ et dis-moi ce que c\'est', 'web_explorer');
