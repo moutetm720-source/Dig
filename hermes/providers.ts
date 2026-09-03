@@ -15,7 +15,8 @@ import { GoogleGenAI } from '@google/genai';
 import { db } from '../src/db/db';
 import { keyValueStore } from '../src/db/schema';
 import { eq } from 'drizzle-orm';
-import { AgentEvent, LLMChatOptions, LLMChatResult, LLMProvider, HermesConfig, DEFAULT_HERMES_CONFIG, HERMES_LIMITS } from './types';
+import { assertProviderBaseUrl } from '../ssrfGuard';
+import { AgentEvent, LLMChatOptions, LLMChatResult, LLMProvider, HermesConfig, DEFAULT_HERMES_CONFIG, HERMES_LIMITS, ProviderSpec, HERMES_POOL } from './types';
 
 // ---------- Config (env + KV) ----------
 
@@ -136,9 +137,11 @@ class OpenAICompatProvider implements LLMProvider {
   model: string;
   baseUrl: string;
   label: string;
-  constructor(baseUrl: string, model: string) {
+  private key?: string;
+  constructor(baseUrl: string, model: string, apiKey?: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.model = model;
+    this.key = apiKey || undefined;
     this.label = `OpenAI-compatible ${this.baseUrl} (${model})`;
   }
 
@@ -183,7 +186,8 @@ class OpenAICompatProvider implements LLMProvider {
 
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
-      throw new Error(`Fournisseur OpenAI-compatible : HTTP ${res.status} ${errText.slice(0, 200)}`);
+      const retryAfter = res.headers.get('retry-after');
+      throw new Error(`Fournisseur OpenAI-compatible : HTTP ${res.status}${retryAfter ? ` (retry-after ${retryAfter}s)` : ''} ${errText.slice(0, 200)}`);
     }
     const data: any = await res.json();
     const msg = data?.choices?.[0]?.message;
@@ -300,8 +304,42 @@ class MockProvider implements LLMProvider {
       return { toolCalls: [{ name: 'web_search', args: { query: String(lastUser?.text || '').slice(0, 200), count: 5 } }] };
     }
 
+    // 12) Gestionnaire d'API & tokens : « ajoute X au pool (+ baseUrl/model/clé) » → providers_add
+    if (/(ajoute|add|branche)[^\n]*(pool|fournisseur)/.test(prompt) || /fournisseur[^\n]*(ajoute|add|branche)/.test(prompt)) {
+      const nameMatch = prompt.match(/(?:ajoute|add|branche)\s+(?:le\s+|la\s+|un\s+|une\s+|nouveau\s+|nouvelle\s+)?([a-z0-9][a-z0-9-_]{1,39})/i);
+      const rawName = (nameMatch?.[1] || 'fournisseur').toLowerCase();
+      const name = ['le', 'la', 'un', 'une', 'nouveau', 'fournisseur', 'pool'].includes(rawName) ? 'fournisseur' : rawName;
+      const baseUrl = (String(lastUser?.text || '').match(/https?:\/\/[^\s"'»\]]+/i) || [])[0];
+      const model = (String(lastUser?.text || '').match(/\bmod[èe]le\s*[:=]?\s*([a-z0-9./:_-]{2,60})/i) || [])[1];
+      const key = (String(lastUser?.text || '').match(/\b(?:api[_ -]?key|cl[ée]|token)\s*[:=]?\s*(sk-[A-Za-z0-9_\-]{4,})/i) || [])[1];
+      const args: Record<string, any> = { name, kind: baseUrl ? 'openai' : 'gemini' };
+      if (baseUrl) args.baseUrl = baseUrl;
+      if (model) args.model = model;
+      if (key) args.apiKey = key;
+      return { toolCalls: [{ name: 'providers_add', args }] };
+    }
+
+    // 13) « supprime le fournisseur X » → providers_remove
+    if (/supprim[ée]e?[^\n]*fournisseur|fournisseur[^\n]*supprim/.test(prompt)) {
+      const nameMatch = String(lastUser?.text || '').match(/fournisseur\s+([a-z0-9][a-z0-9-_]{1,39})/i);
+      const name = (nameMatch?.[1] || 'fournisseur').toLowerCase();
+      return { toolCalls: [{ name: 'providers_remove', args: { name } }] };
+    }
+
+    // 14) « teste le fournisseur X » → providers_test
+    if (/(test[ée]e?|vérifie|verifie)[^\n]*fournisseur|fournisseur[^\n]*(test[ée]e?|vérifie)/.test(prompt)) {
+      const nameMatch = String(lastUser?.text || '').match(/fournisseur\s+([a-z0-9][a-z0-9-_]{1,39})/i);
+      const name = (nameMatch?.[1] || '').toLowerCase();
+      return { toolCalls: [{ name: 'providers_test', args: name ? { name } : {} }] };
+    }
+
+    // 15) « liste les fournisseurs » / « statut du pool » → providers_list
+    if (/(liste|statut|état|etat|montre|vois|show)[^\n]*(fournisseur|pool)|fournisseur[^\n]*(liste|statut)/.test(prompt)) {
+      return { toolCalls: [{ name: 'providers_list', args: {} }] };
+    }
+
     // 7) Défaut : texte honnête
-    return { text: `🤖 **Hermes (mode mock — tests)**\n\nMessage reçu : « ${String(lastUser?.text || '').slice(0, 120)} ».\n\nCe fournisseur est le **mock déterministe de test** : il exécutera les actions explicites (prix, création, suppression, audit) via les outils réels du serveur, mais ne fait aucune génération de langage. Configurez un fournisseur réel (Gemini, Ollama local, Groq...) pour l'interprétation libre.` };
+    return { text: `🤖 **Hermes (mode mock — tests)**\n\nMessage reçu : « ${String(lastUser?.text || '').slice(0, 120)} ».\n\nCe fournisseur est le **mock déterministe de test** : il exécutera les actions explicites (prix, création, suppression, audit, gestion du pool de fournisseurs) via les outils réels du serveur, mais ne fait aucune génération de langage. Configurez un fournisseur réel (Gemini, Ollama local, Groq...) pour l'interprétation libre.` };
   }
 }
 
@@ -334,6 +372,266 @@ export async function getActiveProvider(): Promise<{ provider: LLMProvider | nul
     return { provider: null, reason: 'aucun fournisseur disponible (configurez GEMINI_API_KEY ou un endpoint OpenAI-compatible type Ollama)' };
   } catch (e: any) {
     return { provider: null, reason: `erreur de sélection fournisseur : ${e?.message}` };
+  }
+}
+
+// ---------- POOL MULTI-FOURNISSEURS (gestionnaire d'API & tokens + bascule automatique) ----------
+//
+// Objectif : ne JAMAIS être bloqué. Le pool mélange :
+//   1. les fournisseurs déclarés dans l'environnement (GEMINI_API_KEY, HERMES_OPENAI_BASE_URL) ;
+//   2. les fournisseurs gérés au RUNTIME (KV df_hermes_provider_pool — protégée,
+//      modifiable par Hermes via les skills providers_* ou l'API REST) ;
+//   3. le mock déterministe en dernier recours (réponse toujours honnête).
+// À chaque appel LLM, si un fournisseur renvoie 429/5xx/timeout, il passe en
+// cooldown (30 s sur rate-limit — ou Retry-After — ; 15 s sur erreur) et le
+// suivant est essayé automatiquement.
+
+export interface PoolEntry {
+  name: string;
+  kind: 'gemini' | 'openai' | 'mock';
+  model: string;
+  baseUrl?: string;
+  local?: boolean;
+  priority: number;
+  source: 'env' | 'pool';
+  provider: LLMProvider;
+  hasKey: boolean;
+  /** Clé masquée (jamais en clair) — renseignée pour les vues statut/UI. */
+  keyMasked?: string | null;
+}
+
+interface PoolStat { calls: number; ok: number; errors: number; cooldownUntil: number; lastError: string; lastErrorAt: number }
+const poolStats = new Map<string, PoolStat>();
+
+const emptyStat = (): PoolStat => ({ calls: 0, ok: 0, errors: 0, cooldownUntil: 0, lastError: '', lastErrorAt: 0 });
+
+function stat(name: string): PoolStat {
+  let st = poolStats.get(name);
+  if (!st) { st = emptyStat(); poolStats.set(name, st); }
+  return st;
+}
+
+/** Un secret n'est JAMAIS exposé tel quel (UI, audit, logs, API) : seul sa longueur est signalée. */
+export function maskSecret(v: any): string {
+  if (typeof v !== 'string' || !v) return '';
+  return `•••• (${v.length} car.)`;
+}
+
+function specFromEnv(name: string, kind: 'gemini' | 'openai', model: string, priority: number, baseUrl?: string, apiKey?: string, local?: boolean): ProviderSpec {
+  return { name, kind, model, priority, ...(baseUrl ? { baseUrl } : {}), ...(apiKey ? { apiKey } : {}), ...(local ? { local: true } : {}) };
+}
+
+async function loadPoolSpecs(): Promise<ProviderSpec[]> {
+  try {
+    const r = await db.select().from(keyValueStore).where(eq(keyValueStore.key, HERMES_POOL.KV_KEY));
+    if (r.length > 0 && r[0].value) {
+      const v = typeof r[0].value === 'string' ? JSON.parse(r[0].value) : r[0].value;
+      if (Array.isArray(v)) {
+        return v
+          .filter((x: any) => x && typeof x === 'object' && typeof x.name === 'string' && ['gemini', 'openai', 'mock'].includes(x.kind))
+          .slice(0, HERMES_POOL.MAX_PROVIDERS);
+      }
+    }
+  } catch {}
+  return [];
+}
+
+async function savePoolSpecs(specs: ProviderSpec[]): Promise<void> {
+  await db.insert(keyValueStore).values({ key: HERMES_POOL.KV_KEY, value: specs })
+    .onConflictDoUpdate({ target: keyValueStore.key, set: { value: specs } });
+}
+
+function providerFromSpec(spec: ProviderSpec): LLMProvider {
+  if (spec.kind === 'gemini') return new GeminiProvider(spec.model || DEFAULT_HERMES_CONFIG.geminiModel);
+  if (spec.kind === 'openai') return new OpenAICompatProvider(spec.baseUrl || '', spec.model || '', spec.apiKey);
+  return new MockProvider();
+}
+
+/** Pool complet, trié par priorité (1 = premier, 999 = dernier recours). */
+export async function buildPool(): Promise<PoolEntry[]> {
+  const cfg = await getHermesConfig();
+  const envForce = (process.env.HERMES_PROVIDER || '').toLowerCase();
+  const choice = envForce || cfg.provider;
+  const specs: ProviderSpec[] = [];
+  const envLocal = cfg.openaiBaseUrl ? /localhost|127\.0\.0\.1|\[::1\]/i.test(cfg.openaiBaseUrl) : false;
+
+  if (choice === 'gemini' || choice === 'auto') {
+    if (process.env.GEMINI_API_KEY) specs.push(specFromEnv('gemini-env', 'gemini', cfg.geminiModel, 10));
+  }
+  if (choice === 'openai' || choice === 'auto') {
+    if (cfg.openaiBaseUrl) specs.push(specFromEnv('openai-env', 'openai', cfg.openaiModel, 20, cfg.openaiBaseUrl, process.env.HERMES_OPENAI_API_KEY || undefined, envLocal));
+  }
+  // Fournisseurs gérés au runtime (KV) — hors verrou exclusif gemini/openai
+  if (choice === 'auto' || choice === 'mock') {
+    for (const s of await loadPoolSpecs()) specs.push(s);
+  }
+  // Filet de sécurité : le mock déterministe répond TOUJOURS (jamais bloqué, réponse honnête)
+  specs.push({ name: 'mock-env', kind: 'mock', model: 'mock-deterministe-v1', priority: 999 });
+
+  const entries: PoolEntry[] = specs.map(spec => {
+    const isEnv = spec.name.endsWith('-env');
+    const actualKey = spec.kind === 'gemini'
+      ? (spec.apiKey || (isEnv ? process.env.GEMINI_API_KEY : ''))
+      : spec.kind === 'openai'
+        ? (spec.apiKey || (isEnv ? (process.env.HERMES_OPENAI_API_KEY || '') : ''))
+        : undefined;
+    return {
+      name: spec.name,
+      kind: spec.kind,
+      model: spec.model || (spec.kind === 'gemini' ? DEFAULT_HERMES_CONFIG.geminiModel : '-'),
+      baseUrl: spec.baseUrl,
+      local: spec.local,
+      priority: Number.isFinite(Number(spec.priority)) ? Number(spec.priority) : 500,
+      source: isEnv ? 'env' : 'pool',
+      provider: providerFromSpec(spec),
+      hasKey: spec.kind === 'mock' ? true : Boolean(actualKey),
+      keyMasked: spec.kind === 'mock' ? null : (actualKey ? maskSecret(actualKey) : 'absente')
+    };
+  });
+  entries.sort((a, b) => a.priority - b.priority);
+  return entries;
+}
+
+/** Pool utilisable : les fournisseurs en cooldown sont décalés en fin de file (retentés si tous sont en échec). */
+export async function getUsablePool(): Promise<PoolEntry[]> {
+  const all = await buildPool();
+  const now = Date.now();
+  const cooling = all.filter(e => stat(e.name).cooldownUntil > now);
+  const ready = all.filter(e => stat(e.name).cooldownUntil <= now);
+  return ready.length > 0 ? [...ready, ...cooling] : all;
+}
+
+/** Déclaration de résultat d'un appel fournisseur (drive les cooldowns). */
+export function reportOutcome(name: string, kind: 'ok' | 'rate_limited' | 'error', retryAfterSec?: number, message?: string): void {
+  const st = stat(name);
+  st.calls += 1;
+  if (kind === 'ok') {
+    st.ok += 1;
+  } else {
+    st.errors += 1;
+    const ms = kind === 'rate_limited'
+      ? (Number.isFinite(retryAfterSec) && retryAfterSec! > 0 ? Math.min(retryAfterSec! * 1000, 10 * 60 * 1000) : HERMES_POOL.COOLDOWN_429_MS)
+      : HERMES_POOL.COOLDOWN_ERROR_MS;
+    st.cooldownUntil = Date.now() + ms;
+    st.lastError = String(message || kind).slice(0, 300);
+    st.lastErrorAt = Date.now();
+  }
+}
+
+const RATE_LIMIT_RE = /429|rate.?limit|quota|too many requests|resource exhausted|overloaded/i;
+const RETRY_AFTER_RE = /retry[- ]after[:\s=]*(\d+)/i;
+
+/**
+ * Appel LLM avec bascule automatique : tente les fournisseurs du pool dans
+ * l'ordre de priorité ; sur 429/5xx/timeout, le fournisseur passe en cooldown
+ * et le suivant est essayé. Échec final seulement si TOUS ont échoué.
+ */
+export async function chatWithFailover(opts: LLMChatOptions): Promise<{ result: LLMChatResult; entry: PoolEntry }> {
+  const entries = (await getUsablePool()).slice(0, HERMES_POOL.MAX_FALLBACKS_PER_CALL);
+  if (entries.length === 0) throw new Error('Aucun fournisseur IA disponible (pool vide).');
+  const tried: string[] = [];
+  for (const entry of entries) {
+    try {
+      const result = await entry.provider.chat(opts);
+      reportOutcome(entry.name, 'ok');
+      return { result, entry };
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      tried.push(`${entry.name} (${msg.slice(0, 100)})`);
+      const rate = RATE_LIMIT_RE.test(msg);
+      const m = RETRY_AFTER_RE.exec(msg);
+      reportOutcome(entry.name, rate ? 'rate_limited' : 'error', m ? Number(m[1]) : undefined, msg.slice(0, 300));
+    }
+  }
+  throw new Error(`Tous les fournisseurs IA sont indisponibles. Essayés : ${tried.join(' | ')}`);
+}
+
+/** État du pool, secrets masqués (jamais de clé en clair — UI, API, logs). */
+export async function getPoolStatus(): Promise<Array<Record<string, any>>> {
+  const entries = await buildPool();
+  const now = Date.now();
+  return entries.map(e => {
+    const st = stat(e.name);
+    return {
+      name: e.name, kind: e.kind, model: e.model, baseUrl: e.baseUrl, local: e.local || undefined,
+      priority: e.priority, source: e.source, label: e.provider.label,
+      key: e.keyMasked,
+      inCooldown: st.cooldownUntil > now,
+      cooldownRemainingSec: st.cooldownUntil > now ? Math.ceil((st.cooldownUntil - now) / 1000) : 0,
+      calls: st.calls, ok: st.ok, errors: st.errors,
+      lastError: st.lastError || undefined,
+      lastErrorAt: st.lastErrorAt || undefined
+    };
+  });
+}
+
+const PROVIDER_NAME_RE = /^[a-z0-9-_]{2,40}$/;
+
+/** Ajoute un fournisseur au pool (runtime — sans redéploiement). Retourne l'entrée masquée. */
+export async function addProvider(spec: Partial<ProviderSpec>): Promise<{ ok: true; entry: Record<string, any> }> {
+  const name = String(spec.name || '').trim().toLowerCase();
+  if (!PROVIDER_NAME_RE.test(name)) throw new Error('Nom invalide : 2-40 caractères [a-z0-9-_].');
+  const kind = spec.kind;
+  if (!['gemini', 'openai'].includes(kind as string)) throw new Error("Kind invalide : 'gemini' ou 'openai' (le mock n'est pas ajoutable — c'est le filet de sécurité local).");
+
+  const existing = await loadPoolSpecs();
+  if (existing.some(s => s.name === name)) throw new Error(`Un fournisseur « ${name} » existe déjà.`);
+  if (existing.length >= HERMES_POOL.MAX_PROVIDERS) throw new Error(`Limite du pool atteinte (${HERMES_POOL.MAX_PROVIDERS} fournisseurs).`);
+  const reserved = new Set(['gemini-env', 'openai-env', 'mock-env']);
+  if (reserved.has(name)) throw new Error('Nom réservé (fournisseur d\'environnement).');
+
+  const next: ProviderSpec = { name, kind: kind as 'gemini' | 'openai', priority: Number.isFinite(Number(spec.priority)) ? Math.max(1, Math.min(998, Number(spec.priority))) : 500 };
+  if (kind === 'gemini') {
+    if (!spec.apiKey) throw new Error('Un fournisseur gemini du pool exige apiKey.');
+    next.apiKey = String(spec.apiKey).slice(0, 500);
+    next.model = String(spec.model || DEFAULT_HERMES_CONFIG.geminiModel).slice(0, 80);
+  } else {
+    const baseUrl = String(spec.baseUrl || '').trim();
+    if (!baseUrl) throw new Error('Un fournisseur openai du pool exige baseUrl (endpoint compatible OpenAI).');
+    await assertProviderBaseUrl(baseUrl, { allowLoopback: Boolean(spec.local) });
+    next.baseUrl = baseUrl.slice(0, 300);
+    next.model = String(spec.model || '').slice(0, 120);
+    if (!next.model) throw new Error('Un fournisseur openai du pool exige model.');
+    if (spec.apiKey) next.apiKey = String(spec.apiKey).slice(0, 500);
+    if (spec.local) next.local = true;
+  }
+
+  existing.push(next);
+  await savePoolSpecs(existing);
+  stat(name).cooldownUntil = 0;
+  const [entry] = await getPoolStatus().then(l => l.filter(x => x.name === name));
+  return { ok: true, entry };
+}
+
+/** Retire un fournisseur du pool (le fournisseur d'environnement ne peut pas être retiré). */
+export async function removeProvider(name: string): Promise<{ ok: true; removed: string }> {
+  const n = String(name || '').trim().toLowerCase();
+  if (!n) throw new Error('Nom manquant.');
+  const existing = await loadPoolSpecs();
+  const idx = existing.findIndex(s => s.name === n);
+  if (idx === -1) throw new Error(`Fournisseur inconnu : ${n} (les fournisseurs d'environnement ne sont pas retirables — changez HERMES_PROVIDER).`);
+  existing.splice(idx, 1);
+  await savePoolSpecs(existing);
+  poolStats.delete(n);
+  return { ok: true, removed: n };
+}
+
+/** Test de connexion d'un fournisseur (1 micro-appel, ~1 token) sans impacter les cooldowns. */
+export async function testProvider(name: string): Promise<{ ok: boolean; name: string; ms: number; sample?: string; error?: string }> {
+  const n = String(name || '').trim().toLowerCase();
+  const entries = await buildPool();
+  const entry = entries.find(e => e.name === n);
+  if (!entry) throw new Error(`Fournisseur inconnu : ${n}`);
+  const t0 = Date.now();
+  try {
+    const res = await withTimeout(entry.provider.chat({
+      system: 'Tu réponds exactement : OK',
+      events: [{ type: 'text', role: 'user', text: 'Réponds uniquement : OK' }],
+      tools: []
+    }), 30 * 1000);
+    return { ok: true, name: n, ms: Date.now() - t0, sample: String(res.text || '').slice(0, 120) };
+  } catch (e: any) {
+    return { ok: false, name: n, ms: Date.now() - t0, error: String(e?.message || e).slice(0, 300) };
   }
 }
 

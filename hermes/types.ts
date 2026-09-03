@@ -136,3 +136,23 @@ export const HERMES_LIMITS = {
   CONFIRM_TTL_MS: 10 * 60 * 1000,
   LLM_TIMEOUT_MS: 90 * 1000
 };
+
+// ---------- Pool multi-fournisseurs (gestionnaire d'API & tokens, bascule automatique) ----------
+
+export interface ProviderSpec {
+  name: string;                    // identifiant ^[a-z0-9-_]{2,40}$
+  kind: 'gemini' | 'openai' | 'mock';
+  model?: string;                  // openai : requis ; gemini : défaut gemini-2.5-flash
+  baseUrl?: string;                // openai : requis (Ollama local autorisé via local:true)
+  apiKey?: string;                 // stockée KV protégée, JAMAIS exposée (UI, audit, logs, /api/store)
+  local?: boolean;                 // true = endpoint local (Ollama http loopback) — exception SSRF documentée
+  priority: number;                // 1 = priorité (le mock d'environnement est en 999)
+}
+
+export const HERMES_POOL = {
+  KV_KEY: 'df_hermes_provider_pool',
+  MAX_PROVIDERS: 12,
+  MAX_FALLBACKS_PER_CALL: 4,      // max de fournisseurs essayés par appel chat (anti-blocage sans spam)
+  COOLDOWN_429_MS: 30 * 1000,     // rate-limit → 30 s (ou Retry-After si fourni)
+  COOLDOWN_ERROR_MS: 15 * 1000    // erreur réseau/5xx → 15 s
+};

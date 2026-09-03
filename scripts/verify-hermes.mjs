@@ -85,7 +85,7 @@ async function reseed() {
   console.log('\n═══ HERMES V4 — État réel & registres ═══');
 
   let r = await req('GET', '/api/hermes/status');
-  check('status → 200 + moteur v4 + fournisseur mock', r.status === 200 && String(r.json.engine).startsWith('hermes-core-v4') && String(r.json.provider).startsWith('Mock'), JSON.stringify(r.json).slice(0, 140));
+  check('status → 200 + moteur v5 (pool multi-fournisseurs) + fournisseur mock', r.status === 200 && String(r.json.engine).startsWith('hermes-core-v5') && String(r.json.provider).startsWith('Mock'), JSON.stringify(r.json).slice(0, 140));
   check('status → 25+ skills déclarées', r.json.skillsCount >= 25, `skills=${r.json.skillsCount}`);
   check('status → 9 agents spécialisés', r.json.agentsCount === 9, `agents=${r.json.agentsCount}`);
 
@@ -95,7 +95,7 @@ async function reseed() {
 
   r = await req('GET', '/api/hermes/skills');
   const skillNames = (r.json.skills || []).map(s => s.name);
-  check('skills → registre complet (catalogue, pricing, contenu, canaux, ventes, système, internet)', ['catalog_create', 'catalog_set_price', 'catalog_delete', 'publish_product', 'pricing_audit', 'content_create', 'seo_update', 'channels_dispatch', 'metrics_summary', 'orders_recent', 'audit_system', 'kv_set', 'dispatch_agent', 'web_search', 'web_fetch', 'web_link_check', 'free_tier_lookup', 'free_llm_lookup'].every(s => skillNames.includes(s)), `${skillNames.length} skills`);
+  check('skills → registre complet (catalogue, pricing, contenu, canaux, ventes, système, internet)', ['catalog_create', 'catalog_set_price', 'catalog_delete', 'publish_product', 'pricing_audit', 'content_create', 'seo_update', 'channels_dispatch', 'metrics_summary', 'orders_recent', 'audit_system', 'kv_set', 'dispatch_agent', 'web_search', 'web_fetch', 'web_link_check', 'free_tier_lookup', 'free_llm_lookup', 'providers_list', 'providers_add', 'providers_remove', 'providers_test'].every(s => skillNames.includes(s)), `${skillNames.length} skills`);
 
   console.log('\n═══ HERMES V4 — Sécurité ═══');
 
@@ -185,6 +185,77 @@ async function reseed() {
   check('synergy SANS auth → 401 (régression phase 1)', r.status === 401, `HTTP ${r.status}`);
   r = await req('POST', '/api/obliteratus/ablate', { body: { modelName: 'x' } });
   check('module OBLITERATUS factice retiré → 410 Gone', r.status === 410, `HTTP ${r.status}`);
+
+  console.log('\n═══ HERMES V5 — Gestionnaire d\u2019API & tokens (pool multi-fournisseurs, jamais bloqué) ═══');
+
+  // P1 : endpoints protégés
+  r = await req('GET', '/api/hermes/providers');
+  check('providers SANS auth → 401', r.status === 401, `HTTP ${r.status}`);
+  r = await req('GET', '/api/hermes/providers', A);
+  check('providers (auth) → 200 + pool ≥1 + aucune clé en clair', r.status === 200 && Array.isArray(r.json.pool) && r.json.pool.length >= 1 && !/sk-|ghp_|api[_-]?key.{0,4}["']\s*:\s*["'][A-Za-z0-9]{12,}/i.test(r.text), `pool=${(r.json.pool || []).map(e => e.name).join(',')}`);
+
+  // P2 : ajout d'un fournisseur cassé (priorité 1) + clé masquée dans la réponse
+  r = await req('POST', '/api/hermes/providers', { body: { name: 'test-broken', kind: 'openai', model: 'fake-1', baseUrl: 'https://registry.npmjs.org/v1', apiKey: 'sk-fake-test-1234567890abcdef', priority: 1 }, ...A });
+  check('ajout fournisseur (baseUrl https, prio 1) → 200', r.status === 200 && r.json.added === true, `HTTP ${r.status}`);
+  check('clé JAMAIS en clair dans la réponse (masquée)', r.status === 200 && !r.text.includes('sk-fake-test-1234567890abcdef') && /•|masqu|\(\d+ car\.\)/.test(r.text), r.text.slice(0, 120));
+
+  // P3 : test de connexion → échec HONNÊTE (404 npmjs), pas de faux succès
+  r = await req('POST', '/api/hermes/providers/test-broken/test', A);
+  check('test du fournisseur cassé → ok:false + erreur réelle', r.status === 200 && r.json.ok === false && /404|HTTP|erreur|indispo/i.test(r.json.error || ''), JSON.stringify(r.json).slice(0, 120));
+
+  // P4 : BASCULE AUTOMATIQUE — chat malgré le fournisseur cassé en priorité 1
+  r = await aiChat('statut');
+  const fallbackOk = r.status === 200 && String(r.json.provider || '').startsWith('Mock');
+  check('chat RÉUSSIT via bascule automatique (cassé → mock) — jamais bloqué', fallbackOk && r.json.steps.some(s => s.tool === 'audit_system' && s.status === 'ok'), `provider=${r.json?.provider}`);
+  r = await req('GET', '/api/hermes/providers', A);
+  const brokenStat = (r.json.pool || []).find(e => e.name === 'test-broken');
+  check('fournisseur cassé → cooldown + erreur tracée (stats transparentes)', brokenStat && brokenStat.errors >= 1 && brokenStat.inCooldown === true, JSON.stringify(brokenStat || {}).slice(0, 120));
+
+  // P5 : rejets de validation (SSRF, clé manquante, nom invalide)
+  r = await req('POST', '/api/hermes/providers', { body: { name: 'bad-ssrf', kind: 'openai', model: 'x', baseUrl: 'http://192.168.1.10/v1' }, ...A });
+  check('SSRF : baseUrl privée http 192.168.x → 400', r.status === 400, `HTTP ${r.status}`);
+  r = await req('POST', '/api/hermes/providers', { body: { name: 'bad-meta', kind: 'openai', model: 'x', baseUrl: 'https://metadata.google.internal/' }, ...A });
+  check('SSRF : metadata cloud → 400', r.status === 400, `HTTP ${r.status}`);
+  r = await req('POST', '/api/hermes/providers', { body: { name: 'no-key', kind: 'gemini', model: 'gemini-2.5-flash' }, ...A });
+  check('gemini sans apiKey → 400', r.status === 400, `HTTP ${r.status}`);
+  r = await req('POST', '/api/hermes/providers', { body: { name: 'X', kind: 'openai' }, ...A });
+  check('nom invalide → 400', r.status === 400, `HTTP ${r.status}`);
+
+  // P6 : exception Ollama (http loopback local déclaré)
+  r = await req('POST', '/api/hermes/providers', { body: { name: 'ollama-local', kind: 'openai', model: 'llama3.1', baseUrl: 'http://localhost:11434/v1', local: true, priority: 5 }, ...A });
+  check('Ollama local (http + local:true) → accepté', r.status === 200, `HTTP ${r.status}`);
+  r = await req('POST', '/api/hermes/providers', { body: { name: 'ollama-nolocal', kind: 'openai', model: 'llama3.1', baseUrl: 'http://localhost:11434/v1' }, ...A });
+  check('http localhost SANS local:true → 400 (exception explicite)', r.status === 400, `HTTP ${r.status}`);
+
+  // P7 : la clé du pool est PROTÉGÉE de /api/store (lecture ET écriture, même auth)
+  r = await req('GET', '/api/store');
+  check('/api/store : clé pool absente de la liste publique', r.status === 200 && !(r.json || []).some(k => k.key === 'df_hermes_provider_pool'));
+  r = await req('GET', '/api/store/get?key=df_hermes_provider_pool', { auth: PASSCODE });
+  check('/api/store/get (auth) de la clé pool → 403', r.status === 403, `HTTP ${r.status}`);
+  r = await req('POST', '/api/store', { body: { key: 'df_hermes_provider_pool', value: 'HACKED' }, auth: PASSCODE });
+  check('écriture (auth) de la clé pool via /api/store → 403', r.status === 403, `HTTP ${r.status}`);
+
+  // P8 : HERMES GÈRE LE POOL LUI-MÊME (skills) — « ajoute… » / « liste… » / « supprime… »
+  r = await aiChat('liste les fournisseurs');
+  const listStep = (r.json.steps || []).find(s => s.tool === 'providers_list');
+  check('chat « liste les fournisseurs » → skill providers_list', r.status === 200 && listStep && listStep.status === 'ok', JSON.stringify(listStep || {}).slice(0, 120));
+  r = await aiChat('ajoute groq au pool: baseUrl https://api.groq.com/openai/v1 modèle: llama-3.3-70b-versatile clé: sk-groq-suite-123456789');
+  const addStep = (r.json.steps || []).find(s => s.tool === 'providers_add');
+  check('chat « ajoute groq au pool » → skill providers_add exécutée', r.status === 200 && addStep && addStep.status === 'ok', JSON.stringify(addStep || {}).slice(0, 140));
+  r = await req('GET', '/api/hermes/activity', A);
+  const addAudit = (r.json.activity || []).find(a => a.tool === 'providers_add');
+  check('audit : apiKey du providers_add MASQUÉE (jamais en clair)', addAudit && !String(addAudit.args || '').includes('sk-groq-suite-123456789') && /•/.test(String(addAudit.args || '')), String(addAudit?.args || '').slice(0, 120));
+  r = await aiChat('supprime le fournisseur groq');
+  const rmStep = (r.json.steps || []).find(s => s.tool === 'providers_remove');
+  check('chat « supprime le fournisseur groq » → skill providers_remove', r.status === 200 && rmStep && rmStep.status === 'ok', JSON.stringify(rmStep || {}).slice(0, 120));
+
+  // P9 : nettoyage — retour au pool minimal (mock-env seul)
+  r = await req('DELETE', '/api/hermes/providers/test-broken', A);
+  check('retrait du fournisseur cassé (DELETE) → ok', r.status === 200 && r.json.removed === 'test-broken', `HTTP ${r.status}`);
+  r = await req('DELETE', '/api/hermes/providers/ollama-local', A);
+  check('retrait du fournisseur Ollama (DELETE) → ok', r.status === 200 && r.json.removed === 'ollama-local', `HTTP ${r.status}`);
+  r = await req('GET', '/api/hermes/providers', A);
+  check('pool final → mock-env seul (filet de sécurité)', r.status === 200 && (r.json.pool || []).map(e => e.name).join(',') === 'mock-env', (r.json.pool || []).map(e => e.name).join(','));
 
   console.log('\n═══ HERMES V4 — Rate limiting IA ═══');
   // 5 appels IA déjà consommés (H1,H2,H3? non confirm n'est pas IA, H4, audit, autonome)

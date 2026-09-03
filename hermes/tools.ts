@@ -1181,6 +1181,89 @@ export function buildSkillRegistry(): HermesTool[] {
         if (!task) throw new Error('task vide.');
         return runSubAgent(agent, task);
       }
+    },
+    // ---------- Gestionnaire d'API & tokens — pool multi-fournisseurs (jamais bloqué) ----------
+    // Ces 4 skills permettent à Hermes de gérer LUI-MÊME le pool de fournisseurs
+    // IA au runtime (ajout de tokens, bascule automatique, tests) — sans redéploiement.
+    // Les clés ne transitent JAMAIS en clair dans les traces (masquées par maskArgsForTrace).
+    {
+      name: 'providers_list',
+      description: "Liste le pool de fournisseurs IA (gestionnaire d'API & tokens) : environnement + pool géré, priorité, état (cooldown, erreurs), clés masquées. Pour comprendre la bascule automatique anti-blocage.",
+      access: 'read',
+      parameters: { type: 'object', properties: {} },
+      async run() {
+        const { getPoolStatus } = await import('./providers');
+        const pool = await getPoolStatus();
+        return {
+          count: pool.length,
+          policy: 'bascule automatique : 429/erreur → cooldown (30 s sur rate-limit, 15 s sur erreur) → fournisseur suivant',
+          pool: pool.map(e => ({
+            name: e.name, kind: e.kind, model: e.model, baseUrl: e.baseUrl, local: e.local,
+            priority: e.priority, source: e.source, key: e.key,
+            inCooldown: e.inCooldown, cooldownRemainingSec: e.cooldownRemainingSec,
+            calls: e.calls, ok: e.ok, errors: e.errors, lastError: e.lastError
+          }))
+        };
+      }
+    },
+    {
+      name: 'providers_add',
+      description: "AJOUTE un fournisseur IA au pool (runtime, sans redéploiement) pour la bascule automatique anti-blocage. kind='gemini' (apiKey requis, gratuit) ou 'priority' plus bas = plus prioritaire. kind='openai' : baseUrl + model (Groq, OpenRouter, Mistral, Ollama local avec local=true), apiKey optionnel. Utilisez free_llm_lookup pour trouver un endpoint gratuit compatible.",
+      access: 'write',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Identifiant 2-40 car. [a-z0-9-_-]' },
+          kind: { type: 'string', enum: ['gemini', 'openai'], description: "Type d'endpoint" },
+          model: { type: 'string', description: "Modèle (openai : requis ; gemini : défaut gemini-2.5-flash)" },
+          baseUrl: { type: 'string', description: "URL de base compatible OpenAI (openai : requis) — https public, ou http localhost si local=true" },
+          apiKey: { type: 'string', description: "Clé API (jamais exposée : stockée KV protégée, masquée partout) — requise pour gemini" },
+          priority: { type: 'number', description: '1 = le plus prioritaire (défaut 500, le mock est en 999)' },
+          local: { type: 'boolean', description: 'true = endpoint local de confiance (Ollama http://localhost:11434/v1)' }
+        },
+        required: ['name', 'kind']
+      },
+      async run(args) {
+        const { addProvider } = await import('./providers');
+        const { entry } = await addProvider({
+          name: str(args.name, 40),
+          kind: str(args.kind, 10) as any,
+          model: str(args.model, 120) || undefined,
+          baseUrl: str(args.baseUrl, 300) || undefined,
+          apiKey: str(args.apiKey, 500) || undefined,
+          priority: Number.isFinite(Number(args.priority)) ? Number(args.priority) : undefined,
+          local: Boolean(args.local)
+        });
+        return { added: entry.name, entry, note: 'La clé est stockée dans une clé KV protégée (jamais exposée via /api/store, UI, audit ou logs).' };
+      }
+    },
+    {
+      name: 'providers_remove',
+      description: "Retire un fournisseur du pool (le pool reste au moins sur le mock — jamais bloqué). Les fournisseurs d'environnement (gemini-env, openai-env) ne sont pas retirables : changez HERMES_PROVIDER à la place.",
+      access: 'write',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'Nom du fournisseur à retirer' } },
+        required: ['name']
+      },
+      async run(args) {
+        const { removeProvider } = await import('./providers');
+        return await removeProvider(str(args.name, 40));
+      }
+    },
+    {
+      name: 'providers_test',
+      description: "Teste la connexion d'un fournisseur du pool (1 micro-appel ~1 token) : ok/erreur + latence. Ne déclenche pas de cooldown.",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'Nom du fournisseur à tester' } },
+        required: ['name']
+      },
+      async run(args) {
+        const { testProvider } = await import('./providers');
+        return await testProvider(str(args.name, 40));
+      }
     }
   ];
 }

@@ -63,3 +63,31 @@ export async function assertSafeOutbound(rawUrl: string): Promise<void> {
     }
   }
 }
+
+/**
+ * Validation de l'URL de base d'un fournisseur IA ajouté via le gestionnaire de tokens.
+ * - https public : même règle SSRF que la navigation (assertSafeOutbound).
+ * - http loopback UNIQUEMENT si opts.allowLoopback (endpoint local de confiance, ex. Ollama
+ *   http://localhost:11434/v1) — exception explicite documentée (AUDIT_SECURITE.md P3.2).
+ */
+export async function assertProviderBaseUrl(rawUrl: string, opts: { allowLoopback?: boolean } = {}): Promise<void> {
+  let u: URL;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    throw new Error('URL de base invalide.');
+  }
+  if (u.protocol === 'https:') {
+    await assertSafeOutbound(rawUrl);
+    return;
+  }
+  if (u.protocol === 'http:') {
+    if (opts.allowLoopback) {
+      const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+      if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return;
+      throw new Error('Endpoint local : seul localhost/127.0.0.1 est autorisé en http.');
+    }
+    throw new Error('http non autorisé (https requis, ou endpoint local déclaré).');
+  }
+  throw new Error(`Protocole non autorisé : ${u.protocol} (https requis).`);
+}

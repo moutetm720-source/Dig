@@ -94,11 +94,12 @@ Honnêteté stricte : un composant absent = "absent", jamais "optimisé". Aucun 
     id: 'ops_admin',
     name: 'Administrateur Ops',
     emoji: '🔧',
-    role: 'Configuration clé-valeur, journalisation, maintenance des données métier.',
-    skills: ['kv_get', 'kv_set', 'logs_add', 'audit_system', 'settings_summary', 'catalog_list', 'content_list'],
+    role: 'Configuration clé-valeur, journalisation, maintenance des données métier, gestion du pool de fournisseurs IA (API & tokens).',
+    skills: ['kv_get', 'kv_set', 'logs_add', 'audit_system', 'settings_summary', 'catalog_list', 'content_list', 'providers_list', 'providers_add', 'providers_remove', 'providers_test'],
     systemPrompt: `${PLATFORM_CONTEXT}
 Tu es l'agent OPS. Tu maintiens la configuration métier via kv_get/kv_set (liste blanche — tu ne peux pas toucher aux secrets), journalises les opérations (logs_add) et vérifies la cohérence des données.
-Avant tout kv_set : lire l'état actuel (kv_get) et ne modifier QUE les champs demandés. Si une clé est refusée, dis-le clairement.`
+Avant tout kv_set : lire l'état actuel (kv_get) et ne modifier QUE les champs demandés. Si une clé est refusée, dis-le clairement.
+Tu gères aussi le POOL DE FOURNISSEURS IA (gestionnaire d'API & tokens) : providers_list (état + bascule automatique), providers_add (nouveau fournisseur + token, gratuit/open-source de préférence — retrouve la baseUrl via free_llm_lookup), providers_remove, providers_test. Les clés sont stockées dans une clé KV protégée et jamais exposées — ne les répète jamais dans ta réponse.`
   },
   {
     id: 'web_explorer',

@@ -326,7 +326,7 @@ nature — HMR/scripts inline.)
   (token absent) ; correction : utiliser l'objet retourné par
   `markServerOrderPaid` (demo-complete + verify-transaction).
 
-## P3. Moteur HERMES v4 — agent réel avec tool-calling (2026-09-03)
+## P3. Moteur HERMES v5 — agent réel avec tool-calling (2026-09-03)
 
 **Constat** : l'ancienne « IA Hermes » était une **simulation par mots-clés**
 (`server.ts` : table de correspondance prompt→JSON factice) et le module
@@ -402,6 +402,64 @@ création réelle (draft), PII absente des réponses, journal d'audit,
 cycle autonome (insight réel), synergy 401, ablate 410, 429.
 La suite gère elle-même les pauses sur 429 (fenêtre IA 6/min) → rejouable à la suite.
 
+### P3.2 — Gestionnaire d'API & tokens : pool multi-fournisseurs, bascule automatique (2026-09-03)
+
+Objectif : **ne jamais être bloqué** (rate-limit/erreur d'un fournisseur ne stoppe
+pas Hermes), **toujours gratuit/open-source**, et **Hermes gère le pool lui-même**
+au runtime (sans redéploiement).
+
+**Stockage & confidentialité des tokens**
+- Le pool géré est stocké dans la clé KV `df_hermes_provider_pool` (table
+  `key_value_store`), ajoutée aux deux listes blanches protectrices du serveur :
+  `SENSITIVE_READ_KEYS` (exclue de `GET /api/store` et de `GET /api/store/get?key=…`,
+  **même authentifiée** → 403) et `SENSITIVE_WRITE_KEYS` (écrite **uniquement** par le
+  module Hermes, jamais via l'API store → 403). Les fournisseurs d'environnement
+  (`gemini-env`, `openai-env`, `mock-env`) ne sont pas persistés — ils proviennent de
+  l'env.
+- Les clés/token ne transitent **jamais en clair** : `maskSecret()` ne renvoie que
+  `•••• (N car.)`. Vérifié dans `providers_add` (réponse API + `providers_list`),
+  dans le journal d'audit (`maskArgsForTrace` masque `apiKey|token|secret|password`
+  avant `steps.push`/`pushAudit`), et dans les logs. Un test de la suite Hermes
+  (`verify-hermes.mjs` P2/P8) échoue si une clé en clair apparaît dans une réponse
+  ou l'audit.
+- Équivalent REST (tous `requireAuth` + `apiLimiter`) : `GET/POST /api/hermes/providers`,
+  `DELETE /api/hermes/providers/:name`, `POST /api/hermes/providers/:name/test`.
+
+**Bascule automatique (anti-blocage)**
+- `buildPool()` ordonne : fournisseurs d'env (priorité 10/20) → fournisseurs du pool
+  géré (priorité choisie, 1…998) → `mock-env` (999, filet de sécurité déterministe).
+- `chatWithFailover()` tente les fournisseurs dans l'ordre ; sur 429/rate-limit →
+  cooldown **30 s** (ou `Retry-After` si fourni), sur 5xx/timeout → cooldown **15 s**.
+  Le fournisseur suivant est alors essayé. `reportOutcome()` alimente l'état
+  (calls/ok/errors/lastError) visible dans `GET /api/hermes/providers`.
+- `getUsablePool()` repousse en fin de file les fournisseurs en cooldown (retentés si
+  tous le sont). `MAX_FALLBACKS_PER_CALL=4` plafonne les tentatives par appel.
+- Sémantique `HERMES_PROVIDER` : `mock` = mock + pool géré · `auto` = env + pool géré ·
+  `gemini`/`openai` = verrou exclusif sur ce type. En `auto` **sans** aucun fournisseur
+  réel, Hermes reste honnête (`provider: aucun` + métriques réelles, zéro simulation).
+
+**Sécurité des `baseUrl` (anti-SSRF) & exception Ollama documentée**
+- `assertProviderBaseUrl()` (ssrfGuard.ts) : `https` public → `assertSafeOutbound`
+  (même règle SSRF que la navigation : host/IP internes, metadata cloud, RFC1918,
+  CGNAT, link-local, loopback bloqués + validation DNS). `http` est **refusé** sauf
+  si `local: true` **et** l'hôte est `localhost`/`127.0.0.1`/`::1` — c'est l'exception
+  **explicite et documentée** pour un endpoint local de confiance (ex. **Ollama**
+  `http://localhost:11434/v1`, gratuit/open-source, zéro rate-limit : le fournisseur
+  est un logiciel local de l'opérateur, la clé ne quitte pas la machine). Tout autre
+  protocole/host est rejeté (400).
+- Validation d'`addProvider` : nom `^[a-z0-9-_]{2,40}$`, `gemini` exige `apiKey`,
+  `openai` exige `baseUrl` (validé) + `model`, max 12 fournisseurs, noms réservés
+  `*-env` protégés. Le `kind: mock` n'est pas ajoutable (c'est le filet de sécurité).
+
+**Hermes pilote le pool lui-même (4 skills, agent Ops + orchestrateur)**
+- `providers_list` (lecture) : état du pool + policy de bascule + clés masquées.
+- `providers_add` (écriture) : ajoute un fournisseur + token au runtime (retrouve la
+  `baseUrl` via `free_llm_lookup` pour un endpoint gratuit/open-source).
+- `providers_remove` (écriture) : retire un fournisseur du pool (jamais les `*-env`).
+- `providers_test` (lecture) : 1 micro-appel de connexion (~1 token), sans cooldown.
+- Le mode mock du fournisseur détermine de façon déterministe ces 4 actions
+  (règles 12-15) pour tester la boucle complète sans réseau/clé.
+
 ## Risques résiduels acceptés (documentés)
 
 1. **Messages d'erreur** : certains détails d'erreurs Stripe/DB peuvent
@@ -453,11 +511,14 @@ Les variables d'env du service priment sur `.env` (`dotenv` ne surcharge pas).
   (2), anti-SSRF (4), webhook signé (3), endpoints modérateur (3), rate-limit
   (1), proxy Stripe (1), **auth token (5)**, **commandes serveur/démo (7)**,
   **crypto on-chain fail-safe (8)**.
-- `scripts/verify-hermes.mjs` — **26 tests** du moteur Hermes v4 (fournisseur
+- `scripts/verify-hermes.mjs` — **54 tests** du moteur Hermes v5 (fournisseur
   `HERMES_PROVIDER=mock`, base seedée par `start-test-pg.mjs`) : registres
-  (34 skills / 9 agents), auth, boucle outil réelle (prix/suppression/création
+  (38 skills / 9 agents), auth, boucle outil réelle (prix/suppression/création
   vérifiés en base), confirmation des actions sensibles, PII, audit,
-  **agent internet** (KB free-for.dev offline, web_fetch réel, web_search
-  honnête), cycle autonome, 429. Gère les pauses 429 (fenêtre IA 6/min).
+  **agent internet** (KB free-for.dev + free-llm-apis offline, web_fetch réel,
+  web_search honnête), cycle autonome, 429, et **gestionnaire d'API & tokens**
+  (pool multi-fournisseurs : bascule automatique cassé→mock, clés masquées,
+  clés KV protégées 403, anti-SSRF baseUrl + exception Ollama, Hermes pilote le
+  pool via 4 skills). Gère les pauses 429 (fenêtre IA 6/min).
 - `npm run build` — bundle production OK (1817 modules).
 - `tsc --noEmit` — zéro erreur (serveur + client).

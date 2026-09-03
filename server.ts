@@ -231,6 +231,7 @@ const SENSITIVE_READ_KEYS = new Set([
   'df_social_selling_state_v1',
   'df_french_invoices_v1',
   'df_crypto_pending_reviews',
+  'df_hermes_provider_pool',
 ]);
 
 // Clés dont l'écriture est refusée via l'API (les secrets Stripe et le passcode
@@ -252,6 +253,7 @@ const SENSITIVE_WRITE_KEYS = new Set([
   'df_social_selling_state_v1',
   'df_french_invoices_v1',
   'df_crypto_pending_reviews',
+  'df_hermes_provider_pool',
 ]);
 
 // ============================================================

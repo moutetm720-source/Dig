@@ -13,7 +13,7 @@
  */
 import { Router } from 'express';
 import { runAgentChat, confirmPendingAction, getAgents, skills } from './engine';
-import { getActiveProvider, getHermesConfig, saveHermesConfig } from './providers';
+import { buildPool, getPoolStatus, addProvider, removeProvider, testProvider, getHermesConfig, saveHermesConfig } from './providers';
 import { DEFAULT_HERMES_CONFIG } from './types';
 import { db } from '../src/db/db';
 import { keyValueStore } from '../src/db/schema';
@@ -32,16 +32,19 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
   // ---- État réel ----
   router.get('/status', apiLimiter, async (req, res) => {
     try {
-      const { provider, reason } = await getActiveProvider();
+      const pool = await buildPool();
+      const active = pool[0] || null;
       const memories = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_hermes_memories'));
       let memCount = 0;
       if (memories.length > 0 && Array.isArray(memories[0].value)) memCount = (memories[0].value as any[]).length;
       res.json({
-        status: provider ? 'active' : 'offline',
-        engine: 'hermes-core-v4 (boucle tool-calling réelle, multi-fournisseurs, multi-agents)',
-        provider: provider?.label || 'aucun',
-        providerReason: provider ? undefined : reason,
-        model: provider?.model || '-',
+        status: active ? 'active' : 'offline',
+        engine: 'hermes-core-v5 (boucle tool-calling réelle, pool multi-fournisseurs avec bascule automatique, multi-agents)',
+        provider: active?.provider.label || 'aucun',
+        providerReason: active ? undefined : 'aucun fournisseur disponible',
+        model: active?.model || '-',
+        failover: pool.length > 1 ? `bascule automatique : ${pool.length} fournisseurs en cascade (rate-limit/erreur → cooldown → suivant)` : undefined,
+        providerPool: pool.map(e => ({ name: e.name, kind: e.kind, model: e.model, priority: e.priority, source: e.source, key: e.keyMasked })),
         hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
         skillsCount: skills.length,
         agentsCount: getAgents().length,
@@ -157,8 +160,9 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
       if (openaiBaseUrl !== undefined) patch.openaiBaseUrl = openaiBaseUrl;
       if (openaiModel !== undefined) patch.openaiModel = openaiModel;
       const cfg = await saveHermesConfig(patch);
-      const { provider: active, reason } = await getActiveProvider();
-      res.json({ updated: true, config: cfg, activeProvider: active?.label || 'aucun', activeReason: active ? undefined : reason });
+      const pool = await buildPool();
+      const active = pool[0] || null;
+      res.json({ updated: true, config: cfg, activeProvider: active?.provider.label || 'aucun', activeReason: active ? undefined : 'aucun fournisseur disponible' });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -176,6 +180,52 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
       res.json({ count: list.length, activity: list.slice(0, 50) });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ---- Gestionnaire d'API & tokens — pool de fournisseurs (clés JAMAIS exposées) ----
+  router.get('/providers', requireAuth, apiLimiter, async (req, res) => {
+    try {
+      const pool = await getPoolStatus();
+      res.json({
+        count: pool.length,
+        policy: 'bascule automatique : 429/erreur → cooldown (30 s sur rate-limit, 15 s sur erreur) → fournisseur suivant — jamais bloqué',
+        pool
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.post('/providers', requireAuth, apiLimiter, async (req, res) => {
+    try {
+      const { name, kind, model, baseUrl, apiKey, priority, local } = req.body || {};
+      const { entry } = await addProvider({
+        name, kind, model, baseUrl, apiKey,
+        priority: priority !== undefined && priority !== null ? Number(priority) : undefined,
+        local: Boolean(local)
+      });
+      res.json({ added: true, entry, note: "Clé stockée dans une clé KV protégée — jamais exposée (UI, audit, logs, /api/store)." });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  router.delete('/providers/:name', requireAuth, apiLimiter, async (req, res) => {
+    try {
+      const r = await removeProvider(String(req.params.name || ''));
+      res.json({ removed: true, ...r });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  router.post('/providers/:name/test', requireAuth, apiLimiter, async (req, res) => {
+    try {
+      const r = await testProvider(String(req.params.name || ''));
+      res.json(r);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
     }
   });
 

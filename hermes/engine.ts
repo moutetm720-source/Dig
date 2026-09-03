@@ -18,8 +18,9 @@ import crypto from 'node:crypto';
 import { db } from '../src/db/db';
 import { keyValueStore } from '../src/db/schema';
 import { eq, inArray } from 'drizzle-orm';
-import { AgentEvent, AgentStep, HermesChatResponse, HERMES_LIMITS, HermesContext } from './types';
-import { getActiveProvider, truncateForLLM } from './providers';
+import { AgentEvent, AgentStep, HermesChatResponse, HERMES_LIMITS, HermesContext, LLMChatResult } from './types';
+import type { PoolEntry } from './providers';
+import { buildPool, chatWithFailover, truncateForLLM, maskSecret, getHermesConfig } from './providers';
 import { getSkill, declareSkills, skillRegistry } from './tools';
 import { getAgent, getAgents } from './agents';
 
@@ -61,6 +62,19 @@ function setPending(tool: string, args: Record<string, any>, actor: string, agen
 
 // ---------- Exécution d'un skill (portée) ----------
 
+// Masquage des secrets dans les args avant traces (steps, audit, mémoire) :
+// aucune clé/token ne transite en clair dans les journaux ni dans le contexte LLM.
+function maskArgsForTrace(args: Record<string, any> | undefined): Record<string, any> {
+  if (!args || typeof args !== 'object') return args || {};
+  const out: Record<string, any> = { ...args };
+  for (const k of Object.keys(out)) {
+    if (/api_?key|token|secret|password|passwd|pwd/i.test(k) && typeof out[k] === 'string' && out[k]) {
+      out[k] = maskSecret(out[k]);
+    }
+  }
+  return out;
+}
+
 async function executeSkill(
   toolName: string,
   args: Record<string, any>,
@@ -69,24 +83,25 @@ async function executeSkill(
   callCount: { n: number }
 ): Promise<{ result: any; status: AgentStep['status']; actionId?: string; summary: string }> {
   const t0 = Date.now();
+  const safeArgs = maskArgsForTrace(args);
   const skill = getSkill(toolName);
   if (!skill) {
     const msg = `Skill inconnu : ${toolName}.`;
-    steps.push({ tool: toolName, args, status: 'denied', summary: msg });
+    steps.push({ tool: toolName, args: safeArgs, status: 'denied', summary: msg });
     return { result: { error: msg }, status: 'denied', summary: msg };
   }
   if (callCount.n >= HERMES_LIMITS.MAX_TOOL_CALLS) {
     const msg = 'Budget d\u2019outils épuisé pour cette requête.';
-    steps.push({ tool: toolName, args, status: 'denied', summary: msg });
+    steps.push({ tool: toolName, args: safeArgs, status: 'denied', summary: msg });
     return { result: { error: msg }, status: 'denied', summary: msg };
   }
 
   // Porte de confirmation (skills sensibles)
   if (skill.requiresConfirmation && args?.confirm !== true) {
-    const summary = `Exécution de ${skill.name} avec args : ${JSON.stringify(args).slice(0, 200)}`;
+    const summary = `Exécution de ${skill.name} avec args : ${JSON.stringify(safeArgs).slice(0, 200)}`;
     const actionId = setPending(skill.name, args, ctx.actor, ctx.agentId);
-    steps.push({ tool: skill.name, args, status: 'confirmation_required', summary: summary.slice(0, 200) });
-    await pushAudit({ at: new Date().toISOString(), agent: ctx.agentId, actor: ctx.actor, tool: skill.name, status: 'confirmation_required', actionId, args: JSON.stringify(args).slice(0, 300) });
+    steps.push({ tool: skill.name, args: safeArgs, status: 'confirmation_required', summary: summary.slice(0, 200) });
+    await pushAudit({ at: new Date().toISOString(), agent: ctx.agentId, actor: ctx.actor, tool: skill.name, status: 'confirmation_required', actionId, args: JSON.stringify(safeArgs).slice(0, 300) });
     return { result: { needsConfirmation: true, summary, actionId }, status: 'confirmation_required', actionId, summary: summary.slice(0, 200) };
   }
 
@@ -97,12 +112,12 @@ async function executeSkill(
       new Promise((_, rej) => setTimeout(() => rej(new Error('Délai d\u2019exécution du skill dépassé (20 s).')), 20000))
     ]);
     const summary = summarizeResult(result);
-    steps.push({ tool: skill.name, args, status: 'ok', summary });
-    await pushAudit({ at: new Date().toISOString(), agent: ctx.agentId, actor: ctx.actor, tool: skill.name, status: 'ok', ms: Date.now() - t0, args: JSON.stringify(args).slice(0, 300), summary: summary.slice(0, 200) });
+    steps.push({ tool: skill.name, args: safeArgs, status: 'ok', summary });
+    await pushAudit({ at: new Date().toISOString(), agent: ctx.agentId, actor: ctx.actor, tool: skill.name, status: 'ok', ms: Date.now() - t0, args: JSON.stringify(safeArgs).slice(0, 300), summary: summary.slice(0, 200) });
     return { result, status: 'ok', summary };
   } catch (e: any) {
     const msg = `Échec : ${e?.message || e}`;
-    steps.push({ tool: skill.name, args, status: 'error', summary: msg.slice(0, 200) });
+    steps.push({ tool: skill.name, args: safeArgs, status: 'error', summary: msg.slice(0, 200) });
     await pushAudit({ at: new Date().toISOString(), agent: ctx.agentId, actor: ctx.actor, tool: skill.name, status: 'error', ms: Date.now() - t0, error: msg.slice(0, 300) });
     return { result: { error: msg }, status: 'error', summary: msg.slice(0, 200) };
   }
@@ -161,20 +176,23 @@ export async function runAgentChat(opts: {
     conversation: opts.prompt.slice(0, 500)
   };
 
-  const { provider, reason } = await getActiveProvider();
-
-  // MODE HONNÊTE SANS LLM : données réelles, zéro simulation
-  if (!provider) {
+  // POOL MULTI-FOURNISSEURS : le mock reste en dernier recours (jamais bloqué) ;
+  // en mode « auto » SANS aucun fournisseur réel, on reste honnête (zéro simulation).
+  const pool = await buildPool();
+  const cfgChoice = (process.env.HERMES_PROVIDER || '').toLowerCase() || (await getHermesConfig()).provider;
+  const onlyMock = pool.length === 1 && pool[0].name === 'mock-env';
+  if (onlyMock && cfgChoice === 'auto') {
     const steps: AgentStep[] = [];
     const callCount = { n: 0 };
     const metrics = await executeSkill('metrics_summary', {}, ctx, steps, callCount);
     const audit = await executeSkill('audit_system', {}, ctx, steps, callCount);
     const response =
-      `⚠️ **Aucun fournisseur IA configuré** — je ne peux pas interpréter librement votre demande (${reason}).\n\n` +
-      `Pour m'activer pleinement, configurez dans l'environnement (ou via l'onglet Intégrations) :\n` +
+      `⚠️ **Aucun fournisseur IA configuré** — je ne peux pas interpréter librement votre demande.\n\n` +
+      `Pour m'activer pleinement :\n` +
       `- **Gemini** (gratuit) : \`GEMINI_API_KEY\` — ou\n` +
       `- **Modèles open-source locaux** : Ollama sur \`HERMES_OPENAI_BASE_URL=http://localhost:11434/v1\` + \`HERMES_OPENAI_MODEL=llama3.1\` — ou\n` +
-      `- tout endpoint compatible OpenAI (Groq, OpenRouter...)\n\n` +
+      `- tout endpoint compatible OpenAI (Groq, OpenRouter...) — ou\n` +
+      `- **ajoutez un fournisseur au pool** (je le fais moi-même : « ajoute Groq au pool de fournisseurs IA »)\n\n` +
       `En attendant, voici l'état **réel** de votre plateforme :\n\n` +
       `**Métriques** : \`${summarizeResult(metrics.result)}\`\n\n` +
       `**Audit système** : \`${summarizeResult(audit.result)}\`\n\n` +
@@ -201,12 +219,16 @@ export async function runAgentChat(opts: {
   let pendingConfirmation: HermesChatResponse['pendingConfirmation'];
   let finalText = '';
 
+  let active: PoolEntry | null = null;
   for (let step = 0; step < HERMES_LIMITS.MAX_STEPS; step++) {
-    let out: Awaited<ReturnType<typeof provider.chat>>;
+    let out: LLMChatResult;
     try {
-      out = await provider.chat({ system, events, tools });
+      // Bascule automatique : si ce fournisseur rate-limit/échoue, le pool passe au suivant.
+      const fo = await chatWithFailover({ system, events, tools });
+      out = fo.result;
+      active = fo.entry;
     } catch (e: any) {
-      finalText = `⚠️ **Erreur du fournisseur LLM** (${provider.label}) : ${e?.message || e}\n\nVérifiez la configuration du fournisseur (clé, URL, modèle) et réessayez. Aucune action n'a été exécutée.`;
+      finalText = `⚠️ **Erreur du fournisseur LLM** (bascule automatique tentée sur ${pool.length} fournisseur(s)) : ${e?.message || e}\n\nTous les fournisseurs du pool sont en échec (rate-limit ou erreur) et passent en cooldown — réessayez dans un instant. Aucune action n'a été exécutée.`;
       break;
     }
     if (out.usage) {
@@ -241,8 +263,8 @@ export async function runAgentChat(opts: {
 
   return {
     response: finalText,
-    provider: provider.label,
-    model: provider.model,
+    provider: active?.provider.label || 'aucun',
+    model: active?.model || '-',
     agent: agent.id,
     steps,
     pendingConfirmation,
@@ -270,8 +292,8 @@ export async function confirmPendingAction(actionId: string): Promise<{ ok: bool
 // ---------- Sous-agent (dispatch_agent) ----------
 
 export async function runSubAgent(agent: { id: string; name: string; systemPrompt: string; skills?: string[]; maxSteps?: number }, task: string): Promise<any> {
-  const { provider } = await getActiveProvider();
-  if (!provider) {
+  const pool = await buildPool();
+  if (pool.length === 0) {
     return { agent: agent.id, report: 'Sous-agent indisponible : aucun fournisseur LLM configuré.', steps: [] };
   }
   const ctx: HermesContext = { actor: 'sous-agent', agentId: agent.id, conversation: task.slice(0, 300) };
@@ -283,13 +305,13 @@ export async function runSubAgent(agent: { id: string; name: string; systemPromp
   let report = '';
 
   for (let i = 0; i < budget; i++) {
-    let out: Awaited<ReturnType<typeof provider.chat>>;
+    let out: LLMChatResult;
     try {
-      out = await provider.chat({
+      out = (await chatWithFailover({
         system: `${agent.systemPrompt}\n\nTu es un SOUS-AGENT (budget ${budget} pas). Rapport final en ≤120 mots.`,
         events,
         tools
-      });
+      })).result;
     } catch (e: any) {
       report = `Erreur fournisseur sous-agent : ${e?.message || e}`;
       break;
