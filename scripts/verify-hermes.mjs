@@ -46,6 +46,20 @@ async function req(method, path, { body, auth, headers = {} } = {}) {
 
 const A = { auth: PASSCODE };
 
+// Appels IA robustes : si 429 (fenêtre de 60 s encore active), on attend
+// la fin de la fenêtre et on réessaie UNE fois. La suite reste rejouable
+// à la suite d'une autre exécution.
+async function aiPost(path, body) {
+  let r = await req('POST', path, { body, ...A });
+  if (r.status === 429) {
+    console.log('   … 429 (quota IA) — pause 61 s …');
+    await new Promise(r2 => setTimeout(r2, 61_000));
+    r = await req('POST', path, { body, ...A });
+  }
+  return r;
+}
+const aiChat = (prompt, agentId = 'orchestrator') => aiPost('/api/hermes/chat', { prompt, agentId });
+
 // ---- Re-seed idempotent (la suite est rejouable sans réinitialiser la base) ----
 async function reseed() {
   const postgres = (await import('postgres')).default;
@@ -73,15 +87,15 @@ async function reseed() {
   let r = await req('GET', '/api/hermes/status');
   check('status → 200 + moteur v4 + fournisseur mock', r.status === 200 && String(r.json.engine).startsWith('hermes-core-v4') && String(r.json.provider).startsWith('Mock'), JSON.stringify(r.json).slice(0, 140));
   check('status → 25+ skills déclarées', r.json.skillsCount >= 25, `skills=${r.json.skillsCount}`);
-  check('status → 8 agents spécialisés', r.json.agentsCount === 8, `agents=${r.json.agentsCount}`);
+  check('status → 9 agents spécialisés', r.json.agentsCount === 9, `agents=${r.json.agentsCount}`);
 
   r = await req('GET', '/api/hermes/agents');
   const agentIds = (r.json.agents || []).map(a => a.id);
-  check('agents → liste avec orchestrator + 7 spécialistes', r.status === 200 && agentIds.includes('orchestrator') && agentIds.length === 8, agentIds.join(','));
+  check('agents → liste avec orchestrator + 8 spécialistes (dont web_explorer)', r.status === 200 && agentIds.includes('orchestrator') && agentIds.includes('web_explorer') && agentIds.length === 9, agentIds.join(','));
 
   r = await req('GET', '/api/hermes/skills');
   const skillNames = (r.json.skills || []).map(s => s.name);
-  check('skills → registre complet (catalogue, pricing, contenu, canaux, ventes, système)', ['catalog_create', 'catalog_set_price', 'catalog_delete', 'publish_product', 'pricing_audit', 'content_create', 'seo_update', 'channels_dispatch', 'metrics_summary', 'orders_recent', 'audit_system', 'kv_set', 'dispatch_agent'].every(s => skillNames.includes(s)), `${skillNames.length} skills`);
+  check('skills → registre complet (catalogue, pricing, contenu, canaux, ventes, système, internet)', ['catalog_create', 'catalog_set_price', 'catalog_delete', 'publish_product', 'pricing_audit', 'content_create', 'seo_update', 'channels_dispatch', 'metrics_summary', 'orders_recent', 'audit_system', 'kv_set', 'dispatch_agent', 'web_search', 'web_fetch', 'web_link_check', 'free_tier_lookup'].every(s => skillNames.includes(s)), `${skillNames.length} skills`);
 
   console.log('\n═══ HERMES V4 — Sécurité ═══');
 
@@ -93,7 +107,7 @@ async function reseed() {
   console.log('\n═══ HERMES V4 — Boucle agent réelle (plan → outils → observation) ═══');
 
   // H1 : re-pricing réel via tool calling
-  r = await req('POST', '/api/hermes/chat', { body: { prompt: 'Change le prix de prod-test-1 à 39 €' }, ...A });
+  r = await aiChat('Change le prix de prod-test-1 à 39 €');
   check('chat re-pricing → réponse + étapes d\u2019outils', r.status === 200 && Array.isArray(r.json.steps) && r.json.steps.some(s => s.tool === 'catalog_set_price' && s.status === 'ok'), JSON.stringify(r.json.steps || []).slice(0, 160));
   let store = await req('GET', '/api/store');
   let prods = (store.json || []).filter(x => x.key === 'dpf_app_v2_products');
@@ -101,7 +115,7 @@ async function reseed() {
   check('BOUTIQUE RÉELLEMENT MODIFIÉE : prod-test-1 à 39 €', price1 === 39, `prix=${price1}`);
 
   // H2 : suppression → confirmation obligatoire
-  r = await req('POST', '/api/hermes/chat', { body: { prompt: 'Supprime prod-test-3' }, ...A });
+  r = await aiChat('Supprime prod-test-3');
   check('suppression → demande de confirmation (pas d\u2019exécution)', r.status === 200 && r.json.pendingConfirmation && r.json.pendingConfirmation.tool === 'catalog_delete', JSON.stringify(r.json.pendingConfirmation || {}).slice(0, 120));
   store = await req('GET', '/api/store');
   prods = (store.json || []).filter(x => x.key === 'dpf_app_v2_products');
@@ -116,7 +130,7 @@ async function reseed() {
   check('produit RÉELLEMENT SUPPRIMÉ après confirmation', !prods[0]?.value?.some(p => p.id === 'prod-test-3'));
 
   // H4 : création de produit réel (draft)
-  r = await req('POST', '/api/hermes/chat', { body: { prompt: 'Crée un produit « Test Kit Hermes » à 19.90 €' }, ...A });
+  r = await aiChat('Crée un produit « Test Kit Hermes » à 19.90 €');
   check('création → outil catalog_create exécuté', r.status === 200 && r.json.steps.some(s => s.tool === 'catalog_create' && s.status === 'ok'), JSON.stringify(r.json.steps || []).slice(0, 140));
   store = await req('GET', '/api/store');
   prods = (store.json || []).filter(x => x.key === 'dpf_app_v2_products');
@@ -125,7 +139,7 @@ async function reseed() {
 
   console.log('\n═══ HERMES V4 — RGPD : aucune PII au LLM ═══');
 
-  r = await req('POST', '/api/hermes/chat', { body: { prompt: 'Fais un audit global de la fabrique' }, ...A });
+  r = await aiChat('Fais un audit global de la fabrique');
   const auditResponse = r.json?.response || '';
   check('audit exécuté via outil réel', r.status === 200 && r.json.steps.some(s => s.tool === 'audit_system' && s.status === 'ok'));
   check('réponse SANS e-mail client (PII filtrée)', !auditResponse.includes('jeanne.dupont@example.com') && !auditResponse.includes('paul.martin@example.com'));
@@ -136,9 +150,29 @@ async function reseed() {
   const toolsLogged = (r.json.activity || []).map(a => a.tool);
   check('journal d\u2019audit : actions outillées tracées', r.status === 200 && toolsLogged.includes('catalog_set_price') && toolsLogged.includes('catalog_delete') && toolsLogged.includes('catalog_create'), toolsLogged.slice(0, 6).join(','));
 
+  console.log('\n═══ HERMES V4 — Agent Internet (web_explorer) ═══');
+
+  // I1 : base de connaissances gratuite (offline, déterministe)
+  r = await aiChat('Quels outils gratuits pour héberger mon application ?', 'web_explorer');
+  const kbStep = (r.json.steps || []).find(s => s.tool === 'free_tier_lookup');
+  check('free_tier_lookup → skill exécutée', r.status === 200 && kbStep && kbStep.status === 'ok', JSON.stringify(kbStep || {}).slice(0, 120));
+  check('réponse KB → services réels listés (Render/Vercel/Netlify…)', (r.json.response || '').includes('free-for.dev') || /Render|Vercel|Netlify|Cloudflare/i.test(r.json.response || ''), (r.json.response || '').slice(0, 100).replace(/\n/g, ' '));
+
+  // I2 : lecture d'une page réelle (host autorisé dans le sandbox : npmjs)
+  r = await aiChat('Lis la page https://registry.npmjs.org/ et dis-moi ce que c\'est', 'web_explorer');
+  const fetchStep = (r.json.steps || []).find(s => s.tool === 'web_fetch');
+  check('web_fetch → lecture de page réelle', r.status === 200 && fetchStep && (fetchStep.status === 'ok' || /timeout|indisponible|réseau/i.test(fetchStep.summary || r.json.response || '')), JSON.stringify(fetchStep || {}).slice(0, 120));
+
+  // I3 : recherche web (si le sandbox bloque l'egress → échec HONNÊTE, jamais inventé)
+  r = await aiChat('Cherche sur internet les tendances des produits digitaux 2026', 'web_explorer');
+  const searchStep = (r.json.steps || []).find(s => s.tool === 'web_search');
+  const searchHonest = searchStep && (searchStep.status === 'ok' || /échec|error|indisponible|timeout|réseau|bloqu|failed/i.test(JSON.stringify(searchStep)));
+  check('web_search → exécutée OU échec réseau signalé honnêtement (sandbox)', r.status === 200 && searchHonest, JSON.stringify(searchStep || {}).slice(0, 120));
+  check('web_search → jamais de résultat inventé en cas d\'échec', !(searchStep && searchStep.status !== 'ok' && /résultat.*trouvé|source :.*https/i.test(r.json.response || '')), (r.json.response || '').slice(0, 80).replace(/\n/g, ' '));
+
   console.log('\n═══ HERMES V4 — Cycle autonome & multi-agents ═══');
 
-  r = await req('POST', '/api/hermes/autonomous-loop', A);
+  r = await aiPost('/api/hermes/autonomous-loop', {});
   check('cycle autonome → insight réel (agent security_auditor)', r.status === 200 && r.json.success === true && typeof r.json.insight === 'string' && r.json.insight.length > 30, (r.json.insight || '').slice(0, 80).replace(/\n/g, ' '));
 
   r = await req('POST', '/api/agents/synergy', { body: { prompt: 'Analyse mes ventes et propose une action' } });

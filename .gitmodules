@@ -1,0 +1,6 @@
+[submodule "references/OBLITERATUS"]
+	path = references/OBLITERATUS
+	url = https://github.com/elder-plinius/OBLITERATUS.git
+[submodule "references/awesome-llm-apps"]
+	path = references/awesome-llm-apps
+	url = https://github.com/Shubhamsaboo/awesome-llm-apps.git

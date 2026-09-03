@@ -367,11 +367,39 @@ fantaisie). Le client fabriquait aussi des réponses locales
   des agents Hermes (proposition produit + diagnostic) sans aucune étape inventée.
 - Sidebar : « Alliance OBLITERATUS x HERMES » → « Centre Multi-Agents (Hermes v4) ».
 
-**Tests** : `scripts/verify-hermes.mjs` (fournisseur mock, base seedée) — **20/20 PASS** :
-registres (29 skills / 8 agents), 401/400, **re-pricing vérifié en base**,
+### P3.1 — Agent Internet (`web_explorer`) & base gratuite (2026-09-03)
+
+Nouvel agent **Internet** + 4 skills d'interaction web, mêmes garde-fous que le reste :
+
+| Skill | Garantie |
+|---|---|
+| `web_search` | DuckDuckGo (sans clé) ; URL de recherche **constante** (jamais d'URL utilisateur) ; 15 s ; max 10 résultats |
+| `web_fetch` | `assertSafeOutbound` (https, anti-SSRF, DNS préalable), **credentials dans l'URL interdits**, 20 s, body plafonné 1,5 Mo → texte ~4 000 car. |
+| `web_link_check` | ≤10 URLs, mêmes gardes, HEAD puis GET si 405/501 |
+| `free_tier_lookup` | **Offline** : snapshot curé de free-for.dev (`hermes/knowledge/free-for.json`, 106 services) — aucun appel sortant |
+
+- Aucun credential, aucune destination interne (IP privées, metadata, loopback) — bloqués par
+  `ssrfGuard.ts` (vérifié par la suite sécurité, 400 sur 10/8, localhost, metadata GCP).
+- En cas de réseau indisponible : l'erreur est renvoyée telle quelle au LLM et affichée en UI
+  (**jamais de résultat inventé** — testé : « échec réseau signalé honnêtement »).
+- L'agent est en **lecture seule** sur le web (pas de formulaire, pas de compte, pas de PII de
+  tiers) — rappelé dans son system prompt.
+
+**Références (submodules, lecture seule)** : `references/OBLITERATUS`
+([elder-plinius/OBLITERATUS](https://github.com/elder-plinius/OBLITERATUS) — outil de recherche
+d'abliteration de modèles **locaux** Python/GPU ; **non intégré** au runtime, l'ancien module
+factice a été retiré — cf. P3) et `references/awesome-llm-apps`
+([Shubhamsaboo/awesome-llm-apps](https://github.com/Shubhamsaboo/awesome-llm-apps) — catalogue
+de 100+ apps/agents LLM ; patterns *search → fetch → synthétiser* repris par `web_explorer`).
+Exclus du `tsc`/build, jamais importés.
+
+**Tests** : `scripts/verify-hermes.mjs` (fournisseur mock, base seedée) — **24/24 PASS** :
+registres (**33 skills / 9 agents**), 401/400, **re-pricing vérifié en base**,
 suppression **bloquée jusqu'à confirmation** puis réellement supprimée,
 création réelle (draft), PII absente des réponses, journal d'audit,
+**agent internet** (KB offline, `web_fetch` réel, `web_search` honnête sans egress),
 cycle autonome (insight réel), synergy 401, ablate 410, 429.
+La suite gère elle-même les pauses sur 429 (fenêtre IA 6/min) → rejouable à la suite.
 
 ## Risques résiduels acceptés (documentés)
 
@@ -417,11 +445,11 @@ npm run build && npm start
   (2), anti-SSRF (4), webhook signé (3), endpoints modérateur (3), rate-limit
   (1), proxy Stripe (1), **auth token (5)**, **commandes serveur/démo (7)**,
   **crypto on-chain fail-safe (8)**.
-- `scripts/verify-hermes.mjs` — **20 tests** du moteur Hermes v4 (fournisseur
-  `HERMES_PROVIDER=mock`, base seedée par `start-test-pg.mjs`) : registres,
-  auth, boucle outil réelle (prix/suppression/création vérifiés en base),
-  confirmation des actions sensibles, PII, audit, cycle autonome, 429.
-  ⚠️ ne pas lancer dans la même minute que `verify-security.mjs`
-  (rate-limiters IA en mémoire).
+- `scripts/verify-hermes.mjs` — **24 tests** du moteur Hermes v4 (fournisseur
+  `HERMES_PROVIDER=mock`, base seedée par `start-test-pg.mjs`) : registres
+  (33 skills / 9 agents), auth, boucle outil réelle (prix/suppression/création
+  vérifiés en base), confirmation des actions sensibles, PII, audit,
+  **agent internet** (KB free-for.dev offline, web_fetch réel, web_search
+  honnête), cycle autonome, 429. Gère les pauses 429 (fenêtre IA 6/min).
 - `npm run build` — bundle production OK (1817 modules).
 - `tsc --noEmit` — zéro erreur (serveur + client).

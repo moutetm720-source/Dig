@@ -13,6 +13,8 @@
  * buildSkillRegistry() — il devient automatiquement disponible pour tous
  * les agents (et dans l'UI via GET /api/hermes/skills).
  */
+import * as fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { db } from '../src/db/db';
 import { keyValueStore } from '../src/db/schema';
 import { eq } from 'drizzle-orm';
@@ -84,6 +86,71 @@ const num = (v: any, min = -Infinity, max = Infinity) => {
   if (!Number.isFinite(n) || n < min || n > max) throw new Error(`Valeur numérique invalide : ${v}`);
   return n;
 };
+
+// ---------- Helpers réseau / HTML (skills internet) ----------
+
+async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: any;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<T>((_, rej) => { timer = setTimeout(() => rej(new Error(`Timeout ${label} (${ms / 1000}s) — réseau indisponible ou trop lent.`)), ms); })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(Number(d)); } catch { return ''; } });
+}
+
+export function stripTags(html: string): string {
+  return decodeEntities(html.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+}
+
+/** HTML → texte lisible (supprime script/style/nav, conserve la structure). */
+export function htmlToText(html: string): string {
+  let h = html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+    .replace(/<(nav|footer|header|aside|form)[\s>][\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<(br|\/p|\/div|\/li|\/h[1-6]|\/tr|\/section)[\s>]/gi, '\n');
+  return decodeEntities(h.replace(/<[^>]*>/g, ' '))
+    .split('\n')
+    .map(l => l.replace(/[ \t]+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+    .slice(0, 60_000);
+}
+
+// fetch avec message d'erreur lisible (réseau du serveur) — jamais de silence
+async function netFetch(url: string, init: RequestInit, ms: number, label: string): Promise<Response> {
+  let res: Response;
+  try {
+    res = await withTimeout(fetch(url, init), ms, label);
+  } catch (e: any) {
+    const base = String(e?.message || e);
+    if (/timeout|délai/i.test(base)) throw new Error(`Réseau : ${base}`);
+    throw new Error(`Réseau indisponible depuis le serveur (fetch ${label} : ${base}) — la fonctionnalité fonctionnera sur un hébergement avec accès internet.`);
+  }
+  return res;
+}
+
+// ---------- Base de connaissances free-for.dev (snapshot curé) ----------
+
+let freeForCache: any = null;
+function loadFreeForKB(): any {
+  if (freeForCache) return freeForCache;
+  const p = fileURLToPath(new URL('./knowledge/free-for.json', import.meta.url));
+  freeForCache = JSON.parse(fs.readFileSync(p, 'utf-8'));
+  return freeForCache;
+}
 
 // ---------- Registre ----------
 
@@ -829,6 +896,189 @@ export function buildSkillRegistry(): HermesTool[] {
         if (json.length > 200_000) throw new Error('Valeur trop volumineuse (max 200 Ko).');
         await kvSet(key, args.value);
         return { written: true, key, bytes: json.length };
+      }
+    },
+
+    // ════════════ INTERNET (agent web) ════════════
+    // Sécurité : https uniquement, anti-SSRF (assertSafeOutbound), timeouts,
+    // tailles plafonnées, aucune credential dans les URL. En cas de réseau
+    // indisponible, l'erreur est renvoyée telle quelle (honnêteté : jamais
+    // de résultat inventé).
+    {
+      name: 'web_search',
+      description: "Recherche sur internet (DuckDuckGo, sans clé API). Renvoie les N premiers résultats (titre, URL, extrait).",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Requête de recherche (≤300 car.)' },
+          count: { type: 'number', description: 'Nombre de résultats (1-10, défaut 5)' }
+        },
+        required: ['query']
+      },
+      async run(args) {
+        const query = str(args.query, 300);
+        if (!query) throw new Error('query vide.');
+        const count = Math.min(10, Math.max(1, Math.trunc(Number(args.count) || 5)));
+        const target = 'https://html.duckduckgo.com/html/';
+        await assertSafeOutbound(target);
+        const res = await netFetch(target, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+          },
+          body: `q=${encodeURIComponent(query)}`
+        }, 15_000, 'web_search');
+        if (!res.ok) throw new Error(`Moteur de recherche indisponible (HTTP ${res.status}).`);
+        const html = await res.text();
+        const results: Array<{ title: string; url: string; snippet: string }> = [];
+        // Blocs de résultats : <a class="result__a" href="...">Titre</a> ... <a class="result__snippet">Extrait</a>
+        const blockRe = /<a[^>]*class="[^"]*result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>([\s\S]*?)<\/div>/g;
+        let m: RegExpExecArray | null;
+        while ((m = blockRe.exec(html)) !== null && results.length < count) {
+          const rawHref = m[1];
+          let url = rawHref;
+          const uddg = rawHref.match(/[?&]uddg=([^&]+)/);
+          if (uddg) { try { url = decodeURIComponent(uddg[1]); } catch { /* garde raw */ } }
+          if (!/^https?:\/\//i.test(url)) continue;
+          const title = stripTags(m[2]).trim();
+          const snip = stripTags((m[3].match(/class="[^"]*result__snippet[^"]*"[\s\S]*?>([\s\S]*?)<\/a>/) || [])[1] || '').trim();
+          if (title) results.push({ title: title.slice(0, 150), url: url.slice(0, 400), snippet: snip.slice(0, 250) });
+        }
+        return { query, source: 'duckduckgo', count: results.length, results };
+      }
+    },
+    {
+      name: 'web_fetch',
+      description: "Lit une page web et renvoie son texte (HTML→texte, plafonné ~4 000 car.). https uniquement, destinations internes bloquées.",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'URL https complète (ex: https://example.com/produit)' }
+        },
+        required: ['url']
+      },
+      async run(args) {
+        const raw = str(args.url, 2000);
+        if (!raw) throw new Error('url vide.');
+        let u: URL;
+        try { u = new URL(raw); } catch { throw new Error('URL invalide.'); }
+        if (u.username || u.password) throw new Error('Credentials dans l\'URL interdites.');
+        if (!['http:', 'https:'].includes(u.protocol)) throw new Error('Protocole non supporté (https attendu).');
+        await assertSafeOutbound(u.toString());
+        const res = await netFetch(u.toString(), {
+          redirect: 'follow',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8'
+          }
+        }, 20_000, 'web_fetch');
+        const ctype = String(res.headers.get('content-type') || '');
+        if (!res.ok) throw new Error(`La page a renvoyé HTTP ${res.status}.`);
+        const body = (await res.text()).slice(0, 1_500_000);
+        let text: string;
+        let title = '';
+        if (ctype.includes('html') || /^\s*</.test(body)) {
+          const t = body.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+          if (t) title = stripTags(t[1]).trim().slice(0, 200);
+          text = htmlToText(body);
+        } else {
+          text = body;
+        }
+        return {
+          url: u.toString().slice(0, 400),
+          status: res.status,
+          contentType: ctype.split(';')[0],
+          title,
+          textLength: text.length,
+          text: text.slice(0, 4000)
+        };
+      }
+    },
+    {
+      name: 'web_link_check',
+      description: "Vérifie la santé de 1 à 10 URLs (code HTTP, redirections) — utile pour contrôler les liens contenus/SEO/produits.",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          urls: { type: 'array', items: { type: 'string' }, description: 'Liste d\'URLs https (max 10)' }
+        },
+        required: ['urls']
+      },
+      async run(args) {
+        const urls: string[] = Array.isArray(args.urls) ? args.urls.map(u => str(u, 500)).filter(Boolean).slice(0, 10) : [];
+        if (urls.length === 0) throw new Error('urls vide.');
+        const out: Array<{ url: string; ok: boolean; status?: number; error?: string }> = [];
+        for (const raw of urls) {
+          let u: URL;
+          try { u = new URL(raw); } catch { out.push({ url: raw, ok: false, error: 'URL invalide' }); continue; }
+          if (!['http:', 'https:'].includes(u.protocol)) { out.push({ url: raw, ok: false, error: 'Protocole non supporté' }); continue; }
+          try {
+            await assertSafeOutbound(u.toString());
+            const lh = { 'User-Agent': 'Mozilla/5.0 (compatible; HermesLinkCheck/1.0)' };
+            let res = await netFetch(u.toString(), { method: 'HEAD', redirect: 'follow', headers: lh }, 10_000, 'web_link_check');
+            if (res.status === 405 || res.status === 501) {
+              res = await netFetch(u.toString(), { method: 'GET', redirect: 'follow', headers: lh }, 10_000, 'web_link_check');
+            }
+            out.push({ url: u.toString().slice(0, 300), ok: res.ok, status: res.status });
+          } catch (e: any) {
+            out.push({ url: u.toString().slice(0, 300), ok: false, error: String(e?.message || e).slice(0, 120) });
+          }
+        }
+        return { checked: out.length, ok: out.filter(r => r.ok).length, broken: out.filter(r => !r.ok), results: out };
+      }
+    },
+    {
+      name: 'free_tier_lookup',
+      description: "Consulte la base de connaissances GRATUITE (snapshot curé de free-for.dev, ~100 services) : hébergement, BDD, IA, e-mail, analytics, paiement crypto/carte, monitoring… Idéal pour recommander une infrastructure sans coût.",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Mots-clés (ex: "postgre serverless", "llm gratuit", "qr code")' },
+          category: { type: 'string', description: 'Catégorie (ex: ia, hebergement, base, email, paiement, monitoring…) — voir la liste en renvoyant sans arguments' }
+        }
+      },
+      async run(args) {
+        const kb = loadFreeForKB();
+        const noAccents = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+        const query = str(args.query, 200).toLowerCase().trim();
+        const category = noAccents(str(args.category, 40)).trim();
+        if (!query && !category) {
+          const counts: Record<string, number> = {};
+          for (const e of kb.entries) counts[e.category] = (counts[e.category] || 0) + 1;
+          return { source: kb.meta.source, curatedAt: kb.meta.curatedAt, totalServices: kb.entries.length, categories: counts, hint: 'Appelez à nouveau avec category et/ou query.' };
+        }
+        const tokens = query ? noAccents(query).split(/[\s,]+/).filter(t => t.length > 1) : [];
+        const scored = kb.entries.map(e => {
+          const name = noAccents(e.name);
+          const tags = (e.tags || []).map(noAccents);
+          const cat = noAccents(e.category);
+          const ft = noAccents(e.freeTier || '');
+          let score = 0;
+          if (category && cat === category) score += 10;
+          if (category && cat.includes(category)) score += 4;
+          for (const t of tokens) {
+            if (name.includes(t)) score += 6;
+            if (tags.some(tag => tag.includes(t))) score += 4;
+            if (cat.includes(t)) score += 3;
+            if (ft.includes(t)) score += 2;
+          }
+          return { e, score };
+        }).filter(x => x.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 12);
+        return {
+          source: kb.meta.source,
+          curatedAt: kb.meta.curatedAt,
+          note: kb.meta.note,
+          matched: scored.length,
+          results: scored.map(x => ({ name: x.e.name, category: x.e.category, freeTier: x.e.freeTier, url: x.e.url, tags: x.e.tags }))
+        };
       }
     },
 
