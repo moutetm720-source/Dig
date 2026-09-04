@@ -9,6 +9,7 @@ import { db, ensureSchema } from './src/db/db.js';
 import { keyValueStore } from './src/db/schema.js';
 import { eq } from 'drizzle-orm';
 import { createHermesRouter } from './hermes';
+import { scanSources, applyFix, previewFix, stripeDoctor } from './hermes/diagnostics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -402,6 +403,38 @@ async function readStripeSk(): Promise<string> {
     } catch (e) {}
   }
   return stripeSk;
+}
+
+/** Lecture brute d'une clé KV en string (diagnostic). */
+async function kvString(key: string): Promise<string> {
+  try {
+    const r = await db.select().from(keyValueStore).where(eq(keyValueStore.key, key));
+    if (r.length > 0 && r[0].value !== null && r[0].value !== undefined) {
+      const v = r[0].value;
+      return (typeof v === 'string' ? v : String(v)).replace(/^"|"$/g, '').trim();
+    }
+  } catch (e) {}
+  return '';
+}
+
+/**
+ * Diagnostic Stripe (docteur de code) : état RÉEL de la configuration, sans
+ * jamais exposer un secret (masquage dans hermes/diagnostics.ts).
+ */
+async function runStripeDoctor() {
+  const productsRaw = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'dpf_app_v2_products'));
+  const products = productsRaw.length > 0 && Array.isArray(productsRaw[0].value) ? (productsRaw[0].value as any[]) : [];
+  return stripeDoctor({
+    envKey: (process.env.STRIPE_SECRET_KEY || '').trim(),
+    dbKey: await kvString('df_stripe_sk'),
+    envWhsec: (process.env.STRIPE_WEBHOOK_SECRET || '').trim(),
+    dbWhsec: await kvString('df_stripe_whsec'),
+    mode: await kvString('df_stripe_mode'),
+    currency: await kvString('df_stripe_currency'),
+    demoCheckout: (process.env.DEMO_CHECKOUT || '').trim(),
+    products,
+    publicUrl: (process.env.PUBLIC_URL || '').trim()
+  });
 }
 
 // Webhook Stripe — vérification de signature obligatoire (raw body requis)
@@ -1277,6 +1310,91 @@ app.get('/api/store/get', requireAuth, apiLimiter, async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================================
+// INTÉGRATIONS SOCIALES — endpoint dédié (authentifié)
+// La clé df_social_integrations_v1 contient des tokens : elle reste bloquée
+// dans SENSITIVE_READ/WRITE_KEYS (ni lecture publique, ni écriture via
+// /api/store). Cet endpoint authentifié est le seul chemin légitime.
+// ============================================================
+app.get('/api/integrations/social', requireAuth, apiLimiter, async (req, res) => {
+  try {
+    const r = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_social_integrations_v1'));
+    const value = r.length > 0 ? r[0].value : [];
+    res.json({ integrations: Array.isArray(value) ? value : [] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/integrations/social', requireAuth, apiLimiter, async (req, res) => {
+  try {
+    const list = req.body?.integrations;
+    if (!Array.isArray(list)) return res.status(400).json({ error: 'Le champ integrations (tableau) est requis.' });
+    if (list.length > 100) return res.status(400).json({ error: 'Maximum 100 intégrations.' });
+    const clean = list.filter((x: any) => x && typeof x === 'object').slice(0, 100).map((x: any) => ({
+      ...x,
+      id: String(x.id || x.platform || '').slice(0, 80),
+      platform: String(x.platform || '').slice(0, 40),
+      connected: Boolean(x.connected)
+    }));
+    await db.insert(keyValueStore)
+      .values({ key: 'df_social_integrations_v1', value: clean })
+      .onConflictDoUpdate({ target: keyValueStore.key, set: { value: clean } });
+    res.json({ success: true, count: clean.length });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================================
+// DOCTEUR DE CODE — détection + correction des erreurs d'intégration
+// (voir hermes/diagnostics.ts et l'agent Hermes `code_doctor`)
+// ============================================================
+app.get('/api/diagnostics/scan', requireAuth, apiLimiter, async (req, res) => {
+  try {
+    const report = scanSources(undefined);
+    res.json({
+      scannedFiles: report.scannedFiles,
+      apiCalls: report.apiCalls,
+      count: report.findings.length,
+      byRule: report.byRule,
+      findings: report.findings.map(f => ({
+        id: f.id, rule: f.rule, severity: f.severity, file: f.file, line: f.line,
+        endpoint: f.endpoint, httpStatus: f.httpStatus, message: f.message,
+        autoFix: f.fix ? f.fix.kind : null
+      })),
+      generatedAt: report.generatedAt
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Erreur du scan.' });
+  }
+});
+
+app.get('/api/diagnostics/stripe', requireAuth, apiLimiter, async (req, res) => {
+  try {
+    res.json(await runStripeDoctor());
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Erreur du diagnostic Stripe.' });
+  }
+});
+
+// Correctif de code : aperçu (dry-run) par défaut, application sur confirm:true
+app.post('/api/diagnostics/fix', requireAuth, apiLimiter, async (req, res) => {
+  try {
+    const id = String(req.body?.id || '').trim();
+    if (!id) return res.status(400).json({ error: "Le champ 'id' (identifiant du finding) est requis." });
+    const confirm = req.body?.confirm === true;
+    const result = confirm ? applyFix(id) : previewFix(id);
+    if (!result.applied && !confirm) return res.json({ ...result, dryRun: true });
+    if (!result.applied) return res.status(400).json(result);
+    res.json({ ...result, dryRun: false });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Erreur du correctif.' });
   }
 });
 

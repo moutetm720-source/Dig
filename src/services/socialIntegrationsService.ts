@@ -417,13 +417,16 @@ class SocialIntegrationsService {
       // SÉCURITÉ : aucun passcode faible en dur — token de session ou passcode
       // du login validé côté serveur (sinon l'appel est anonyme → 401).
       const bearer = getAuthBearer();
-      const res = await fetch('/api/store/get?key=df_social_integrations_v1', {
+      // df_social_integrations_v1 contient des tokens : la clé reste protégée
+      // (SENSITIVE_READ_KEYS → /api/store/get renvoie 403). La lecture passe
+      // donc par l'endpoint dédié authentifié.
+      const res = await fetch('/api/integrations/social', {
         headers: { ...(bearer ? { Authorization: bearer } : {}) }
       });
       if (res.ok) {
         const data = await res.json();
-        if (data && Array.isArray(data.value) && data.value.length > 0) {
-          const serverList: SocialIntegrationItem[] = data.value;
+        if (data && Array.isArray(data.integrations) && data.integrations.length > 0) {
+          const serverList: SocialIntegrationItem[] = data.integrations;
           this.integrations = DEFAULT_INTEGRATIONS.map(def => {
             const found = serverList.find(s => s.id === def.id || s.platform === def.platform);
             return found ? { ...def, ...found } : def;
@@ -468,9 +471,13 @@ class SocialIntegrationsService {
     if (!item) return { success: false, message: 'Intégration introuvable.' };
 
     try {
+      const bearer = getAuthBearer();
       const res = await fetch('/api/social/verify-connection', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(bearer ? { Authorization: bearer } : {})
+        },
         body: JSON.stringify({
           platform: item.platform,
           webhookUrl: item.webhookUrl,
@@ -482,6 +489,7 @@ class SocialIntegrationsService {
         })
       });
 
+      if (!res.ok) throw new Error(`HTTP ${res.status} — /api/social/verify-connection`);
       const data = await res.json();
       const now = new Date().toISOString();
 
@@ -530,9 +538,13 @@ class SocialIntegrationsService {
     const postText = `Découvrez "${targetProduct.title}" — Solution digitale complète prête à l'emploi. Accès instantané et mises à jour incluses. ${item.discountCode ? `Utilisez le code ${item.discountCode} pour -${item.discountPercent || 20}%.` : ''}`;
 
     try {
+      const bearer = getAuthBearer();
       const res = await fetch('/api/social/publish-test-post', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(bearer ? { Authorization: bearer } : {})
+        },
         body: JSON.stringify({
           platform: item.platform,
           webhookUrl: item.webhookUrl,
@@ -545,6 +557,7 @@ class SocialIntegrationsService {
         })
       });
 
+      if (!res.ok) throw new Error(`HTTP ${res.status} — /api/social/publish-test-post`);
       const data = await res.json();
       const now = new Date().toISOString();
 
@@ -593,20 +606,20 @@ class SocialIntegrationsService {
     this.save();
     try {
       const bearer = getAuthBearer();
-      await fetch('/api/store', {
+      // Écriture via l'endpoint dédié : /api/store refuse cette clé protégée (403).
+      const res = await fetch('/api/integrations/social', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           ...(bearer ? { Authorization: bearer } : {})
         },
-        body: JSON.stringify({
-          df_social_integrations_v1: this.integrations
-        })
+        body: JSON.stringify({ integrations: this.integrations })
       });
+      if (!res.ok) throw new Error(`HTTP ${res.status} — /api/integrations/social`);
       store.addLog('success', 'agent', 'Configurations des réseaux sociaux enregistrées et synchronisées dans la base de données SQL.');
       return true;
-    } catch (err) {
-      console.warn('Could not sync social integrations to server:', err);
+    } catch (err: any) {
+      store.addLog('error', 'agent', `Synchronisation serveur des réseaux sociaux ÉCHOUÉE : ${err?.message || err}`);
       return false;
     }
   }

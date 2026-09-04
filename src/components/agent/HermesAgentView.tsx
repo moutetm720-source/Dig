@@ -144,8 +144,8 @@ export const HermesAgentView: React.FC = () => {
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-1 max-w-2xl">
-                Boucle d'agent avec tool-calling exécutée sur le serveur : 29 compétences réelles (boutique, pricing,
-                SEO, canaux, audit, maintenance), 8 agents spécialisés, journal d'audit et confirmation des actions sensibles.
+                Boucle d'agent avec tool-calling exécutée sur le serveur : 41 compétences réelles (boutique, pricing,
+                SEO, canaux, audit, maintenance, docteur de code), 9 agents spécialisés, journal d'audit et confirmation des actions sensibles.
               </p>
               {st && st.status === 'inactive' && (
                 <p className="text-[11px] text-amber-300/90 mt-1.5">
