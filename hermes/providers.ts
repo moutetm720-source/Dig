@@ -282,6 +282,39 @@ class MockProvider implements LLMProvider {
       return { toolCalls: [{ name: 'code_fix', args: { id: fixMatch[1] } }] };
     }
 
+    // 4e) REPOS GITHUB — « détail du repo X » → repos_get
+    const repoDetail = String(lastUser?.text || '').match(/d[ée]tail[^\n]*?repo[^\n]*?\s+([a-zA-Z0-9_.\/-]+)/i);
+    if (repoDetail) {
+      return { toolCalls: [{ name: 'repos_get', args: { id: repoDetail[1] } }] };
+    }
+
+    // 4f) VEILLE GITHUB — « fais une veille github sur X » → repos_harvest
+    if (/(veille|harveste)\b[^\n]{0,40}github|github[^\n]{0,25}(veille|harveste)\b|fais[^\n]{0,30}veille/i.test(prompt)) {
+      const q = String(lastUser?.text || '').match(/sur\s+(?:le\s+|la\s+|les\s+)?([a-z0-9 ._-]{3,80})/i);
+      return { toolCalls: [{ name: 'repos_harvest', args: { query: q?.[1]?.trim() || 'ai agent' } }] };
+    }
+
+    // 4g) RÉFÉRENTIELS LOCAUX — « référentiels / awesome-llm-apps / OBLITERATUS » → reference_repos
+    if (/référentiel|reference_repos|references\/|awesome-llm-apps|obliteratus/i.test(prompt)) {
+      const nameM = String(lastUser?.text || '').match(/(OBLITERATUS|awesome-free-llm-apis|awesome-llm-apps)/i);
+      return { toolCalls: [{ name: 'reference_repos', args: nameM ? { name: nameM[1] } : {} }] };
+    }
+
+    // 4h) LIENS PLATEFORME — « liste les liens de la plateforme » → platform_links
+    if (/(liste|inventaire|quels|contrôle|verifie|vérifie)[^\n]*liens|liens[^\n]*(liste|inventaire|plateforme)/i.test(prompt)) {
+      return { toolCalls: [{ name: 'platform_links', args: { check: /vérifie|contrôle|check|santé/i.test(prompt) } }] };
+    }
+
+    // 4i) REPOS GITHUB — « liste les repos » → repos_list
+    if (/(liste|quels|montre|vois|show)[^\n]{0,40}(repo|github)|repos?[^\n]{0,30}(harvest|liste)/i.test(prompt)) {
+      return { toolCalls: [{ name: 'repos_list', args: {} }] };
+    }
+
+    // 4j) VUE GLOBALE — « vue globale de la plateforme » → platform_overview
+    if (/vue globale|aper[çc]u de la plateforme|overview de la plateforme/i.test(prompt)) {
+      return { toolCalls: [{ name: 'platform_overview', args: {} }] };
+    }
+
     // 5) Audit → outil audit_system
     if (prompt.includes('audit') || prompt.includes('statut') || prompt.includes('diagnostic')) {
       return { toolCalls: [{ name: 'audit_system', args: {} }] };

@@ -317,8 +317,8 @@ export const HermesAgentWidget: React.FC<HermesAgentWidgetProps> = ({ onNavigate
                   <div className="flex items-center gap-2.5">
                     <Activity className="w-5 h-5 text-emerald-400" />
                     <div>
-                      <div className="font-bold text-white text-sm">Boucle Autonome Arrière-Plan</div>
-                      <div className="text-[11px] text-slate-400">Exécute des diagnostics et enregistre ses réflexions sur le serveur</div>
+                      <div className="font-bold text-white text-sm">Autonomie Server (Hermes)</div>
+                      <div className="text-[11px] text-slate-400">Cycle SUR LE SERVEUR (même navigateur fermé) : observation → plan → actions sûres (brouillons/veille) → rapport. Actions sensibles = confirmation requise.</div>
                     </div>
                   </div>
                   <button
@@ -349,20 +349,40 @@ export const HermesAgentWidget: React.FC<HermesAgentWidgetProps> = ({ onNavigate
                   </div>
 
                   <div>
-                    <label className="text-[10px] text-slate-400 block mb-1">Dernier cycle exécuté</label>
+                    <label className="text-[10px] text-slate-400 block mb-1">
+                      Dernier cycle exécuté {state.autonomy?.runs ? `(${state.autonomy.runs} au total)` : ''}
+                    </label>
                     <div className="bg-[#1A1A22] border border-slate-700/80 p-2 rounded-lg text-[11px] font-mono text-emerald-400 truncate">
-                      {state.lastAutonomousRun ? new Date(state.lastAutonomousRun).toLocaleTimeString() : 'En attente'}
+                      {state.autonomy?.running ? '⏳ en cours…' : state.autonomy?.lastRunAt ? new Date(state.autonomy.lastRunAt).toLocaleString() : 'En attente'}
                     </div>
                   </div>
                 </div>
 
                 <button
                   onClick={() => void hermesAgentService.runAutonomousNow()}
-                  className="w-full bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 py-2 rounded-lg font-bold flex items-center justify-center gap-2 transition-colors"
+                  disabled={state.autonomy?.running === true}
+                  className="w-full bg-indigo-600/20 hover:bg-indigo-600/30 disabled:opacity-50 text-indigo-300 border border-indigo-500/30 py-2 rounded-lg font-bold flex items-center justify-center gap-2 transition-colors"
                 >
                   <Zap className="w-4 h-4 text-indigo-400" />
                   Déclencher un Cycle Autonome Immédiat
                 </button>
+
+                {/* Dernier rapport + journal des cycles (serveur) */}
+                {state.autonomy?.recent && state.autonomy.recent.length > 0 && (
+                  <div className="space-y-2 pt-1">
+                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">Journal des cycles (serveur)</div>
+                    <div className="bg-[#0D0D12] border border-slate-800 p-2.5 rounded-lg text-[11px] text-slate-300 whitespace-pre-wrap max-h-40 overflow-y-auto">
+                      {state.autonomy.recent[0].report}
+                    </div>
+                    {state.autonomy.recent.slice(1, 4).map((c: any) => (
+                      <div key={c.at} className="flex items-center gap-2 text-[10px] text-slate-500 font-mono">
+                        <span className="text-emerald-500/70">●</span>
+                        <span className="shrink-0">{new Date(c.at).toLocaleString([], { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+                        <span className="truncate">{String(c.report).replace(/\s+/g, ' ').slice(0, 90)}…</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {/* Permissions réelles */}

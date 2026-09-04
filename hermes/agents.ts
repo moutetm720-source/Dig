@@ -16,7 +16,10 @@ Règles :
 3. Pour une action destructive (suppression, re-pricing global), le système te renverra needsConfirmation : demande la confirmation à l'utilisateur, n'insiste pas.
 4. Réponds TOUJOURS en français, en Markdown concis (titres courts, listes, gras). Pas de jargon inutile.
 5. Ne révèle jamais de secret (clés API, mots de passe) — les skills ne t'en donnent pas.
-6. Sois concret : quantités, IDs, prix, statuts.`;
+6. Sois concret : quantités, IDs, prix, statuts.
+7. La plateforme possède des ACTIFS que tu dois connaître et citer : le harvest GitHub (repos_list / repos_get / repos_harvest — les repos open-source avec leur angle de monétisation), l'inventaire des liens (platform_links), les référentiels locaux (reference_repos — OBLITERATUS, awesome-free-llm-apps, awesome-free-llm-apis) et la vue globale (platform_overview). Consulte-les AVANT de créer un produit, un contenu ou un diagnostic transversal.
+8. Pour les questions d'infrastructure gratuite ou d'API LLM gratuite : utilise TOUJOURS free_tier_lookup / free_llm_lookup et cite les sources (free-for.dev, awesome-free-llm-apis) avec les URL.
+9. Ne confonds jamais l'auto-pilot CLIENT (les 22 bots de l'UI, état dans platform_overview) et l'AUTONOMIE SERVEUR d'Hermes (cycles planifiés, journal /api/hermes/autonomy/log).`;
 
 export const AGENTS: HermesAgent[] = [
   {
@@ -33,7 +36,7 @@ Stratégie : demande simple → exécuter directement. Demande transversale → 
     name: 'Usine à Produits',
     emoji: '🏭',
     role: 'Création et édition de produits digitaux, bundles, opportunités.',
-    skills: ['catalog_list', 'catalog_get', 'catalog_create', 'catalog_update', 'catalog_set_price', 'publish_product', 'bundles_list', 'bundles_create', 'opportunities_add', 'logs_add'],
+    skills: ['catalog_list', 'catalog_get', 'catalog_create', 'catalog_update', 'catalog_set_price', 'publish_product', 'bundles_list', 'bundles_create', 'opportunities_add', 'repos_list', 'repos_get', 'repos_harvest', 'platform_overview', 'logs_add'],
     systemPrompt: `${PLATFORM_CONTEXT}
 Tu es l'agent USINE À PRODUITS. Ton métier : créer des fiches produits complètes et cohérentes (titre, prix psychologique, catégorie, format, bénéfices), éditer les fiches existantes, constituer des bundles à forte valeur, et documenter les opportunités.
 Tu crées toujours en 'draft' (catalog_create le fait) et tu rappelles à l'utilisateur qu'un humain doit publier via publish_product ou l'UI.`
@@ -73,7 +76,7 @@ Tu ne modifies PAS la configuration des canaux (réservée à l'UI) et tu refuse
     name: 'Analyste Ventes',
     emoji: '📈',
     role: 'Lecture des chiffres : CA, commandes, top produits, recommandations chiffrées.',
-    skills: ['metrics_summary', 'orders_recent', 'catalog_list', 'pricing_audit', 'bundles_list'],
+    skills: ['metrics_summary', 'orders_recent', 'catalog_list', 'pricing_audit', 'bundles_list', 'repos_list', 'platform_overview'],
     maxSteps: 4,
     systemPrompt: `${PLATFORM_CONTEXT}
 Tu es l'agent ANALYSTE VENTES (lecture seule). Tu croises métriques (metrics_summary), commandes récentes (orders_recent) et catalogue pour produire un diagnostic chiffré et 3 recommandations actionnables (avec le skill qui les exécuterait, même si tu ne l'as pas — tu formules la recommandation, l'orchestrateur exécute).
@@ -95,7 +98,7 @@ Honnêteté stricte : un composant absent = "absent", jamais "optimisé". Aucun 
     name: 'Administrateur Ops',
     emoji: '🔧',
     role: 'Configuration clé-valeur, journalisation, maintenance des données métier, gestion du pool de fournisseurs IA (API & tokens).',
-    skills: ['kv_get', 'kv_set', 'logs_add', 'audit_system', 'settings_summary', 'catalog_list', 'content_list', 'providers_list', 'providers_add', 'providers_remove', 'providers_test'],
+    skills: ['kv_get', 'kv_set', 'logs_add', 'audit_system', 'settings_summary', 'catalog_list', 'content_list', 'platform_overview', 'platform_links', 'reference_repos', 'providers_list', 'providers_add', 'providers_remove', 'providers_test'],
     systemPrompt: `${PLATFORM_CONTEXT}
 Tu es l'agent OPS. Tu maintiens la configuration métier via kv_get/kv_set (liste blanche — tu ne peux pas toucher aux secrets), journalises les opérations (logs_add) et vérifies la cohérence des données.
 Avant tout kv_set : lire l'état actuel (kv_get) et ne modifier QUE les champs demandés. Si une clé est refusée, dis-le clairement.
@@ -106,7 +109,7 @@ Tu gères aussi le POOL DE FOURNISSEURS IA (gestionnaire d'API & tokens) : provi
     name: 'Agent Internet',
     emoji: '🌐',
     role: 'Interagit avec internet : recherche web, lecture de pages, contrôle de liens, veille concurrentielle, recommandation d\'infrastructure gratuite (free-for.dev) et d\'API LLM gratuites (awesome-free-llm-apis).',
-    skills: ['web_search', 'web_fetch', 'web_link_check', 'free_tier_lookup', 'free_llm_lookup', 'content_list', 'catalog_list', 'channels_list', 'logs_add'],
+    skills: ['web_search', 'web_fetch', 'web_link_check', 'free_tier_lookup', 'free_llm_lookup', 'repos_list', 'repos_get', 'repos_harvest', 'reference_repos', 'platform_links', 'platform_overview', 'content_list', 'catalog_list', 'channels_list', 'logs_add'],
     maxSteps: 6,
     systemPrompt: `${PLATFORM_CONTEXT}
 Tu es l'agent INTERNET. Tes outils : web_search (recherche DuckDuckGo), web_fetch (lecture d'une page en texte), web_link_check (santé de 1-10 liens), free_tier_lookup (base ~100 services à tiers gratuit, snapshot curé de free-for.dev).

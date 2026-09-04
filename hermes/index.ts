@@ -14,6 +14,7 @@
 import { Router } from 'express';
 import { runAgentChat, confirmPendingAction, getAgents, skills } from './engine';
 import { buildPool, getPoolStatus, addProvider, removeProvider, testProvider, getHermesConfig, saveHermesConfig } from './providers';
+import { getAutonomyConfig, saveAutonomyConfig, runAutonomyCycle, getRecentAutonomyReports, isAutonomyRunning } from './autonomy';
 import { DEFAULT_HERMES_CONFIG } from './types';
 import { db } from '../src/db/db';
 import { keyValueStore } from '../src/db/schema';
@@ -34,12 +35,18 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
     try {
       const pool = await buildPool();
       const active = pool[0] || null;
-      const memories = await db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_hermes_memories'));
+      const [memories, repos, autonomyCfg] = await Promise.all([
+        db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_hermes_memories')),
+        db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_github_repositories')),
+        getAutonomyConfig()
+      ]);
       let memCount = 0;
       if (memories.length > 0 && Array.isArray(memories[0].value)) memCount = (memories[0].value as any[]).length;
+      const reposVal = memories && repos.length > 0 ? repos[0].value : null;
+      const reposList = Array.isArray(reposVal) ? reposVal : (typeof reposVal === 'string' ? (() => { try { const p = JSON.parse(reposVal); return Array.isArray(p) ? p : []; } catch { return []; } })() : []);
       res.json({
         status: active ? 'active' : 'offline',
-        engine: 'hermes-core-v5 (boucle tool-calling réelle, pool multi-fournisseurs avec bascule automatique, multi-agents)',
+        engine: 'hermes-core-v5 (boucle tool-calling réelle, pool multi-fournisseurs avec bascule automatique, multi-agents, autonomie serveur)',
         provider: active?.provider.label || 'aucun',
         providerReason: active ? undefined : 'aucun fournisseur disponible',
         model: active?.model || '-',
@@ -49,6 +56,8 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
         skillsCount: skills.length,
         agentsCount: getAgents().length,
         memoriesCount: memCount,
+        reposCount: reposList.length,
+        autonomy: { enabled: autonomyCfg.enabled, intervalMinutes: autonomyCfg.intervalMinutes, lastRunAt: autonomyCfg.lastRunAt, runs: autonomyCfg.runs, running: isAutonomyRunning() },
         timestamp: new Date().toISOString()
       });
     } catch (err: any) {
@@ -119,19 +128,65 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
   });
 
   // ---- Cycle autonome (analyse lecture seule) ----
+  // Route historique : délègue au NOUVEAU cycle d'autonomie (observation →
+  // plan → actions sûres → rapport journalisé). Compatibilité conservée.
   router.post('/autonomous-loop', requireAuth, aiLimiter, async (req, res) => {
     try {
-      const result = await runAgentChat({
-        agentId: 'security_auditor',
-        prompt: 'Cycle autonome : produis en ≤80 mots un diagnostic de la santé de la plateforme (paiements, auth, canaux, catalogue) et UNE recommandation prioritaire.',
-        history: [],
-        actor: 'cycle-autonome'
-      });
-      if (result.provider === 'aucun') {
-        // Mode honnête : pas de LLM → pas d'insight inventé
-        return res.json({ success: true, insight: null, reason: 'Aucun fournisseur LLM configuré — aucun insight généré (pas de simulation).' });
+      const report = await runAutonomyCycle('api');
+      if ((report as any).skipped) {
+        return res.json({ success: false, insight: null, reason: (report as any).reason });
       }
-      res.json({ success: true, insight: result.response, agent: result.agent, provider: result.provider, steps: result.steps.map(s => s.tool) });
+      const r = report as any;
+      res.json({ success: true, insight: r.report, agent: 'autonomy', provider: r.provider, steps: (r.actions || []).map((a: any) => a.tool), observations: r.observation, recommendations: r.recommendations });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ---- Autonomie serveur (config + journal) ----
+  router.get('/autonomy', requireAuth, apiLimiter, async (req, res) => {
+    try {
+      const config = await getAutonomyConfig();
+      const recent = await getRecentAutonomyReports(5);
+      res.json({
+        config,
+        running: isAutonomyRunning(),
+        nextRunIn: config.lastRunAt && config.enabled ? `≈${config.intervalMinutes} min après ${new Date(config.lastRunAt).toISOString()}` : (config.enabled ? 'prochain cycle planifié' : 'autonomie en pause'),
+        recent
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.post('/autonomy', requireAuth, apiLimiter, async (req, res) => {
+    try {
+      const { enabled, intervalMinutes } = req.body || {};
+      const patch: any = {};
+      if (enabled !== undefined) patch.enabled = Boolean(enabled);
+      if (intervalMinutes !== undefined) patch.intervalMinutes = Number(intervalMinutes);
+      const config = await saveAutonomyConfig(patch);
+      res.json({ updated: true, config });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  router.post('/autonomy/run', requireAuth, aiLimiter, async (req, res) => {
+    try {
+      const report = await runAutonomyCycle('api');
+      if ((report as any).skipped) return res.status(409).json({ error: (report as any).reason });
+      res.json({ success: true, report });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.get('/autonomy/log', requireAuth, apiLimiter, async (req, res) => {
+    try {
+      const n = Math.min(30, Math.max(1, Number(req.query.n) || 10));
+      const reports = await getRecentAutonomyReports(n);
+      res.json({ count: reports.length, reports });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

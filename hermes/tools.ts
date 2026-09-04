@@ -14,6 +14,7 @@
  * les agents (et dans l'UI via GET /api/hermes/skills).
  */
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db } from '../src/db/db';
 import { keyValueStore } from '../src/db/schema';
@@ -161,6 +162,87 @@ function loadFreeLLmKB(): any {
 }
 
 // ---------- Registre ----------
+
+    // ---------- Helpers liens (inventaire + contrôle de santé) ----------
+
+/** Masque un lien de destination : conserve origine+chemin, efface les tokens/params sensibles. */
+export function maskLink(raw: string): string {
+  try {
+    const u = new URL(raw);
+    let out = `${u.protocol}//${u.host}${u.pathname.slice(0, 120)}`;
+    if (u.search) {
+      const keys = [...u.searchParams.keys()].slice(0, 4);
+      out += `?${keys.map(k => `${k}=•••`).join('&')}${keys.length < u.searchParams.size ? '&…' : ''}`;
+    }
+    return out;
+  } catch {
+    return raw.slice(0, 80) + '…';
+  }
+}
+
+/** Contrôle de santé d'une URL (HEAD, repli GET sur 405/501) — partagé par web_link_check et platform_links. */
+export async function checkUrlHealth(raw: string): Promise<{ url: string; ok: boolean; status?: number; error?: string }> {
+  let u: URL;
+  try { u = new URL(raw); } catch { return { url: raw, ok: false, error: 'URL invalide' }; }
+  if (!['http:', 'https:'].includes(u.protocol)) return { url: raw, ok: false, error: 'Protocole non supporté' };
+  try {
+    await assertSafeOutbound(u.toString());
+    const lh = { 'User-Agent': 'Mozilla/5.0 (compatible; HermesLinkCheck/1.0)' };
+    let res = await netFetch(u.toString(), { method: 'HEAD', redirect: 'follow', headers: lh }, 10_000, 'link_check');
+    if (res.status === 405 || res.status === 501) {
+      res = await netFetch(u.toString(), { method: 'GET', redirect: 'follow', headers: lh }, 10_000, 'link_check');
+    }
+    return { url: u.toString().slice(0, 300), ok: res.ok, status: res.status };
+  } catch (e: any) {
+    return { url: u.toString().slice(0, 300), ok: false, error: String(e?.message || e).slice(0, 120) };
+  }
+}
+
+// ---------- Helpers référentiels locaux (submodules references/*) ----------
+
+const REFERENCES_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'references');
+const REFERENCES_NAMES = ['OBLITERATUS', 'awesome-free-llm-apis', 'awesome-llm-apps'];
+const READABLE_EXT = new Set(['.md', '.json', '.txt']);
+const SEARCH_FILES = ['README.md', 'data.json', 'CLAUDE.md', 'AGENTS.md', 'WORKSPACE.md', 'AIWG.md', 'CONTRIBUTING.md', 'SECURITY.md'];
+
+function referencesPath(repoName: string, file: string): string | null {
+  const repoDir = path.resolve(REFERENCES_ROOT, repoName);
+  if (repoDir !== path.join(REFERENCES_ROOT, path.basename(repoDir))) return null; // anti-traversée
+  const full = path.resolve(repoDir, file || '');
+  if (!full.startsWith(REFERENCES_ROOT + path.sep)) return null;
+  return full;
+}
+
+// ---------- Base de veille GitHub (cache mémoire, anti-quota) ----------
+const harvestCache = new Map<string, { at: number; results: any[] }>();
+const HARVEST_CACHE_MS = 30 * 60 * 1000;
+
+// Résumé compact d'un repo harvesté (jamais de dump massif)
+function repoBrief(r: any) {
+  return {
+    id: r.id, name: r.fullName || r.name, stars: r.stars ?? r.stargazers_count ?? null,
+    language: r.language || null, license: r.license || null,
+    suggestedProductType: r.suggestedProductType || null,
+    viabilityScore: r.commercialViabilityScore ?? null,
+    angle: String(r.monetizationAngle || '').slice(0, 160),
+    status: r.status || 'scanned'
+  };
+}
+
+/** Angles de monétisation dérivés des topics (même logique que le harvest client). */
+function repoAngle(item: any): { format: string; angle: string } {
+  const topics: string[] = Array.isArray(item.topics) ? item.topics : [];
+  const desc = String(item.description || '');
+  const isAgents = topics.includes('agent') || /agent/i.test(desc);
+  const isTemplate = topics.includes('template') || topics.includes('boilerplate');
+  const isPrompt = topics.includes('prompt') || /prompt/i.test(desc);
+  const n = `${item.full_name} (${item.stargazers_count ?? 0}★)`;
+  if (isAgents) return { format: 'pro_kit', angle: `Système multi-agents : packager en toolkit de production prêt à l'emploi (rôles pré-configurés, SOP de déploiement, doc) — source : ${n}.` };
+  if (isTemplate) return { format: 'template', angle: `Boilerplate : packager en starter SaaS à vendre (auth, Stripe, CI pré-câblés) avec doc premium — source : ${n}.` };
+  if (isPrompt) return { format: 'prompt_pack', angle: `Référentiel de prompts : extraire un pack curé avec schémas de validation et guide d'usage — source : ${n}.` };
+  return { format: 'guide', angle: `Outil open-source ${item.language || ''} : construire un « blueprint self-hosted » (guide + templates) autour de ${n}.` };
+}
+
 
 export function buildSkillRegistry(): HermesTool[] {
   return [
@@ -907,7 +989,7 @@ export function buildSkillRegistry(): HermesTool[] {
       }
     },
 
-    // ════════════ INTERNET (agent web) ════════════
+// ════════════ INTERNET (agent web) ════════════
     // Sécurité : https uniquement, anti-SSRF (assertSafeOutbound), timeouts,
     // tailles plafonnées, aucune credential dans les URL. En cas de réseau
     // indisponible, l'erreur est renvoyée telle quelle (honnêteté : jamais
@@ -1020,23 +1102,7 @@ export function buildSkillRegistry(): HermesTool[] {
       async run(args) {
         const urls: string[] = Array.isArray(args.urls) ? args.urls.map(u => str(u, 500)).filter(Boolean).slice(0, 10) : [];
         if (urls.length === 0) throw new Error('urls vide.');
-        const out: Array<{ url: string; ok: boolean; status?: number; error?: string }> = [];
-        for (const raw of urls) {
-          let u: URL;
-          try { u = new URL(raw); } catch { out.push({ url: raw, ok: false, error: 'URL invalide' }); continue; }
-          if (!['http:', 'https:'].includes(u.protocol)) { out.push({ url: raw, ok: false, error: 'Protocole non supporté' }); continue; }
-          try {
-            await assertSafeOutbound(u.toString());
-            const lh = { 'User-Agent': 'Mozilla/5.0 (compatible; HermesLinkCheck/1.0)' };
-            let res = await netFetch(u.toString(), { method: 'HEAD', redirect: 'follow', headers: lh }, 10_000, 'web_link_check');
-            if (res.status === 405 || res.status === 501) {
-              res = await netFetch(u.toString(), { method: 'GET', redirect: 'follow', headers: lh }, 10_000, 'web_link_check');
-            }
-            out.push({ url: u.toString().slice(0, 300), ok: res.ok, status: res.status });
-          } catch (e: any) {
-            out.push({ url: u.toString().slice(0, 300), ok: false, error: String(e?.message || e).slice(0, 120) });
-          }
-        }
+        const out = await Promise.all(urls.map(raw => checkUrlHealth(raw)));
         return { checked: out.length, ok: out.filter(r => r.ok).length, broken: out.filter(r => !r.ok), results: out };
       }
     },
@@ -1145,6 +1211,371 @@ export function buildSkillRegistry(): HermesTool[] {
             freeTier: x.e.freeTier, baseUrl: x.e.baseUrl, url: x.e.url,
             models: x.models
           }))
+        };
+      }
+    },
+
+    // ════════════ REPOS GITHUB (harvest de la plateforme) ════════════
+    // La plateforme harveste des repos open-source (UI « Moteur GitHub »)
+    // avec un angle de monétisation chacun (df_github_repositories, synchro
+    // client→serveur). Ces 3 skills rendent ce harvest visible et utilisable
+    // par Hermes : c'est le vivier d'idées de produits de l'usine.
+    {
+      name: 'repos_list',
+      description: "Consulte le HARVEST GITHUB de la plateforme (repos open-source scan, notés 0-100 en viabilité commerciale, avec angle de monétisation et type de produit suggéré). C'est le vivier d'idées de produits : lire avant de créer un produit issu d'un repo.",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          limit: { type: 'number', description: 'Nombre de repos à retourner (1-15, défaut 8)' },
+          minScore: { type: 'number', description: 'Score de viabilité minimum (0-100)' }
+        }
+      },
+      async run(args) {
+        const limit = Math.min(15, Math.max(1, Math.trunc(Number(args.limit) || 8)));
+        const minScore = Math.min(100, Math.max(0, Number(args.minScore) || 0));
+        const repos = await readList('df_github_repositories');
+        if (repos.length === 0) {
+          return { total: 0, hint: "Aucun repo harvesté pour l'instant. Utilise repos_harvest (veille GitHub live côté serveur) ou l'écran « Moteur GitHub » de l'UI." };
+        }
+        const sorted = [...repos]
+          .sort((a, b) => (b.commercialViabilityScore || 0) - (a.commercialViabilityScore || 0))
+          .filter(r => (r.commercialViabilityScore || 0) >= minScore)
+          .slice(0, limit);
+        return {
+          total: repos.length,
+          shown: sorted.length,
+          source: 'df_github_repositories (harvest GitHub — UI Moteur GitHub + repos_harvest)',
+          lastScannedAt: repos.map(r => r.scannedAt).filter(Boolean).sort().pop() || null,
+          repos: sorted.map(repoBrief)
+        };
+      }
+    },
+    {
+      name: 'repos_get',
+      description: "Détail d'UN repo du harvest GitHub (par id, fullName owner/repo ou nom) : description, tech stack, licence, topics, angle de monétisation complet. À utiliser avant de transformer un repo en produit (catalog_create).",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: { id: { type: 'string', description: 'id, fullName (owner/repo) ou nom du repo' } },
+        required: ['id']
+      },
+      async run(args) {
+        const q = str(args.id, 120).toLowerCase();
+        if (!q) throw new Error('id vide.');
+        const repos = await readList('df_github_repositories');
+        const repo = repos.find(r =>
+          (r.id || '').toLowerCase() === q ||
+          (r.fullName || '').toLowerCase() === q ||
+          (r.name || '').toLowerCase() === q);
+        if (!repo) {
+          return { found: false, harvestTotal: repos.length, hint: 'Repo introuvable dans le harvest. Voir repos_list ou repos_harvest pour élargir.' };
+        }
+        return {
+          found: true,
+          ...repoBrief(repo),
+          description: String(repo.description || '').slice(0, 400),
+          readmeSnippet: String(repo.readmeSnippet || '').slice(0, 300),
+          techStack: Array.isArray(repo.techStack) ? repo.techStack.slice(0, 8) : [],
+          topics: Array.isArray(repo.topics) ? repo.topics.slice(0, 10) : [],
+          url: repo.url || `https://github.com/${repo.fullName || repo.name}`,
+          monetizationAngle: String(repo.monetizationAngle || '').slice(0, 400)
+        };
+      }
+    },
+    {
+      name: 'repos_harvest',
+      description: "VEILLE GITHUB LIVE (côté serveur, sans clé — 60 req/h, cache 30 min par requête) : cherche l'API GitHub, note chaque repo trouvé avec un angle de monétisation dérivé de ses topics, et l'ajoute au harvest (df_github_repositories) pour nourrir l'usine à produits en continu.",
+      access: 'write',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Requête GitHub (ex: "ai agent", "boilerplate nextjs", "prompt library")' },
+          limit: { type: 'number', description: 'Nombre max de repos (1-6, défaut 5)' }
+        }
+      },
+      async run(args) {
+        const query = str(args.query, 120) || 'ai agent';
+        const limit = Math.min(6, Math.max(1, Math.trunc(Number(args.limit) || 5)));
+        const cacheKey = query.toLowerCase().replace(/\s+/g, ' ').trim();
+        const cached = harvestCache.get(cacheKey);
+        if (cached && Date.now() - cached.at < HARVEST_CACHE_MS) {
+          return { fromCache: true, cacheAgeSec: Math.round((Date.now() - cached.at) / 1000), query, repos: cached.results.slice(0, limit).map(repoBrief) };
+        }
+        const target = 'https://api.github.com/search/repositories';
+        await assertSafeOutbound(target);
+        const qs = `q=${encodeURIComponent(`${query} in:name,description,topics stars:>300`)}&sort=stars&order=desc&per_page=${limit}`;
+        const res = await netFetch(`${target}?${qs}`, {
+          headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'HermesGithubHarvest/1.0' }
+        }, 20_000, 'repos_harvest');
+        if (!res.ok) {
+          throw new Error(`API GitHub indisponible (HTTP ${res.status})${res.status === 403 ? ' — quota horaire atteint, réessaie plus tard' : ''}.`);
+        }
+        const data: any = await res.json();
+        const items: any[] = Array.isArray(data.items) ? data.items : [];
+        if (items.length === 0) {
+          return { fromCache: false, query, added: 0, note: 'Aucun résultat GitHub pour cette requête.', repos: [] };
+        }
+        const now = new Date().toISOString();
+        const live = items.slice(0, limit).map((item: any) => {
+          const { format, angle } = repoAngle(item);
+          const viability = Math.min(99, Math.max(75, Math.round(75 + ((item.stargazers_count || 0) / 1000) * 1.5)));
+          return {
+            id: `gh_live_${String(item.id)}`,
+            name: String(item.name || ''),
+            fullName: String(item.full_name || item.name || ''),
+            owner: String(item.owner?.login || ''),
+            description: String(item.description || '').slice(0, 400),
+            url: String(item.html_url || ''),
+            stars: item.stargazers_count ?? 0,
+            forks: item.forks_count ?? 0,
+            language: item.language || null,
+            topics: (Array.isArray(item.topics) ? item.topics : []).slice(0, 10),
+            license: item.license?.spdx_id || null,
+            openIssues: item.open_issues_count ?? 0,
+            techStack: [],
+            suggestedProductType: format,
+            monetizationAngle: angle,
+            commercialViabilityScore: viability,
+            status: 'scanned',
+            scannedAt: now,
+            source: 'repos_harvest (API GitHub live)'
+          };
+        });
+        const repos = await readList('df_github_repositories');
+        const byFull = new Map(repos.map(r => [String(r.fullName || '').toLowerCase(), r]));
+        let added = 0, refreshed = 0;
+        for (const r of live) {
+          const k = r.fullName.toLowerCase();
+          const ex = byFull.get(k);
+          if (ex) {
+            ex.scannedAt = now;
+            if (ex.status !== 'productized') ex.status = 'rescanned';
+            refreshed++;
+          } else {
+            repos.push(r);
+            added++;
+          }
+        }
+        await writeList('df_github_repositories', repos);
+        harvestCache.set(cacheKey, { at: Date.now(), results: live });
+        await kvSet('df_github_last_harvest', { at: now, query, added, refreshed, total: repos.length });
+        return {
+          fromCache: false, query, added, refreshed, total: repos.length,
+          note: 'Repos ajoutés au harvest de la plateforme (visible aussi dans l\'UI Moteur GitHub après synchro).',
+          repos: live.map(repoBrief)
+        };
+      }
+    },
+
+    // ════════════ RÉFÉRENTIELS LOCAUX (submodules references/*) ════════════
+    {
+      name: 'reference_repos',
+      description: "Lit les REPOS DE RÉFÉRENCE LOCAUX du projet (submodules git dans references/ : OBLITERATUS — toolkit abliteration, awesome-free-llm-apis — API LLM gratuites (data.json), awesome-llm-apps — catalogue 100+ apps IA open-source « clone it, ship it, sell it »). Sans argument : état + extrait README de chaque repo. name=… : fichiers du repo. name+file : contenu d'un fichier texte (plafonné). search=… : recherche textuelle dans les fichiers documentaires.",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'OBLITERATUS | awesome-free-llm-apis | awesome-llm-apps' },
+          file: { type: 'string', description: 'Fichier à lire (ex: README.md, data.json) — texte uniquement, < 200 Ko' },
+          search: { type: 'string', description: 'Mot-clé recherché dans les fichiers documentaires du référentiel (ou de tous si name absent)' }
+        }
+      },
+      async run(args) {
+        const reposState: any[] = [];
+        for (const name of REFERENCES_NAMES) {
+          const dir = path.join(REFERENCES_ROOT, name);
+          let files: string[] = [];
+          try { files = fs.readdirSync(dir); } catch { /* absent */ }
+          const readmePath = path.join(dir, 'README.md');
+          let readmeExcerpt = '';
+          try {
+            const rd = fs.readFileSync(readmePath, 'utf8');
+            readmeExcerpt = rd.replace(/[#*`>\-|]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 280);
+          } catch { /* pas de README */ }
+          reposState.push({
+            name,
+            initialized: files.length > 0,
+            topLevelEntries: files.length,
+            readmeExcerpt: readmeExcerpt || null
+          });
+        }
+        const name = str(args.name, 60);
+        const wanted = name ? REFERENCES_NAMES.find(n => n.toLowerCase() === name.toLowerCase()) : null;
+        if (name && !wanted) {
+          return { repos: reposState, error: `Référentiel inconnu : ${name}. Disponibles : ${REFERENCES_NAMES.join(', ')}` };
+        }
+        const targets = wanted ? [wanted] : REFERENCES_NAMES;
+
+        // Mode fichier
+        if (wanted && args.file) {
+          const file = str(args.file, 200);
+          const full = referencesPath(wanted, file);
+          if (!full) throw new Error(`Chemin refusé : ${args.file} (doit rester dans references/${wanted}/).`);
+          let st: fs.Stats;
+          try { st = fs.statSync(full); } catch { return { found: false, hint: `Fichier absent : ${file}. Lis d'abord la liste (name seul).` }; }
+          if (!st.isFile() || st.size > 200_000) throw new Error(`Fichier illisible (doit être un fichier texte < 200 Ko).`);
+          const ext = path.extname(full).toLowerCase();
+          if (!READABLE_EXT.has(ext)) throw new Error(`Type de fichier non supporté : ${ext || '(aucun)'} — seuls .md/.json/.txt sont lisibles.`);
+          const content = fs.readFileSync(full, 'utf8').slice(0, 8000);
+          return { repo: wanted, file, bytes: st.size, truncated: st.size > 8000, content };
+        }
+
+        // Mode liste des fichiers
+        if (wanted && !args.search) {
+          const dir = path.join(REFERENCES_ROOT, wanted);
+          let entries: fs.Dirent[] = [];
+          try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { /* vide */ }
+          const listing = entries.slice(0, 100).map(e => ({ name: e.name, type: e.isDirectory() ? 'dir' : 'file' }));
+          return { repo: wanted, initialized: listing.length > 0, entries: listing, hint: 'Re-lis avec file=… pour le contenu, ou search=… pour une recherche.' };
+        }
+
+        // Mode recherche
+        if (args.search) {
+          const needle = str(args.search, 100).toLowerCase();
+          if (!needle) throw new Error('search vide.');
+          const matches: Array<{ repo: string; file: string; line: number; excerpt: string }> = [];
+          for (const repo of targets) {
+            const dir = path.join(REFERENCES_ROOT, repo);
+            for (const fname of SEARCH_FILES) {
+              if (matches.length >= 8) break;
+              const full = path.join(dir, fname);
+              try {
+                const st = fs.statSync(full);
+                if (!st.isFile() || st.size > 500_000) continue;
+                const lines = fs.readFileSync(full, 'utf8').split('\n');
+                for (let i = 0; i < lines.length && matches.length < 8; i++) {
+                  if (lines[i].toLowerCase().includes(needle)) {
+                    matches.push({ repo, file: fname, line: i + 1, excerpt: lines[i].trim().replace(/\s+/g, ' ').slice(0, 220) });
+                  }
+                }
+              } catch { /* fichier absent — normal */ }
+            }
+          }
+          return { search: needle, scope: `fichiers documentaires (${SEARCH_FILES.join(', ')}) des ${targets.length} référentiel(s)`, matches: matches.length, results: matches, hint: matches.length === 0 ? 'Aucun match — élargis le mot-clé ou lis un fichier précis (name+file).' : undefined };
+        }
+
+        return {
+          repos: reposState,
+          note: reposState.every(r => !r.initialized)
+            ? 'TOUS les référentiels sont VIDES : `git submodule update --init --recursive` n\'a pas été exécuté sur cette instance (voir la Build Command Render du README).'
+            : 'Re-lis avec name=… (liste des fichiers), name+file=… (contenu) ou search=… (recherche).'
+        };
+      }
+    },
+
+    // ════════════ LIENS DE LA PLATEFORME ════════════
+    {
+      name: 'platform_links',
+      description: "Inventaire des LIENS de la plateforme : liens d'accès produits (PUBLIC_URL + ?product=), sitemap.xml, flux RSS/feed.xml, llms.txt, destinations des canaux connectés (masquées), liens tracking des kits affiliés. check=true pour tester la santé des liens principaux (max 5 HEAD, 404/redirections).",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: { check: { type: 'boolean', description: 'Tester la santé des liens principaux (max 5 contrôles HEAD)' } }
+      },
+      async run(args) {
+        const base = (process.env.PUBLIC_URL || '').trim().replace(/\/$/, '');
+        const products = (await readList('dpf_app_v2_products')).filter(p => p.status === 'published');
+        const integrations = await readList('dpf_app_v2_integrations');
+        const kits = await readList('df_affiliate_promo_kits_v1');
+        const productLinks = products.slice(0, 10).map(p => `${base || '(PUBLIC_URL absente)'}/?product=${encodeURIComponent(p.id)}`);
+        const channels = integrations
+          .filter(i => i.connected)
+          .slice(0, 12)
+          .map(i => ({
+            name: i.name || i.service || 'canal',
+            service: i.service || null,
+            destination: i.config?.webhookUrl ? maskLink(String(i.config.webhookUrl)) : (i.config?.webhookEndpoint ? String(i.config.webhookEndpoint).slice(0, 100) : null)
+          }));
+        const affiliateLinks = (Array.isArray(kits) ? kits : [])
+          .map(k => k.affiliateTrackingUrl || k.trackingUrl || null)
+          .filter(Boolean)
+          .map(u => maskLink(String(u)))
+          .slice(0, 8);
+        const inventory = {
+          generatedAt: new Date().toISOString(),
+          site: {
+            sitemap: `${base || ''}/sitemap.xml`,
+            rss: `${base || ''}/feed.xml`,
+            llmsTxt: `${base || ''}/llms.txt`
+          },
+          publicUrl: base || 'absente — les liens produits sont relatifs (définir PUBLIC_URL pour des URLs absolues)',
+          productAccessLinks: { count: products.length, shown: productLinks.slice(0, 5), sample: productLinks },
+          channels: { connected: channels.length, destinations: channels },
+          affiliateKits: { count: Array.isArray(kits) ? kits.length : 0, trackingLinks: affiliateLinks }
+        };
+        if (args.check === true) {
+          // Uniquement des URLs absolues (PUBLIC_URL définie) — les liens relatifs ne sont pas testables.
+          const toCheck = [`${base}/sitemap.xml`, `${base}/feed.xml`, ...productLinks]
+            .filter(u => u.startsWith('http'))
+            .slice(0, 5);
+          if (toCheck.length === 0) {
+            return { ...inventory, healthCheck: { checked: 0, ok: 0, results: [], note: 'PUBLIC_URL absente — aucun lien absolu testable (définir PUBLIC_URL pour activer le contrôle).' } };
+          }
+          const health = await Promise.all(toCheck.map(u => checkUrlHealth(u)));
+          return {
+            ...inventory,
+            healthCheck: {
+              checked: health.length,
+              ok: health.filter(h => h.ok).length,
+              results: health
+            }
+          };
+        }
+        return inventory;
+      }
+    },
+
+    // ════════════ VUE GLOBALE (Hermes « voit » toute la plateforme) ════════════
+    {
+      name: 'platform_overview',
+      description: "Vue d'ensemble COMPLÈTE de la plateforme en un appel : boutique (produits/CA/commandes), canaux, harvest GitHub (repos + meilleurs scores), liens, auto-pilot client synchronisé, pool IA, skills & agents Hermes. Point de départ idéal avant toute demande transversale.",
+      access: 'read',
+      parameters: { type: 'object', properties: {} },
+      async run() {
+        const [products, orders, integrations, repos, kits, apEnabled1, apEnabled2, apSpeed1, apSpeed2, autonomyCfg, lastHarvest] = await Promise.all([
+          readList('dpf_app_v2_products'), readList('dpf_app_v2_orders'), readList('dpf_app_v2_integrations'),
+          readList('df_github_repositories'), readList('df_affiliate_promo_kits_v1'),
+          kvGet('df_auto_pilot_enabled_v1'), kvGet('df_auto_pilot_enabled'),
+          kvGet('df_auto_loop_speed_v1'), kvGet('df_auto_loop_speed'),
+          kvGet('df_hermes_autonomy_config'), kvGet('df_github_last_harvest')
+        ]);
+        const revenue = orders.reduce((s: number, o: any) => s + (Number(o.totalAmount) || 0), 0);
+        const base = (process.env.PUBLIC_URL || '').trim().replace(/\/$/, '');
+        const published = products.filter(p => p.status === 'published');
+        return {
+          generatedAt: new Date().toISOString(),
+          boutique: {
+            products: products.length, published: published.length,
+            orders: orders.length, revenueEur: Math.round(revenue * 100) / 100,
+            topProducts: [...products].sort((a, b) => (b.salesCount || 0) - (a.salesCount || 0)).slice(0, 3)
+              .map(p => ({ id: p.id, title: p.title, sales: p.salesCount || 0, priceEur: p.pricing?.recommendedPrice ?? p.price ?? null }))
+          },
+          canaux: {
+            total: integrations.length,
+            connected: integrations.filter(i => i.connected).length,
+            names: integrations.filter(i => i.connected).slice(0, 8).map(i => i.name || i.service || 'canal')
+          },
+          reposGithub: {
+            total: repos.length,
+            lastHarvest: lastHarvest ? { at: lastHarvest.at, query: lastHarvest.query, added: lastHarvest.added } : null,
+            top: [...repos].sort((a, b) => (b.commercialViabilityScore || 0) - (a.commercialViabilityScore || 0)).slice(0, 3)
+              .map(r => ({ name: r.fullName || r.name, score: r.commercialViabilityScore ?? null, productType: r.suggestedProductType || null }))
+          },
+          liens: {
+            publicUrl: base || 'absent (liens relatifs)',
+            productLinks: published.length,
+            sitemap: `${base || ''}/sitemap.xml`,
+            rss: `${base || ''}/feed.xml`,
+            affiliateKits: Array.isArray(kits) ? kits.length : 0
+          },
+          autoPilotClient: {
+            enabled: apEnabled1 ?? apEnabled2 ?? null,
+            loopSpeed: apSpeed1 || apSpeed2 || null,
+            note: "État des cycles client (22 bots de l'UI, synchronisés) — distinct de l'autonomie serveur d'Hermes (df_hermes_autonomy_config)."
+          },
+          autonomieHermes: autonomyCfg || { enabled: null, note: 'non configurée — GET /api/hermes/autonomy' },
+          hermes: { skills: 'voir /api/hermes/skills', agents: 'voir list_agents' }
         };
       }
     },
@@ -1375,9 +1806,29 @@ export function getSkill(name: string): HermesTool | undefined {
   return skillRegistry.find(t => t.name === name);
 }
 
-export function declareSkills(names?: string[]): ToolDeclarationSchemaList {
-  const list = names ? skillRegistry.filter(t => names.includes(t.name)) : skillRegistry;
+export function declareSkills(names?: string[], allowedOnly?: string[]): ToolDeclarationSchemaList {
+  let list = names ? skillRegistry.filter(t => names.includes(t.name)) : skillRegistry;
+  if (allowedOnly) list = list.filter(t => allowedOnly.includes(t.name));
   return list.map(t => ({ name: t.name, description: t.description, parameters: t.parameters }));
 }
+
+/**
+ * Périmètre AUTONOMIE (cycle planifié sans utilisateur à l'écran) —
+ * « autonomie sûre » : lecture + création de BROUILLONS uniquement.
+ * Jamais exécutées en autonomie : re-pricing, publication, suppression,
+ * diffusion canaux, kv_set, pool de fournisseurs, code_fix…
+ * (les skills requiresConfirmation restent bloquées par le moteur de toute façon).
+ */
+export const AUTONOMY_SAFE_SKILLS: string[] = [
+  // Lecture
+  'platform_overview', 'platform_links', 'repos_list', 'repos_get', 'reference_repos',
+  'metrics_summary', 'orders_recent', 'audit_system', 'settings_summary',
+  'catalog_list', 'catalog_get', 'pricing_audit', 'bundles_list', 'content_list',
+  'campaigns_list', 'channels_list', 'seo_get', 'kv_get', 'logs_add',
+  'list_agents', 'web_search', 'web_fetch', 'web_link_check',
+  'free_tier_lookup', 'free_llm_lookup',
+  // Veille & création de brouillons (jamais de publication)
+  'repos_harvest', 'catalog_create', 'content_create', 'bundles_create', 'opportunities_add'
+];
 
 type ToolDeclarationSchemaList = Array<{ name: string; description: string; parameters: ToolParameterSchema }>;
