@@ -87,11 +87,11 @@ async function reseed() {
   let r = await req('GET', '/api/hermes/status');
   check('status → 200 + moteur v5 (pool multi-fournisseurs) + fournisseur mock', r.status === 200 && String(r.json.engine).startsWith('hermes-core-v5') && String(r.json.provider).startsWith('Mock'), JSON.stringify(r.json).slice(0, 140));
   check('status → 25+ skills déclarées', r.json.skillsCount >= 25, `skills=${r.json.skillsCount}`);
-  check('status → 9 agents spécialisés', r.json.agentsCount === 9, `agents=${r.json.agentsCount}`);
+  check('status → 10 agents spécialisés', r.json.agentsCount === 10, `agents=${r.json.agentsCount}`);
 
   r = await req('GET', '/api/hermes/agents');
   const agentIds = (r.json.agents || []).map(a => a.id);
-  check('agents → liste avec orchestrator + 8 spécialistes (dont web_explorer)', r.status === 200 && agentIds.includes('orchestrator') && agentIds.includes('web_explorer') && agentIds.length === 9, agentIds.join(','));
+  check('agents → liste avec orchestrator + 9 spécialistes (dont web_explorer et code_doctor)', r.status === 200 && agentIds.includes('orchestrator') && agentIds.includes('web_explorer') && agentIds.includes('code_doctor') && agentIds.length === 10, agentIds.join(','));
 
   r = await req('GET', '/api/hermes/skills');
   const skillNames = (r.json.skills || []).map(s => s.name);

@@ -73,7 +73,7 @@ export const MultiAgentCenterView: React.FC = () => {
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-1 max-w-3xl">
-              8 agents spécialisés qui partagent les 29 compétences réelles du moteur serveur. Chaque exécution passe par
+              9 agents spécialisés qui partagent les 41 compétences réelles du moteur serveur. Chaque exécution passe par
               la boucle d'agent (plan → outils → observation) et est journalisée.
             </p>
           </div>

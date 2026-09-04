@@ -32,6 +32,32 @@ import { getAuthBearer } from '../../services/authToken';
 import { CurrencyCode, CryptoGatewaySettings } from '../../types';
 import { SocialNetworksHub } from './SocialNetworksHub';
 
+/**
+ * Écrit des clés KV côté serveur en vérifiant la réponse : un 401/403/500
+ * n'est plus jamais confondu avec un succès (cause des « ça ne marche pas »
+ * silencieux après le durcissement sécurité).
+ */
+async function pushStore(payload: Record<string, any>): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const bearer = getAuthBearer();
+    const res = await fetch('/api/store', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(bearer ? { Authorization: bearer } : {})
+      },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({} as any));
+      return { ok: false, error: (detail as any)?.error || `HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || 'réseau indisponible' };
+  }
+}
+
 export const IntegrationsView: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'social' | 'stripe' | 'crypto' | 'geo' | 'security'>('social');
   
@@ -131,9 +157,10 @@ export const IntegrationsView: React.FC = () => {
     localStorage.setItem('df_stripe_currency', currency);
 
     // Also push to backend KV store (token de session / passcode du login validé)
+    // NB : la réponse EST vérifiée — un 401/403/500 ne doit plus passer pour un succès.
     try {
       const bearer = getAuthBearer();
-      await fetch('/api/store', {
+      const res = await fetch('/api/store', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -147,12 +174,22 @@ export const IntegrationsView: React.FC = () => {
           df_stripe_currency: currency
         })
       });
-    } catch (err) {
-      console.warn("Could not sync to server store directly", err);
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail?.error || `HTTP ${res.status} — /api/store`);
+      }
+      setStripeSaveSuccess(true);
+      store.addLog('success', 'stripe', `Configuration Stripe enregistrée sur le serveur (Mode: ${stripeMode.toUpperCase()}, Devise: ${currency})`);
+    } catch (err: any) {
+      setStripeSaveSuccess(false);
+      setStripeTestResult({
+        success: false,
+        message: `Enregistrement serveur ÉCHOUÉ : ${err?.message || err}. La configuration n'est valable que dans ce navigateur (localStorage) — le tunnel de paiement ne fonctionnera pas tant qu'elle n'est pas enregistrée côté serveur. Connectez-vous en tant que modérateur puis réessayez.`
+      });
+      store.addLog('error', 'stripe', `Échec de l'enregistrement serveur de la config Stripe : ${err?.message || err}`);
+      return;
     }
 
-    setStripeSaveSuccess(true);
-    store.addLog('success', 'stripe', `Configuration Stripe mise à jour (Mode: ${stripeMode.toUpperCase()}, Devise: ${currency})`);
     setTimeout(() => setStripeSaveSuccess(false), 3000);
   };
 
@@ -161,24 +198,16 @@ export const IntegrationsView: React.FC = () => {
     cryptoPaymentService.updateSettings(cryptoSettings);
     
     // Push settings directly to server database (token de session / passcode du login validé)
-    try {
-      const bearer = getAuthBearer();
-      await fetch('/api/store', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(bearer ? { Authorization: bearer } : {})
-        },
-        body: JSON.stringify({
-          df_crypto_settings_v1: cryptoSettings,
-          df_crypto_btc: cryptoSettings.merchantBtcAddress,
-          df_crypto_eth: cryptoSettings.merchantEthAddress,
-          df_crypto_sol: cryptoSettings.merchantSolAddress,
-          df_crypto_usdt: cryptoSettings.merchantUsdtAddress
-        })
-      });
-    } catch (err) {
-      console.warn("Could not sync crypto to server store directly", err);
+    const saved = await pushStore({
+      df_crypto_settings_v1: cryptoSettings,
+      df_crypto_btc: cryptoSettings.merchantBtcAddress,
+      df_crypto_eth: cryptoSettings.merchantEthAddress,
+      df_crypto_sol: cryptoSettings.merchantSolAddress,
+      df_crypto_usdt: cryptoSettings.merchantUsdtAddress
+    });
+    if (!saved.ok) {
+      store.addLog('error', 'agent', `Config crypto NON enregistrée côté serveur : ${saved.error}`);
+      return;
     }
 
     setCryptoSaveSuccess(true);
@@ -190,24 +219,16 @@ export const IntegrationsView: React.FC = () => {
     setCryptoSettings(restored);
     
     // Push to server database immediately (token de session / passcode du login validé)
-    try {
-      const bearer = getAuthBearer();
-      await fetch('/api/store', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(bearer ? { Authorization: bearer } : {})
-        },
-        body: JSON.stringify({
-          df_crypto_settings_v1: restored,
-          df_crypto_btc: restored.merchantBtcAddress,
-          df_crypto_eth: restored.merchantEthAddress,
-          df_crypto_sol: restored.merchantSolAddress,
-          df_crypto_usdt: restored.merchantUsdtAddress
-        })
-      });
-    } catch (err) {
-      console.warn("Could not sync restored crypto to server store directly", err);
+    const saved = await pushStore({
+      df_crypto_settings_v1: restored,
+      df_crypto_btc: restored.merchantBtcAddress,
+      df_crypto_eth: restored.merchantEthAddress,
+      df_crypto_sol: restored.merchantSolAddress,
+      df_crypto_usdt: restored.merchantUsdtAddress
+    });
+    if (!saved.ok) {
+      store.addLog('error', 'agent', `Adresses crypto NON réinitialisées côté serveur : ${saved.error}`);
+      return;
     }
 
     setCryptoSaveSuccess(true);
@@ -231,11 +252,20 @@ export const IntegrationsView: React.FC = () => {
     }
 
     try {
+      // /api/checkout/verify-keys est protégé (requireAuth) : sans Bearer le
+      // serveur répond 401 et le test échouait systématiquement.
+      const bearer = getAuthBearer();
       const res = await fetch('/api/checkout/verify-keys', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(bearer ? { Authorization: bearer } : {})
+        },
         body: JSON.stringify({ secretKey: sk, publishableKey: pk })
       });
+      if (res.status === 401) {
+        throw new Error('Accès modérateur requis : déverrouillez la console (code modérateur) puis relancez le test.');
+      }
       const data = await res.json();
 
       if (data.success) {
@@ -312,16 +342,12 @@ export const IntegrationsView: React.FC = () => {
     // l'ancien passcode.
     const currentBearer = getAuthBearer();
     localStorage.setItem('df_moderator_passcode', newPasscode.trim());
-    try {
-      if (currentBearer) {
-        await fetch('/api/store', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: currentBearer },
-          body: JSON.stringify({ df_moderator_passcode: newPasscode.trim() })
-        });
+    if (currentBearer) {
+      const synced = await pushStore({ df_moderator_passcode: newPasscode.trim() });
+      if (!synced.ok) {
+        setPassError(`Le serveur a refusé la rotation (${synced.error}). Si MODERATOR_PASSCODE est défini en variable d'environnement, c'est lui qui fait foi : changez-le dans le dashboard d'hébergement.`);
+        return;
       }
-    } catch (err) {
-      console.warn('Could not sync new moderator passcode to server', err);
     }
     setNewPasscode('');
     setConfirmPasscode('');

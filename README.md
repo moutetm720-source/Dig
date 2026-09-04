@@ -8,8 +8,8 @@ tunnel de démo sans Stripe, et une sécurité durcie (voir [`AUDIT_SECURITE.md`
 
 - **Serveur** : Node.js + Express (TypeScript, `tsx`), PostgreSQL (drizzle-orm, key-value store), `server.ts`
 - **Client** : React 18 + Vite + Tailwind (`src/`)
-- **IA** : moteur d'agent Hermes (`hermes/`) — boucle tool-calling réelle, **pool multi-fournisseurs avec bascule automatique** (anti rate-limit), gestionnaire d'API & tokens pilotable par Hermes
-- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (54 tests, mode mock)
+- **IA** : moteur d'agent Hermes (`hermes/`) — boucle tool-calling réelle, **pool multi-fournisseurs avec bascule automatique** (anti rate-limit), gestionnaire d'API & tokens pilotable par Hermes, **docteur de code** (`code_doctor`) qui détecte et corrige les erreurs d'intégration client ↔ API
+- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (53 tests, mode mock), `scripts/verify-diagnostics.mjs` (40 tests — docteur de code)
 
 ## Démarrage
 
@@ -36,7 +36,7 @@ npm start          # production
    - Notez : *Connection String* (contient le mot de passe) + *Host/Port/User/Database*.
      Vous n'aurez pas à les saisir manuellement si vous **liez** la base (étape 3).
 2. **Service Web** — *New* → *Web Service* → branchez le dépôt GitHub
-   `moutetm720-source/Dig`, branche `arena/01a0680e-dig` (ou `main` une fois fusionné) :
+   `moutetm720-source/Dig`, branche `main` :
    - **Build Command** : `npm install && npm run build`
    - **Start Command** : `npm start` (→ `tsx server.ts`, `tsx` est en `dependencies`)
    - **Region** : Frankfurt (idéalement la même que la base).
@@ -179,7 +179,30 @@ PORT=3211 DB_HOST=127.0.0.1 DB_USER=postgres DB_PASSWORD=*** DB_NAME=applet \
 # 3. Suites
 node scripts/verify-security.mjs --base http://127.0.0.1:3211 --passcode <code> --whsec <secret>
 node scripts/verify-hermes.mjs    --base http://127.0.0.1:3211 --passcode <code>
+node scripts/verify-diagnostics.mjs --base http://127.0.0.1:3211 --passcode <code>
 ```
 
-⚠️ Les rate-limiters IA (6 req/min/IP) sont en mémoire : les deux suites ne doivent pas
-consommer la même fenêtre — la suite Hermes gère elle-même les pauses sur 429.
+⚠️ Les rate-limiters (IA 6/min, webhooks 10/min, crypto 10/5 min, auth 10/10 min) sont
+en mémoire : **les deux suites gèrent elles-mêmes les pauses sur 429** (attente de la fin
+de fenêtre + un essai), donc elles restent rejouables à la suite. Pour un enchaînement
+rapide, redémarrez le serveur entre les deux suites (les compteurs sont remis à zéro).
+
+## 🩺 Docteur de code — « Stripe ne marche pas »
+
+Une classe de bug récurrente : un écran appelle l'API **sans les bons droits** (endpoint
+`requireAuth` appelé sans `Authorization` → 401) ou **écrit une clé protégée** via
+`/api/store` (→ 403), et comme la réponse n'était pas vérifiée, l'UI affichait un succès.
+Le docteur de code (`hermes/diagnostics.ts`) rend ça détectable et corrigeable à chaud :
+
+| Skill / endpoint | Rôle |
+|---|---|
+| `code_scan` · `GET /api/diagnostics/scan` | Analyse les `fetch('/api/…')` du client : 401 garanti, 403 garanti, réponse jamais vérifiée, endpoint hors contrat |
+| `stripe_doctor` · `GET /api/diagnostics/stripe` | État réel de la config Stripe : source/format de clé (une clé `pk_…` est refusée), cohérence mode live/test, webhook, devise, mode démo, prix, **et joignabilité de `api.stripe.com` depuis le serveur** (egress/DNS) — **jamais de secret en clair** |
+| `code_fix` · `POST /api/diagnostics/fix` | Applique le correctif (en-tête `Authorization` + import, garde `res.ok`), **confirmation obligatoire**, fichier original sauvegardé dans `.dig-doctor/` |
+
+Dans le chat Hermes : *« Les fonctions Stripe ne fonctionnent pas, diagnostique »* →
+l'agent `code_doctor` enchaîne `stripe_doctor` / `code_scan`, puis propose `code_fix`.
+Le contrat (`API_CONTRACT`) est comparé aux routes réelles de `server.ts` par
+`verify-diagnostics.mjs` : il ne peut pas dériver silencieusement.
+
+> Un correctif de code n'est actif qu'après `npm run build` (ou redéploiement).

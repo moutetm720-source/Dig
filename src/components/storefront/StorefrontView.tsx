@@ -345,6 +345,15 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
         setIsProcessingPayment(true);
         try {
           const res = await fetch(`/api/checkout/verify-session/${sessionId}`);
+          if (!res.ok) {
+            // 429/5xx transitoire : on réessaie avant de conclure (le paiement
+            // peut être en cours de confirmation côté Stripe).
+            if (attempts < 4) {
+              setTimeout(() => verifySession(attempts + 1), 2500);
+              return;
+            }
+            throw new Error(`HTTP ${res.status} — /api/checkout/verify-session`);
+          }
           const verification = await res.json();
 
           if (verification.paid) {

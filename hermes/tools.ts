@@ -1264,6 +1264,107 @@ export function buildSkillRegistry(): HermesTool[] {
         const { testProvider } = await import('./providers');
         return await testProvider(str(args.name, 40));
       }
+    },
+
+    // ============================================================
+    // DOCTEUR DE CODE — détection + correction des erreurs d'intégration
+    // (voir hermes/diagnostics.ts). C'est l'agent qui répond à « Stripe ne
+    // marche pas » : il trouve l'appel client fautif (401/403/échec silencieux)
+    // et peut le réparer, avec confirmation.
+    // ============================================================
+    {
+      name: 'code_scan',
+      description: "DOCTEUR DE CODE : analyse les appels fetch('/api/…') du client et détecte les erreurs d'intégration qui cassent une fonction — endpoint protégé appelé SANS Authorization (401 systématique), clé KV protégée lue/écrite via /api/store (403 systématique), réponse jamais vérifiée (échec silencieux affiché comme un succès), endpoint absent du contrat. À utiliser dès qu'une fonction (Stripe, réseaux sociaux, checkout) « ne marche pas ».",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          rule: { type: 'string', enum: ['missing_auth', 'protected_write', 'protected_read', 'unchecked_response', 'unknown_endpoint'], description: 'Filtrer sur une règle' },
+          onlyFixable: { type: 'boolean', description: 'Ne garder que les findings avec correctif automatique' }
+        }
+      },
+      async run(args) {
+        const { scanSources } = await import('./diagnostics');
+        const report = scanSources();
+        let findings = report.findings;
+        if (args.rule) findings = findings.filter(f => f.rule === args.rule);
+        if (args.onlyFixable) findings = findings.filter(f => Boolean(f.fix));
+        return {
+          scannedFiles: report.scannedFiles,
+          apiCalls: report.apiCalls,
+          count: findings.length,
+          byRule: report.byRule,
+          findings: findings.slice(0, 20).map(f => ({
+            id: f.id, rule: f.rule, severity: f.severity,
+            location: `${f.file}:${f.line}`, endpoint: f.endpoint,
+            httpStatus: f.httpStatus, message: f.message,
+            autoFix: f.fix ? f.fix.kind : null
+          })),
+          nextStep: findings.length > 0
+            ? "Corriger avec code_fix (confirmation requise) — un correctif à la fois, puis re-scan."
+            : 'Aucune erreur d’intégration détectée : le problème est ailleurs (configuration → stripe_doctor).'
+        };
+      }
+    },
+    {
+      name: 'code_fix',
+      description: "APPLIQUE le correctif d'un finding du docteur de code (injection de l'en-tête Authorization + import manquant, ou garde `res.ok`). Le fichier original est sauvegardé dans .dig-doctor/ avant écriture, puis le scan est rejoué. Confirmation obligatoire.",
+      access: 'destructive',
+      requiresConfirmation: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Identifiant du finding (retourné par code_scan)' },
+          confirm: { type: 'boolean', description: 'Confirmation explicite obligatoire' }
+        },
+        required: ['id']
+      },
+      async run(args) {
+        const { applyFix } = await import('./diagnostics');
+        const id = str(args.id, 120);
+        const result = applyFix(id);
+        if (!result.applied) throw new Error(result.reason || 'Correctif non appliqué.');
+        return {
+          applied: true,
+          file: result.file,
+          line: result.line,
+          rule: result.rule,
+          backup: result.backup,
+          remainingFindings: result.remainingFindings,
+          note: 'Relancer code_scan pour vérifier ; un `npm run build` est nécessaire pour publier le correctif.'
+        };
+      }
+    },
+    {
+      name: 'stripe_doctor',
+      description: "Diagnostic Stripe runtime : source de la clé (env/base), format (sk_live_/sk_test_ — une clé pk_ est refusée par Stripe), cohérence mode déclaré vs clé, secret de webhook, devise ISO, conflit DEMO_CHECKOUT, produits publiés sans prix. JAMAIS de secret en clair (masquage).",
+      access: 'read',
+      parameters: { type: 'object', properties: {} },
+      async run() {
+        const products = await readList('dpf_app_v2_products');
+        const { stripeDoctor, probeStripeApi } = await import('./diagnostics');
+        const envKey = (process.env.STRIPE_SECRET_KEY || '').trim();
+        const envWhsec = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+        const dbKey = String((await kvGet('df_stripe_sk')) || '').replace(/^"|"$/g, '').trim();
+        const dbWhsec = String((await kvGet('df_stripe_whsec')) || '').replace(/^"|"$/g, '').trim();
+        const report = stripeDoctor({
+          envKey, dbKey, envWhsec, dbWhsec,
+          mode: String((await kvGet('df_stripe_mode')) || 'test'),
+          currency: String((await kvGet('df_stripe_currency')) || 'EUR'),
+          demoCheckout: (process.env.DEMO_CHECKOUT || '').trim(),
+          products,
+          publicUrl: (process.env.PUBLIC_URL || '').trim(),
+          apiProbe: await probeStripeApi()
+        });
+        return {
+          ok: report.ok,
+          effective: report.effective,
+          checks: report.checks,
+          nextStep: report.ok
+            ? 'Configuration Stripe cohérente : si le paiement échoue encore, lancer code_scan (erreur d’intégration client) puis vérifier le webhook dans le dashboard Stripe.'
+            : 'Corriger les points en statut fail avant de re-tester un paiement.'
+        };
+      }
     }
   ];
 }

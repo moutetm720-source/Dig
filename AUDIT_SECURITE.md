@@ -34,7 +34,7 @@
 1. **Révoquer/rotater** : clé Stripe `sk` + `whsec` (exposées par l'ancien `GET /api/store`), tokens Telegram/API des canaux, clé Gemini, clé IndexNow, mot de passe DB.
 2. **Purger l'historique Git** (`git filter-repo`) : passcode `2026`, proxy Stripe, backup.tar.gz et scripts `fix_*.cjs`/`test-*.js` y restent visibles.
 3. **Définir `MODERATOR_PASSCODE` en variable d'env** du déploiement (recommandé) ; sinon le passcode auto-généré (log serveur au 1er démarrage) est utilisé.
-4. Période suivante : vraie auth par utilisateur (Supabase Auth / sessions) au lieu du passcode partagé ; commandes créées **côté serveur** par le webhook signé (livraison 100 % serveur) ; vraie confirmation on-chain du paiement crypto ; CSP.
+4. Période suivante : **vraie auth par utilisateur** (Supabase Auth / sessions) au lieu du passcode partagé — c'est le seul point de cette liste encore ouvert. Les commandes créées **côté serveur** (P2-1), la confirmation **on-chain** du paiement crypto (P2-3) et la **CSP** (P2-4) sont implémentées et couvertes par la suite de régression.
 
 Légende : 🔴 Critique · 🟠 Haute · 🟡 Moyenne · 🔵 Faible
 
@@ -460,6 +460,58 @@ au runtime (sans redéploiement).
 - Le mode mock du fournisseur détermine de façon déterministe ces 4 actions
   (règles 12-15) pour tester la boucle complète sans réseau/clé.
 
+## P4. DOCTEUR DE CODE — agent de détection/correction des erreurs d'intégration (2026-09-04)
+
+**Constat** : le durcissement sécurité (C1/C2/H2) a rendu plusieurs endpoints
+`requireAuth` et plusieurs clés KV protégées — **sans mettre à jour tous les
+appelants côté client**. Résultat utilisateur : « les fonctions Stripe ne
+marchent pas », alors que le serveur est sain.
+
+**Bugs réels trouvés et corrigés** (tous reproduits, puis re-vérifiés à 0) :
+
+| Fichier | Bug | Effet réel | Correctif |
+|---|---|---|---|
+| `IntegrationsView.tsx` (test clé Stripe) | `POST /api/checkout/verify-keys` appelé **sans** `Authorization` | **401 systématique** → « La vérification de la clé Stripe a échoué » | en-tête `Bearer` + message explicite si 401 |
+| `IntegrationsView.tsx` (enregistrement Stripe/crypto/passcode) | réponse `fetch` **jamais vérifiée**, succès affiché dans tous les cas | config jamais enregistrée côté serveur (401/403) mais « mise à jour » à l'écran → tunnel de paiement HS | `res.ok` vérifié, erreur affichée et journalisée |
+| `socialIntegrationsService.ts` | `GET /api/store/get?key=df_social_integrations_v1` | **403 systématique** (clé protégée en lecture) | nouvel endpoint authentifié `GET /api/integrations/social` |
+| `socialIntegrationsService.ts` | `POST /api/store { df_social_integrations_v1 }` | **403 systématique** (clé protégée en écriture) | `POST /api/integrations/social` |
+| `socialIntegrationsService.ts` | `verify-connection` / `publish-test-post` sans `Authorization` | **401 systématique** | en-tête `Bearer` + `res.ok` |
+| `channelOrchestrator.ts` | dispatch webhook en fire-and-forget (`.catch(() => {})`) | échec invisible, canal marqué « envoyé » | échec journalisé (`warn`) |
+| `StorefrontView.tsx` | `verify-session` sans `res.ok` | 429/5xx traité comme « paiement non confirmé » | garde `res.ok` + nouvelle tentative (4 × 2,5 s) |
+
+**Ce qui a été ajouté** (`hermes/diagnostics.ts`, agent `code_doctor`) :
+
+1. **`API_CONTRACT`** — contrat des endpoints (auth requise ou non, critique ou
+   non). `verify-diagnostics.mjs` le compare aux routes réelles de `server.ts`
+   (auth comprise) : toute dérive fait échouer la suite.
+2. **`scanSources()`** — analyse statique des `fetch('/api/…')` du client :
+   `missing_auth` (401), `protected_write` / `protected_read` (403),
+   `unchecked_response` (échec silencieux), `unknown_endpoint`.
+3. **`applyFix()`** — correctifs mécaniques whitelisted : injection de
+   `Authorization: getAuthBearer()` (+ import ajouté si absent) et garde
+   `res.ok`. Fichier original sauvegardé dans `.dig-doctor/`, re-scan de
+   contrôle, **jamais d'offset périmé** (le scan est rejoué à chaque correctif).
+4. **`stripeDoctor()`** — diagnostic runtime : source de la clé (env/base),
+   format (`sk_live_`/`sk_test_` — une clé `pk_…` est refusée), cohérence mode
+   déclaré vs clé, secret de webhook, devise ISO (alerte devises sans
+   décimales), conflit `DEMO_CHECKOUT`, produits publiés sans prix.
+   **Aucune clé en clair** (masquage) → le résultat peut aller au LLM et à l'UI.
+   Une **sonde réseau** (`probeStripeApi`) distingue enfin « clé invalide » de
+   « le serveur ne peut pas joindre `api.stripe.com` » (egress/DNS/proxy) : dans
+   ce second cas `create-session` répond **502 + `stripeUnreachable`** avec la
+   cause (`ECONNRESET`, `ENOTFOUND`…) au lieu d'un `fetch failed` opaque.
+5. **Exposition** : skills Hermes `code_scan` (lecture), `stripe_doctor`
+   (lecture), `code_fix` (**destructif, confirmation obligatoire**) ; endpoints
+   authentifiés `GET /api/diagnostics/scan`, `GET /api/diagnostics/stripe`,
+   `POST /api/diagnostics/fix` (dry-run par défaut, écriture sur `confirm:true`).
+
+**Vérifié** : `scripts/verify-diagnostics.mjs` → **40/40 PASS** — contrat ↔
+`server.ts`, 401 sur les 5 nouveaux endpoints protégés, scan du dépôt réel à
+**0 finding**, diagnostic Stripe (clé absente / `pk_…` / mode incohérent /
+devise invalide / masquage), aller-retour `/api/integrations/social` avec la clé
+toujours 403 via `/api/store`, et le scénario **détection → correction →
+re-scan à 0** sur fixture (TSX toujours valide via esbuild, 3 sauvegardes).
+
 ## Risques résiduels acceptés (documentés)
 
 1. **Messages d'erreur** : certains détails d'erreurs Stripe/DB peuvent
@@ -489,6 +541,10 @@ au runtime (sans redéploiement).
 ```bash
 export PORT=3211
 export DB_HOST=127.0.0.1 DB_USER=postgres DB_PASSWORD=*** DB_NAME=applet
+export DB_SSL=disable                            # base LOCALE sans TLS : en prod,
+                                                 # db.ts impose sinon ssl=require
+                                                 # (inutile sur Render : DATABASE_URL
+                                                 #  contient déjà ?sslmode=require)
 export SESSION_SECRET=$(openssl rand -hex 32)   # OBLIGATOIRE en prod
 export MODERATOR_PASSCODE=***                    # recommandé (s'impose à l'UI)
 export DEMO_CHECKOUT=1                            # seulement SANS Stripe
@@ -512,15 +568,24 @@ optionnels (Hermes tourne aussi sur le pool de fournisseurs géré au runtime).
 - `scripts/verify-security.mjs` — **43 tests** : store KV (9), tunnel paiement
   (2), anti-SSRF (4), webhook signé (3), endpoints modérateur (3), rate-limit
   (1), proxy Stripe (1), **auth token (5)**, **commandes serveur/démo (7)**,
-  **crypto on-chain fail-safe (8)**.
-- `scripts/verify-hermes.mjs` — **54 tests** du moteur Hermes v5 (fournisseur
+  **crypto on-chain fail-safe (8)**. Gère les pauses 429 (webhooks 10/min,
+  crypto 10/5 min, auth 10/10 min) → rejouable à la suite ; redémarrer le
+  serveur remet les compteurs à zéro et évite les pauses.
+- `scripts/verify-hermes.mjs` — **53 tests** du moteur Hermes v5 (fournisseur
   `HERMES_PROVIDER=mock`, base seedée par `start-test-pg.mjs`) : registres
-  (38 skills / 9 agents), auth, boucle outil réelle (prix/suppression/création
+  (41 skills / 10 agents), auth, boucle outil réelle (prix/suppression/création
   vérifiés en base), confirmation des actions sensibles, PII, audit,
   **agent internet** (KB free-for.dev + free-llm-apis offline, web_fetch réel,
   web_search honnête), cycle autonome, 429, et **gestionnaire d'API & tokens**
   (pool multi-fournisseurs : bascule automatique cassé→mock, clés masquées,
   clés KV protégées 403, anti-SSRF baseUrl + exception Ollama, Hermes pilote le
   pool via 4 skills). Gère les pauses 429 (fenêtre IA 6/min).
-- `npm run build` — bundle production OK (1817 modules).
+- `scripts/verify-diagnostics.mjs` — **40 tests** du docteur de code :
+  contrat `API_CONTRACT` ↔ routes réelles de `server.ts` (anti-dérive), 401 sur
+  les endpoints protégés, scan du dépôt réel à 0 finding, diagnostic Stripe
+  (clé absente/`pk_…`/mode incohérent/devise invalide/masquage), aller-retour
+  `/api/integrations/social`, scénario détection→correction→re-scan sur fixture,
+  et boucle réelle de l'agent `code_doctor` (skills exécutés, `code_fix` soumis à
+  confirmation).
+- `npm run build` — bundle production OK (1815 modules).
 - `tsc --noEmit` — zéro erreur (serveur + client).

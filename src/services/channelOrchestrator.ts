@@ -401,7 +401,17 @@ class ChannelOrchestratorService {
               productTitle: product.title,
               price: product.pricing?.recommendedPrice || 29
             })
-          }).catch(() => {});
+          })
+            .then(async (r) => {
+              // Un dispatch refusé (401/403/500) ne doit plus passer inaperçu.
+              if (!r.ok) {
+                const d = await r.json().catch(() => ({} as any));
+                throw new Error((d as any)?.error || `HTTP ${r.status}`);
+              }
+            })
+            .catch((err: any) => {
+              store.addLog('warn', 'agent', `Webhook ${channel.name} non dispatché : ${err?.message || err}`);
+            });
         } catch (e) {}
       }
 

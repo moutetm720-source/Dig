@@ -263,6 +263,25 @@ class MockProvider implements LLMProvider {
       return { toolCalls: [{ name: 'catalog_create', args: { title, price, category: 'IA & Productivité', format: 'prompt_pack' } }] };
     }
 
+    // 4b) DOCTEUR DE CODE — « Stripe ne marche pas » → diagnostic de la config
+    if (/(stripe|paiement|checkout|webhook)/.test(prompt)
+      && /(marche pas|ne fonctionne pas|fonctionne pas|erreur|[ée]chec|cass[ée]|probl[èe]me|diagnostique?|v[ée]rifie|invalid)/.test(prompt)) {
+      return { toolCalls: [{ name: 'stripe_doctor', args: {} }] };
+    }
+
+    // 4c) DOCTEUR DE CODE — « scanne le code / erreurs 401 / intégration » → code_scan
+    if (/(scan|scanne|docteur|code_doctor|401|403|int[ée]gration)/.test(prompt)
+      && /(code|api|client|[ée]cran|endpoint|appel|fonction)/.test(prompt)) {
+      return { toolCalls: [{ name: 'code_scan', args: {} }] };
+    }
+
+    // 4d) DOCTEUR DE CODE — « corrige/répare le finding <id> » → code_fix
+    // (sans confirm → le moteur exige une confirmation explicite)
+    const fixMatch = prompt.match(/\b((?:missing_auth|protected_write|protected_read|unchecked_response|unknown_endpoint)-[a-z0-9]{4,})\b/);
+    if (fixMatch && /(corrige|corrig|r[ée]pare|fix|applique)/.test(prompt)) {
+      return { toolCalls: [{ name: 'code_fix', args: { id: fixMatch[1] } }] };
+    }
+
     // 5) Audit → outil audit_system
     if (prompt.includes('audit') || prompt.includes('statut') || prompt.includes('diagnostic')) {
       return { toolCalls: [{ name: 'audit_system', args: {} }] };
