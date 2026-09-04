@@ -65,6 +65,27 @@ export interface HermesMessage {
   isAutonomous?: boolean;
 }
 
+export interface HermesAutonomyReport {
+  at: string;
+  trigger: string;
+  provider: string;
+  ms: number;
+  report: string;
+  actions: Array<{ tool: string; status: string; summary: string }>;
+  recommendations: string[];
+  anomalies: string[];
+}
+
+export interface HermesAutonomyState {
+  enabled: boolean;
+  intervalMinutes: number;
+  lastRunAt: string | null;
+  lastReportAt: string | null;
+  runs: number;
+  running: boolean;
+  recent: HermesAutonomyReport[];
+}
+
 export interface HermesAgentState {
   agentId: string;
   isAutonomousEnabled: boolean;
@@ -72,6 +93,8 @@ export interface HermesAgentState {
   lastAutonomousRun: string | null;
   status: 'idle' | 'thinking' | 'executing' | 'error';
   serverStatus: HermesServerStatus | null;
+  /** État de l'autonomie SERVEUR (source de vérité : /api/hermes/autonomy). */
+  autonomy: HermesAutonomyState | null;
   messages: HermesMessage[];
 }
 
@@ -108,6 +131,7 @@ class HermesAgentService {
       lastAutonomousRun: null,
       status: 'idle',
       serverStatus: null,
+      autonomy: null,
       messages: []
     };
     // On ne restaure que les préférences locales (jamais d'état factice)
@@ -123,7 +147,7 @@ class HermesAgentService {
         {
           id: 'welcome-1',
           sender: 'hermes',
-          content: `👋 **Je suis Hermes Agent v4** — un moteur d'agent réel qui tourne sur votre serveur.\n\nJ'ai **29 compétences** (créer/publier des produits, re-pricing, SEO, diffusion sur vos canaux, audit, maintenance) et **7 agents spécialisés** que je peux dispatcher. Chaque action est exécutée côté serveur, tracée dans le journal d'audit, et les actions sensibles demandent votre confirmation.\n\n*Que puis-je faire pour votre fabrique ?*`,
+          content: `👋 **Je suis Hermes** — un moteur d'agent réel qui tourne sur votre serveur.\n\nJ'ai **47 compétences** (boutique, pricing, SEO, canaux, audit, docteur de code, **harvest GitHub**, **liens de la plateforme**, **référentiels locaux**) et **10 agents spécialisés** que je peux dispatcher. Je tourne aussi en **autonomie serveur** (cycles planifiés, brouillons, journal) — onglet *Autonomie Server*. Chaque action sensible demande votre confirmation.\n\n*Que puis-je faire pour votre fabrique ?*`,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         }
       ];
@@ -131,6 +155,7 @@ class HermesAgentService {
 
     this.startAutoLoopIfNeeded();
     void this.loadServerStatus();
+    void this.loadAutonomy();
   }
 
   private getDefaultState(): HermesAgentState {
@@ -141,6 +166,7 @@ class HermesAgentService {
       lastAutonomousRun: null,
       status: 'idle',
       serverStatus: null,
+      autonomy: null,
       messages: []
     };
   }
@@ -193,65 +219,119 @@ class HermesAgentService {
   }
 
   public toggleAutonomy(enabled?: boolean) {
-    this.state.isAutonomousEnabled = enabled !== undefined ? enabled : !this.state.isAutonomousEnabled;
+    const next = enabled !== undefined ? enabled : !this.state.isAutonomousEnabled;
+    this.state.isAutonomousEnabled = next;
     this.notify();
-    this.startAutoLoopIfNeeded();
+    void this.saveAutonomy({ enabled: next });
   }
 
   public setAutoInterval(minutes: number) {
     this.state.autonomousIntervalMinutes = minutes;
     this.notify();
-    this.startAutoLoopIfNeeded();
+    void this.saveAutonomy({ intervalMinutes: minutes });
   }
 
+  /** Sauvegarde la config d'autonomie côté SERVEUR (source de vérité) puis resynchronise. */
+  private async saveAutonomy(patch: { enabled?: boolean; intervalMinutes?: number }) {
+    try {
+      const res = await api('/api/hermes/autonomy', { method: 'POST', body: JSON.stringify(patch) });
+      if (res.ok) await this.loadAutonomy();
+    } catch { /* serveur indisponible — l'état local reste en miroir, resynchronisé au prochain load */ }
+  }
+
+  /** Lit l'état d'autonomie SERVEUR (config + dernier cycle + derniers rapports). */
+  public async loadAutonomy(): Promise<void> {
+    try {
+      const res = await api('/api/hermes/autonomy');
+      if (!res.ok) return;
+      const data = await res.json();
+      const cfg = data.config || {};
+      this.state.autonomy = {
+        enabled: !!cfg.enabled,
+        intervalMinutes: cfg.intervalMinutes || 30,
+        lastRunAt: cfg.lastRunAt || null,
+        lastReportAt: cfg.lastReportAt || null,
+        runs: cfg.runs || 0,
+        running: !!data.running,
+        recent: Array.isArray(data.recent) ? data.recent : []
+      };
+      this.state.isAutonomousEnabled = !!cfg.enabled;
+      if (cfg.intervalMinutes) this.state.autonomousIntervalMinutes = cfg.intervalMinutes;
+      if (cfg.lastRunAt) this.state.lastAutonomousRun = cfg.lastRunAt;
+      this.notify();
+    } catch { /* serveur indisponible */ }
+  }
+
+  /**
+   * Le cycle autonome tourne désormais SUR LE SERVEUR (hermes/autonomy.ts) —
+   * même navigateur fermé. Le client ne fait que poller l'état (config,
+   * journal) toutes les 60 s.
+   */
   private startAutoLoopIfNeeded() {
     if (this.autoLoopTimer) {
       clearInterval(this.autoLoopTimer);
       this.autoLoopTimer = null;
     }
-    if (this.state.isAutonomousEnabled) {
-      const ms = Math.max(1, this.state.autonomousIntervalMinutes) * 60 * 1000;
-      this.autoLoopTimer = setInterval(() => {
-        void this.runAutonomousNow(true);
-      }, ms);
-    }
+    this.autoLoopTimer = setInterval(() => {
+      void this.loadAutonomy();
+    }, 60_000);
   }
 
-  /** Cycle autonome réel (agent security_auditor) — silencieux s'il n'y a pas de fournisseur IA. */
+  /**
+   * Cycle autonome réel — exécuté SUR LE SERVEUR (observation → plan → actions
+   * sûres → rapport journalisé). Avec LLM : plan d'actions intelligent ; sans
+   * LLM : cycle déterministe sur données réelles (jamais de simulation).
+   */
   public async runAutonomousNow(silentIfEmpty = false): Promise<string | null> {
     if (this.state.status === 'thinking') return null;
     this.state.status = 'executing';
     this.notify();
     try {
-      const res = await api('/api/hermes/autonomous-loop', { method: 'POST' });
-      if (!res.ok) return null;
+      const res = await api('/api/hermes/autonomy/run', { method: 'POST' });
+      if (res.status === 409) {
+        if (!silentIfEmpty) {
+          this.state.messages.push({
+            id: `auto-${Date.now()}`,
+            sender: 'system',
+            content: `⏳ **Cycle autonome** : un cycle est déjà en cours, réessaie dans un instant.`,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          });
+        }
+        return null;
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      this.state.lastAutonomousRun = new Date().toISOString();
-      if (data.insight) {
+      const r = data.report || {};
+      this.state.lastAutonomousRun = r.at || new Date().toISOString();
+      if (r.report) {
         this.state.messages.push({
           id: `auto-${Date.now()}`,
           sender: 'hermes',
-          content: `🤖 **Cycle autonome Hermes v4** (${data.agent || 'security_auditor'})\n\n${data.insight}`,
+          content: `🤖 **Cycle autonome Hermes (serveur)** ${r.provider ? `— ${r.provider}` : ''}\n\n${r.report}`,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          agent: data.agent,
-          provider: data.provider,
-          steps: data.steps,
+          agent: 'autonomy',
+          provider: r.provider,
+          steps: (r.actions || []).map((a: any) => ({
+            tool: a.tool,
+            status: a.status === 'ok' ? 'ok' : a.status === 'error' ? 'error' : 'denied',
+            summary: a.summary
+          })),
           isAutonomous: true
         });
-        store.addLog('info', 'agent', `[Hermes autonome] ${String(data.insight).slice(0, 100)}…`);
-        return data.insight;
+        store.addLog('info', 'agent', `[Hermes autonome] ${String(r.report).replace(/\s+/g, ' ').slice(0, 120)}…`);
       }
+      await this.loadAutonomy();
+      return r.report || null;
+    } catch (e: any) {
+      console.warn('Hermes autonomous cycle error', e);
       if (!silentIfEmpty) {
         this.state.messages.push({
-          id: `auto-${Date.now()}`,
+          id: `auto-err-${Date.now()}`,
           sender: 'system',
-          content: `⚙️ **Cycle autonome** : exécuté, mais aucun insight produit — ${data.reason || 'aucun fournisseur IA configuré'}.`,
+          content: `⚠️ **Cycle autonome** : ${e?.message || 'erreur serveur'} — vérifie ta session modérateur.`,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         });
       }
-      return null;
-    } catch (e) {
-      console.warn('Hermes autonomous loop error', e);
       return null;
     } finally {
       this.state.status = 'idle';

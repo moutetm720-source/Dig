@@ -72,6 +72,28 @@ async function reseed() {
   // Remplace le catalogue (supprime au passage les prod-hermes-* des runs précédents)
   await sql`INSERT INTO key_value_store (key, value) VALUES ('dpf_app_v2_products', ${JSON.stringify(products)}::jsonb)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
+  // Canaux + kits affiliés (pour platform_links / platform_overview)
+  const integrations = [
+    { id: 'int-stripe', name: 'Stripe Payments', service: 'stripe', connected: true, statusText: 'Connected', lastSync: new Date().toISOString(), config: { webhookEndpoint: '/api/webhooks/stripe' } },
+    { id: 'int-discord', name: 'Discord', service: 'discord', connected: true, statusText: 'Connected', lastSync: new Date().toISOString(), config: { webhookUrl: 'https://discord.com/api/webhooks/123/abcd' } }
+  ];
+  await sql`INSERT INTO key_value_store (key, value) VALUES ('dpf_app_v2_integrations', ${JSON.stringify(integrations)}::jsonb)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
+  // Harvest GitHub seedé (pour repos_list / repos_get / cycle autonome)
+  const githubRepos = [
+    { id: 'gh_1', name: 'crewAI', fullName: 'joaomdmoura/crewAI', owner: 'joaomdmoura', description: 'Framework for orchestrating role-playing, autonomous AI agents.', url: 'https://github.com/joaomdmoura/crewAI', stars: 28400, forks: 3400, language: 'Python', topics: ['ai-agents', 'multi-agent-systems'], license: 'MIT', techStack: ['Python'], suggestedProductType: 'pro_kit', monetizationAngle: 'Turn into a turnkey Multi-Agent Production Architecture Toolkit with pre-configured YAML roles.', commercialViabilityScore: 96, status: 'scanned', scannedAt: new Date().toISOString() },
+    { id: 'gh_2', name: 'shadcn-ui', fullName: 'shadcn-ui/ui', owner: 'shadcn', description: 'Beautifully designed components that you can copy and paste into your apps.', url: 'https://github.com/shadcn-ui/ui', stars: 76500, forks: 6900, language: 'TypeScript', topics: ['react', 'tailwind'], license: 'MIT', techStack: ['Next.js'], suggestedProductType: 'template', monetizationAngle: 'Package into an Ultimate SaaS UI & Admin Dashboard Design System.', commercialViabilityScore: 98, status: 'scanned', scannedAt: new Date().toISOString() }
+  ];
+  await sql`INSERT INTO key_value_store (key, value) VALUES ('df_github_repositories', ${JSON.stringify(githubRepos)}::jsonb)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
+  const kits = [
+    { id: 'kit-test-1', productTitle: 'Guide IA Automatisation', affiliateCode: 'HERMES10', affiliateTrackingUrl: 'https://boutique-digitale.fr/p/prod-test-1?ref=hermes10&discount=10', createdAt: new Date().toISOString() }
+  ];
+  await sql`INSERT INTO key_value_store (key, value) VALUES ('df_affiliate_promo_kits_v1', ${JSON.stringify(kits)}::jsonb)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
+  // État auto-pilot client (synchronisé) pour platform_overview
+  await sql`INSERT INTO key_value_store (key, value) VALUES ('df_auto_pilot_enabled_v1', ${JSON.stringify(true)}::jsonb)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`;
   await sql.end();
 }
 
@@ -96,6 +118,7 @@ async function reseed() {
   r = await req('GET', '/api/hermes/skills');
   const skillNames = (r.json.skills || []).map(s => s.name);
   check('skills → registre complet (catalogue, pricing, contenu, canaux, ventes, système, internet)', ['catalog_create', 'catalog_set_price', 'catalog_delete', 'publish_product', 'pricing_audit', 'content_create', 'seo_update', 'channels_dispatch', 'metrics_summary', 'orders_recent', 'audit_system', 'kv_set', 'dispatch_agent', 'web_search', 'web_fetch', 'web_link_check', 'free_tier_lookup', 'free_llm_lookup', 'providers_list', 'providers_add', 'providers_remove', 'providers_test'].every(s => skillNames.includes(s)), `${skillNames.length} skills`);
+  check('skills → registres plateforme (repos GitHub, référentiels, liens, vue globale) présents', ['repos_list', 'repos_get', 'repos_harvest', 'reference_repos', 'platform_links', 'platform_overview'].every(s => skillNames.includes(s)), `${skillNames.length} skills`);
 
   console.log('\n═══ HERMES V4 — Sécurité ═══');
 
@@ -185,6 +208,87 @@ async function reseed() {
   check('synergy SANS auth → 401 (régression phase 1)', r.status === 401, `HTTP ${r.status}`);
   r = await req('POST', '/api/obliteratus/ablate', { body: { modelName: 'x' } });
   check('module OBLITERATUS factice retiré → 410 Gone', r.status === 410, `HTTP ${r.status}`);
+
+  console.log('\n\u2550\u2550\u2550 HERMES V5 \u2014 Repos GitHub, liens & r\u00e9f\u00e9rentiels (Hermes \u00ab voit \u00bb la plateforme) \u2550\u2550\u2550');
+
+  // R1 : repos_list \u2014 le harvest GitHub (df_github_repositories) est VISIBLE par Hermes
+  r = await aiChat('liste les repos github harvest\u00e9s');
+  let rStep = (r.json.steps || []).find(s => s.tool === 'repos_list');
+  check('chat \u00ab liste les repos \u00bb \u2192 skill repos_list ex\u00e9cut\u00e9e', r.status === 200 && rStep && rStep.status === 'ok', JSON.stringify(rStep || {}).slice(0, 120));
+  check('repos_list \u2192 repos r\u00e9els du harvest (crewAI/shadcn seed\u00e9s)', /crewAI|shadcn/i.test(r.json.response || '') || /crewAI|shadcn/i.test(JSON.stringify(r.json.steps || [])), (r.json.response || '').slice(0, 80).replace(/\n/g, ' '));
+
+  // R2 : repos_get \u2014 d\u00e9tail d\u2019un repo par nom
+  r = await aiChat('d\u00e9tail du repo crewAI');
+  rStep = (r.json.steps || []).find(s => s.tool === 'repos_get');
+  check('chat \u00ab d\u00e9tail du repo crewAI \u00bb \u2192 skill repos_get (id crewAI)', r.status === 200 && rStep && rStep.status === 'ok' && /crewAI/i.test(JSON.stringify(rStep.args || rStep.summary || {})), JSON.stringify(rStep || {}).slice(0, 120));
+
+  // R3 : repos_harvest \u2014 veille GitHub LIVE (r\u00e9seau sandbox ; \u00e9chec honn\u00e8te accept\u00e9)
+  r = await aiChat('fais une veille github sur nextjs boilerplate');
+  rStep = (r.json.steps || []).find(s => s.tool === 'repos_harvest');
+  check('chat \u00ab veille github \u00bb \u2192 skill repos_harvest (ok OU \u00e9chec r\u00e9seau signal\u00e9 honn\u00eatement)', r.status === 200 && rStep && (rStep.status === 'ok' || /GitHub|r\u00e9seau|indispo|timeout|API|quota/i.test(rStep.summary || '')), JSON.stringify(rStep || {}).slice(0, 140));
+  if (rStep && rStep.status === 'ok') {
+    let storeKv = await req('GET', '/api/store');
+    let reposKv = (storeKv.json || []).filter(x => x.key === 'df_github_repositories');
+    check('repos_harvest \u2192 repos R\u00c9ELLEMENT ajout\u00e9s au harvest (KV serveur, d\u00e9doublonn\u00e9s)', reposKv.length > 0 && Array.isArray(reposKv[0].value) && reposKv[0].value.length >= 2, reposKv[0] ? `${reposKv[0].value.length} repos` : 'KV absente');
+  }
+
+  // R4 : reference_repos \u2014 submodules locaux (OBLITERATUS, awesome-*)
+  r = await aiChat('liste les r\u00e9f\u00e9rentiels locaux');
+  rStep = (r.json.steps || []).find(s => s.tool === 'reference_repos');
+  check('chat \u00ab r\u00e9f\u00e9rentiels locaux \u00bb \u2192 skill reference_repos ex\u00e9cut\u00e9e', r.status === 200 && rStep && rStep.status === 'ok', JSON.stringify(rStep || {}).slice(0, 140));
+
+  // R5 : platform_links \u2014 inventaire des liens + destinations canaux masqu\u00e9es
+  r = await aiChat('liste les liens de la plateforme');
+  rStep = (r.json.steps || []).find(s => s.tool === 'platform_links');
+  check('chat \u00ab liens de la plateforme \u00bb \u2192 skill platform_links ex\u00e9cut\u00e9e', r.status === 200 && rStep && rStep.status === 'ok', JSON.stringify(rStep || {}).slice(0, 120));
+  check('platform_links \u2192 sitemap.xml dans le r\u00e9sultat', /sitemap\.xml/.test(JSON.stringify(r.json.steps || [])), '');
+
+  // R6 : platform_overview \u2014 la vue globale en un appel
+  r = await aiChat('vue globale de la plateforme');
+  rStep = (r.json.steps || []).find(s => s.tool === 'platform_overview');
+  check('chat \u00ab vue globale \u00bb \u2192 skill platform_overview ex\u00e9cut\u00e9e', r.status === 200 && rStep && rStep.status === 'ok', JSON.stringify(rStep || {}).slice(0, 120));
+
+  // R7 : /status enrichi (repos, autonomie)
+  r = await req('GET', '/api/hermes/status');
+  check('status \u2192 reposCount + autonomie + skills \u2265 45', r.status === 200 && typeof r.json.reposCount === 'number' && r.json.autonomy && typeof r.json.autonomy.enabled === 'boolean' && r.json.skillsCount >= 45, JSON.stringify({ repos: r.json.reposCount, skills: r.json.skillsCount, auto: r.json.autonomy }));
+
+  console.log('\n\u2550\u2550\u2550 HERMES V5 \u2014 Autonomie serveur (cycles planifi\u00e9s, actions s\u00fbres, journal) \u2550\u2550\u2550');
+
+  // A1 : lecture de la config
+  r = await req('GET', '/api/hermes/autonomy', A);
+  check('GET /autonomy (auth) \u2192 config + journal', r.status === 200 && r.json.config && typeof r.json.config.enabled === 'boolean' && r.json.config.intervalMinutes >= 5, JSON.stringify(r.json.config || {}));
+  r = await req('GET', '/api/hermes/autonomy');
+  check('GET /autonomy SANS auth \u2192 401', r.status === 401, `HTTP ${r.status}`);
+
+  // A2 : validation des bornes + pause
+  r = await req('POST', '/api/hermes/autonomy', { body: { intervalMinutes: 1 }, ...A });
+  check('POST /autonomy intervalMinutes=1 \u2192 400 (min 5)', r.status === 400, `HTTP ${r.status}`);
+  r = await req('POST', '/api/hermes/autonomy', { body: { enabled: false }, ...A });
+  check('POST /autonomy {enabled:false} \u2192 mis \u00e0 jour', r.status === 200 && r.json.config && r.json.config.enabled === false);
+
+  // A3 : cycle manuel \u2192 rapport R\u00c9EL (mock = mode d\u00e9terministe, z\u00e9ro simulation)
+  r = await aiPost('/api/hermes/autonomy/run', {});
+  check('cycle manuel \u2192 rapport r\u00e9el (donn\u00e9es, longueur > 60)', r.status === 200 && r.json.success === true && typeof r.json.report.report === 'string' && r.json.report.report.length > 60, (r.json.report?.report || '').slice(0, 100).replace(/\n/g, ' '));
+  check('cycle \u2192 provider d\u00e9clar\u00e9 honn\u00eatement (mock/d\u00e9terministe)', /mock|d\u00e9terministe/i.test(r.json.report?.provider || ''), r.json.report?.provider || '');
+  check('cycle \u2192 actions S\u00dcbRES uniquement (jamais publish/price/delete/dispatch/kv_set)', !(r.json.report?.actions || []).some(a => /^(publish_product|catalog_set_price|catalog_delete|catalog_update|channels_dispatch|kv_set|code_fix|providers_add|email_sequence_add)$/.test(a.tool)), JSON.stringify((r.json.report?.actions || []).map(a => a.tool)));
+
+  // A4 : journal des cycles
+  r = await req('GET', '/api/hermes/autonomy/log', A);
+  check('GET /autonomy/log \u2192 cycle journalis\u00e9', r.status === 200 && r.json.count >= 1 && typeof r.json.reports[0].report === 'string', `count=${r.json.count}`);
+
+  // A5 : endpoint historique /autonomous-loop \u2192 d\u00e9l\u00e8gue au nouveau cycle
+  r = await aiPost('/api/hermes/autonomous-loop', {});
+  check('legacy /autonomous-loop \u2192 d\u00e9l\u00e8gue au nouveau cycle (insight = rapport r\u00e9el)', r.status === 200 && r.json.success === true && typeof r.json.insight === 'string' && r.json.insight.length > 30, (r.json.insight || '').slice(0, 80).replace(/\n/g, ' '));
+
+  // A6 : restauration de la config
+  r = await req('POST', '/api/hermes/autonomy', { body: { enabled: true, intervalMinutes: 30 }, ...A });
+  check('POST /autonomy {enabled:true, intervalMinutes:30} \u2192 restaur\u00e9', r.status === 200 && r.json.config.enabled === true && r.json.config.intervalMinutes === 30);
+
+  // A7 : cl\u00e9s de l\u2019autonomie PROT\u00c9G\u00c9ES de /api/store (lecture ET \u00e9criture)
+  r = await req('GET', '/api/store');
+  check('/api/store : cl\u00e9s d\u2019autonomie absentes de la liste publique', r.status === 200 && !(r.json || []).some(k => k.key === 'df_hermes_autonomy_config' || k.key === 'df_hermes_autonomy_log'));
+  r = await req('POST', '/api/store', { body: { key: 'df_hermes_autonomy_config', value: { enabled: true, intervalMinutes: 5 } }, auth: PASSCODE });
+  check('\u00e9criture (auth) de df_hermes_autonomy_config via /api/store \u2192 403', r.status === 403, `HTTP ${r.status}`);
 
   console.log('\n═══ HERMES V5 — Gestionnaire d\u2019API & tokens (pool multi-fournisseurs, jamais bloqué) ═══');
 

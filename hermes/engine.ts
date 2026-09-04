@@ -15,6 +15,9 @@
  *  - mode HONNÊTE sans LLM : données réelles + explication, zéro simulation
  */
 import crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { db } from '../src/db/db';
 import { keyValueStore } from '../src/db/schema';
 import { eq, inArray } from 'drizzle-orm';
@@ -136,21 +139,42 @@ function summarizeResult(result: any): string {
 
 async function platformContext(): Promise<string> {
   try {
-    const keys = ['dpf_app_v2_products', 'dpf_app_v2_orders', 'dpf_app_v2_integrations'];
+    const keys = [
+      'dpf_app_v2_products', 'dpf_app_v2_orders', 'dpf_app_v2_integrations',
+      'df_github_repositories', 'df_affiliate_promo_kits_v1',
+      'df_auto_pilot_enabled_v1', 'df_auto_pilot_enabled',
+      'df_auto_loop_speed_v1', 'df_auto_loop_speed',
+      'df_hermes_autonomy_config'
+    ];
     const r = await db.select().from(keyValueStore).where(inArray(keyValueStore.key, keys));
     const map: Record<string, any> = {};
     for (const row of r) {
       const v = typeof row.value === 'string' ? safeParse(row.value) : row.value;
-      map[row.key] = Array.isArray(v) ? v : [];
+      map[row.key] = Array.isArray(v) ? v : (v ?? null);
     }
     const products = map['dpf_app_v2_products'] || [];
     const orders = map['dpf_app_v2_orders'] || [];
     const integrations = map['dpf_app_v2_integrations'] || [];
+    const repos = map['df_github_repositories'] || [];
+    const kits = map['df_affiliate_promo_kits_v1'] || [];
+    const apEnabled = map['df_auto_pilot_enabled_v1'] ?? map['df_auto_pilot_enabled'] ?? null;
+    const apSpeed = map['df_auto_loop_speed_v1'] || map['df_auto_loop_speed'] || '';
+    const autonomy = map['df_hermes_autonomy_config'];
     const revenue = orders.reduce((s: number, o: any) => s + (Number(o.totalAmount) || 0), 0);
+    const topRepos = [...repos].sort((a: any, b: any) => (b.commercialViabilityScore || 0) - (a.commercialViabilityScore || 0)).slice(0, 3)
+      .map((x: any) => `${x.fullName || x.name}`);
+    const HERE = path.dirname(fileURLToPath(import.meta.url));
+    const refsReady = (() => {
+      try { return fs.readdirSync(path.join(HERE, '..', 'references')).filter(f => fs.readdirSync(path.join(HERE, '..', 'references', f)).length > 0).length; } catch { return 0; }
+    })();
     return `ÉTAT ACTUEL DE LA PLATEFORME (données serveur, ${new Date().toISOString().slice(0, 10)}) :
 - Produits : ${products.length} (dont ${products.filter((p: any) => p.status === 'published').length} publiés)
 - Commandes : ${orders.length} — CA total : ${Math.round(revenue * 100) / 100} €
 - Canaux : ${integrations.length} (dont ${integrations.filter((i: any) => i.connected).length} connectés)
+- Repos GitHub harvestés : ${repos.length}${topRepos.length ? ` (top : ${topRepos.join(', ')})` : ''} — skills repos_list/repos_get/repos_harvest
+- Liens plateforme : ${products.filter((p: any) => p.status === 'published').length} liens d'accès produits, sitemap.xml, feed.xml, ${Array.isArray(kits) ? kits.length : 0} kit(s) affilié(s) — skill platform_links
+- Auto-pilot client (bots UI) : ${apEnabled === true || apEnabled === 'true' ? 'ACTIF' : apEnabled === false || apEnabled === 'false' ? 'EN PAUSE' : 'état inconnu'}${apSpeed ? ` (${apSpeed})` : ''} — Autonomie serveur d'Hermes : ${autonomy ? (autonomy.enabled ? `ON (intervalle ${autonomy.intervalMinutes} min)` : 'OFF') : 'non configurée'}
+- Référentiels locaux (references/) : ${refsReady > 0 ? `${refsReady} initialisé(s) — skill reference_repos` : 'vides (submodules non initialisés)'}
 Skills disponibles : ${skillRegistry.map(t => t.name).join(', ')}`;
   } catch {
     return 'ÉTAT ACTUEL DE LA PLATEFORME : indisponible temporairement.';
@@ -168,6 +192,10 @@ export async function runAgentChat(opts: {
   prompt: string;
   history?: Array<{ role: 'user' | 'model'; text: string }>;
   actor: string;
+  /** Restreint les skills offertes (autonomie : périmètre sûr). */
+  allowedTools?: string[];
+  /** Bloc ajouté au system prompt (ex: consignes du cycle autonome). */
+  systemAddition?: string;
 }): Promise<HermesChatResponse> {
   const agent = getAgent(opts.agentId || 'orchestrator');
   const ctx: HermesContext = {
@@ -211,8 +239,8 @@ export async function runAgentChat(opts: {
   }
   events.push({ type: 'text', role: 'user', text: opts.prompt.slice(0, 4000) });
 
-  const tools = declareSkills(agent.skills);
-  const system = `${agent.systemPrompt}\n\n${await platformContext()}\n\nAgent en cours : ${agent.name} (${agent.id})`;
+  const tools = declareSkills(agent.skills, opts.allowedTools);
+  const system = `${agent.systemPrompt}\n\n${opts.systemAddition ? `${opts.systemAddition}\n\n` : ''}${await platformContext()}\n\nAgent en cours : ${agent.name} (${agent.id})`;
   const steps: AgentStep[] = [];
   const callCount = { n: 0 };
   let usage: { inputTokens?: number; outputTokens?: number } = {};

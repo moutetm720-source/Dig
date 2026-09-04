@@ -512,6 +512,78 @@ devise invalide / masquage), aller-retour `/api/integrations/social` avec la cl�
 toujours 403 via `/api/store`, et le scénario **détection → correction →
 re-scan à 0** sur fixture (TSX toujours valide via esbuild, 3 sauvegardes).
 
+## P5. AUTONOMIE SERVEUR + REPOS / LIENS / RÉFÉRENTIELS (2026-09-04)
+
+Le moteur Hermes est passé d'un agent « on-demand » à un **agent autonome
+planifié côté serveur**, et il « voit » désormais les actifs créés dans l'UI
+(harvest GitHub, liens, référentiels). Chaque extension reste **bornée,
+authentifiée et journalisée**.
+
+### P5.1 — Cycle autonome serveur (« autonomie sûre »)
+
+Un planificateur (`hermes/autonomy.ts`, `startAutonomyScheduler` monté dans
+`server.ts`) lance un cycle toutes les N minutes (défaut 30, **bornes 5–240**).
+Chaque cycle : **observation** (skills réelles sur données réelles) → **plan →
+actions** → **rapport** journalisé en base (`df_hermes_autonomy_log`, 20
+derniers) + entrée d'audit (`autonomy_cycle`).
+
+- **Périmètre sûr dur** : le cycle n'exécute QUE les skills de
+  `AUTONOMY_SAFE_SKILLS` (lecture + veille + création de **brouillons**).
+  Re-pricing, publication, suppression, diffusion canaux, `kv_set`,
+  `code_fix`, `providers_*` sont **structurellement exclus** du périmètre —
+  indépendamment de ce que le LLM demande. Les skills `requiresConfirmation`
+  restent bloquées par la porte de confirmation (jamais exécutées en autonomie).
+- **Anti-boucle / anti-DoS** : drapeau `running` (un seul cycle à la fois),
+  timeout 20 s par skill d'observation, budgets durs du moteur réutilisés
+  (6 pas LLM / 10 outils), `intervalMinutes` borné 5–240 (validation serveur,
+  400 en dehors).
+- **Honnêteté sans LLM** : si aucun fournisseur réel, le cycle est
+  **déterministe sur données réelles** (zéro simulation, `provider` déclaré
+  « déterministe ») — jamais de rapport inventé.
+- **Config & journal** : `GET/POST /api/hermes/autonomy`,
+  `POST /api/hermes/autonomy/run`, `GET /api/hermes/autonomy/log` — tous
+  `requireAuth` + limiteurs. Les clés `df_hermes_autonomy_config` /
+  `df_hermes_autonomy_log` sont ajoutées à `SENSITIVE_READ_KEYS` et
+  `SENSITIVE_WRITE_KEYS` : **exclues de `/api/store` en lecture et écriture,
+  même authentifiée** (403), comme le pool de fournisseurs.
+
+### P5.2 — Skills « la plateforme » (repos, référentiels, liens, vue globale)
+
+- **`repos_list` / `repos_get`** (lecture) — exposent le harvest GitHub de
+  l'UI (`df_github_repositories`, synchro client→serveur) : repos notés avec
+  angle de monétisation. `repos_get` accepte id / fullName / nom.
+- **`repos_harvest`** (écriture) — veille GitHub **live côté serveur** :
+  `api.github.com/search` (https, `assertSafeOutbound` anti-SSRF, timeout 20 s,
+  `User-Agent` dédié), **sans clé** (quota 60 req/h), **cache mémoire 30 min
+  par requête** (anti-spam de quota), `per_page` plafonné 6, note 0-99, et
+  fusion dédoublonnée (par `fullName`) dans `df_github_repositories`. Échec
+  réseau → erreur honnête (jamais de repo inventé).
+- **`reference_repos`** (lecture) — lit les submodules `references/*` en
+  **lecture seule** : état/README, liste des fichiers, lecture de fichiers
+  **texte** (`README.md`, `data.json`, …), **plafonnés 200 Ko**, et recherche
+  textuelle bornée (8 matchs). **Anti-traversée de chemin** : le chemin résolu
+  doit rester sous `references/` (`referencesPath` rejette `..`) et seuls les
+  extensions `.md/.json/.txt` sont lisibles. Submodules vides → état
+  « non initialisés » honnête.
+- **`platform_links`** (lecture) — inventaire des liens : produits
+  (`PUBLIC_URL/?product=`), `sitemap.xml`, `feed.xml`, `llms.txt`,
+  destinations de canaux **masquées** (`maskLink` : origine+chemin, tokens /
+  query effacés), kits affiliés. `check=true` teste la santé **uniquement des
+  URLs absolues** (HEAD, `assertSafeOutbound`, 10 s, max 5) — les liens
+  relatifs ne sont pas testables (signalé honnêtement).
+- **`platform_overview`** (lecture) — vue globale agrégée (boutique, canaux,
+  repos, liens, auto-pilot client, autonomie) : point de départ, **aucune PII**
+  (agrégats uniquement), **aucun secret**.
+
+**Vérifié** : `scripts/verify-hermes.mjs` → **77/77 PASS** (était 53) —
+nouveaux tests : registres plateforme, `repos_list`/`repos_get`/`repos_harvest`
+(échec réseau honnête accepté), `reference_repos`, `platform_links` (+ sitemap),
+`platform_overview`, `status` enrichi (repos/autonomie), **autonomie serveur**
+(config, 401 sans auth, validation 400, cycle manuel → rapport réel +
+provider honnête + **actions sûres uniquement**, journal, compat
+`/autonomous-loop`, clés 403 via `/api/store`). `verify-security.mjs` 43/43,
+`verify-diagnostics.mjs` 40/40, `tsc --noEmit` et `npm run build` OK.
+
 ## Risques résiduels acceptés (documentés)
 
 1. **Messages d'erreur** : certains détails d'erreurs Stripe/DB peuvent

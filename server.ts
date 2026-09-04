@@ -219,6 +219,8 @@ const SENSITIVE_READ_KEYS = new Set([
   'df_stripe_whsec',
   'df_moderator_passcode',
   'df_session_secret',
+  'df_hermes_autonomy_config',
+  'df_hermes_autonomy_log',
   'df_social_integrations_v1',
   'dpf_app_v2_orders',
   'dpf_server_orders_v1',
@@ -240,6 +242,8 @@ const SENSITIVE_READ_KEYS = new Set([
 // Les commandes serveur (dpf_server_orders_v1) et le secret de session
 // (df_session_secret) sont EXCLUSIVEMENT écrits par le serveur.
 const SENSITIVE_WRITE_KEYS = new Set([
+  'df_hermes_autonomy_config',
+  'df_hermes_autonomy_log',
   'df_social_integrations_v1',
   'df_session_secret',
   'dpf_server_orders_v1',
@@ -2315,6 +2319,12 @@ app.post('/api/agency/generate', apiLimiter, async (req, res) => {
 // Implémentation : hermes/ (providers, tools, agents, engine)
 // ==========================================
 app.use('/api/hermes', createHermesRouter({ requireAuth, aiLimiter, apiLimiter }));
+
+// Autonomie serveur d'Hermes : cycle planifié (observation → plan → actions
+// sûres → rapport journalisé). Fonctionne même si le navigateur est fermé.
+const { startAutonomyScheduler, stopAutonomyScheduler } = await import('./hermes/autonomy');
+void startAutonomyScheduler();
+process.on('SIGTERM', () => { stopAutonomyScheduler(); process.exit(0); });
 
 // =======================================================
 // OBLITERATUS — MODULE RETIRÉ (2026-09-03)
