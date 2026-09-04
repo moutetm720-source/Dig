@@ -496,12 +496,16 @@ marchent pas », alors que le serveur est sain.
    déclaré vs clé, secret de webhook, devise ISO (alerte devises sans
    décimales), conflit `DEMO_CHECKOUT`, produits publiés sans prix.
    **Aucune clé en clair** (masquage) → le résultat peut aller au LLM et à l'UI.
+   Une **sonde réseau** (`probeStripeApi`) distingue enfin « clé invalide » de
+   « le serveur ne peut pas joindre `api.stripe.com` » (egress/DNS/proxy) : dans
+   ce second cas `create-session` répond **502 + `stripeUnreachable`** avec la
+   cause (`ECONNRESET`, `ENOTFOUND`…) au lieu d'un `fetch failed` opaque.
 5. **Exposition** : skills Hermes `code_scan` (lecture), `stripe_doctor`
    (lecture), `code_fix` (**destructif, confirmation obligatoire**) ; endpoints
    authentifiés `GET /api/diagnostics/scan`, `GET /api/diagnostics/stripe`,
    `POST /api/diagnostics/fix` (dry-run par défaut, écriture sur `confirm:true`).
 
-**Vérifié** : `scripts/verify-diagnostics.mjs` → **37/37 PASS** — contrat ↔
+**Vérifié** : `scripts/verify-diagnostics.mjs` → **40/40 PASS** — contrat ↔
 `server.ts`, 401 sur les 5 nouveaux endpoints protégés, scan du dépôt réel à
 **0 finding**, diagnostic Stripe (clé absente / `pk_…` / mode incohérent /
 devise invalide / masquage), aller-retour `/api/integrations/social` avec la clé
@@ -576,7 +580,7 @@ optionnels (Hermes tourne aussi sur le pool de fournisseurs géré au runtime).
   (pool multi-fournisseurs : bascule automatique cassé→mock, clés masquées,
   clés KV protégées 403, anti-SSRF baseUrl + exception Ollama, Hermes pilote le
   pool via 4 skills). Gère les pauses 429 (fenêtre IA 6/min).
-- `scripts/verify-diagnostics.mjs` — **37 tests** du docteur de code :
+- `scripts/verify-diagnostics.mjs` — **40 tests** du docteur de code :
   contrat `API_CONTRACT` ↔ routes réelles de `server.ts` (anti-dérive), 401 sur
   les endpoints protégés, scan du dépôt réel à 0 finding, diagnostic Stripe
   (clé absente/`pk_…`/mode incohérent/devise invalide/masquage), aller-retour

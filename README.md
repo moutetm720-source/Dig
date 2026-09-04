@@ -9,7 +9,7 @@ tunnel de démo sans Stripe, et une sécurité durcie (voir [`AUDIT_SECURITE.md`
 - **Serveur** : Node.js + Express (TypeScript, `tsx`), PostgreSQL (drizzle-orm, key-value store), `server.ts`
 - **Client** : React 18 + Vite + Tailwind (`src/`)
 - **IA** : moteur d'agent Hermes (`hermes/`) — boucle tool-calling réelle, **pool multi-fournisseurs avec bascule automatique** (anti rate-limit), gestionnaire d'API & tokens pilotable par Hermes, **docteur de code** (`code_doctor`) qui détecte et corrige les erreurs d'intégration client ↔ API
-- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (53 tests, mode mock), `scripts/verify-diagnostics.mjs` (37 tests — docteur de code)
+- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (53 tests, mode mock), `scripts/verify-diagnostics.mjs` (40 tests — docteur de code)
 
 ## Démarrage
 
@@ -197,7 +197,7 @@ Le docteur de code (`hermes/diagnostics.ts`) rend ça détectable et corrigeable
 | Skill / endpoint | Rôle |
 |---|---|
 | `code_scan` · `GET /api/diagnostics/scan` | Analyse les `fetch('/api/…')` du client : 401 garanti, 403 garanti, réponse jamais vérifiée, endpoint hors contrat |
-| `stripe_doctor` · `GET /api/diagnostics/stripe` | État réel de la config Stripe : source/format de clé (une clé `pk_…` est refusée), cohérence mode live/test, webhook, devise, mode démo, prix — **jamais de secret en clair** |
+| `stripe_doctor` · `GET /api/diagnostics/stripe` | État réel de la config Stripe : source/format de clé (une clé `pk_…` est refusée), cohérence mode live/test, webhook, devise, mode démo, prix, **et joignabilité de `api.stripe.com` depuis le serveur** (egress/DNS) — **jamais de secret en clair** |
 | `code_fix` · `POST /api/diagnostics/fix` | Applique le correctif (en-tête `Authorization` + import, garde `res.ok`), **confirmation obligatoire**, fichier original sauvegardé dans `.dig-doctor/` |
 
 Dans le chat Hermes : *« Les fonctions Stripe ne fonctionnent pas, diagnostique »* →

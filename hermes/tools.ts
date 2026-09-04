@@ -1342,7 +1342,7 @@ export function buildSkillRegistry(): HermesTool[] {
       parameters: { type: 'object', properties: {} },
       async run() {
         const products = await readList('dpf_app_v2_products');
-        const { stripeDoctor } = await import('./diagnostics');
+        const { stripeDoctor, probeStripeApi } = await import('./diagnostics');
         const envKey = (process.env.STRIPE_SECRET_KEY || '').trim();
         const envWhsec = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
         const dbKey = String((await kvGet('df_stripe_sk')) || '').replace(/^"|"$/g, '').trim();
@@ -1353,7 +1353,8 @@ export function buildSkillRegistry(): HermesTool[] {
           currency: String((await kvGet('df_stripe_currency')) || 'EUR'),
           demoCheckout: (process.env.DEMO_CHECKOUT || '').trim(),
           products,
-          publicUrl: (process.env.PUBLIC_URL || '').trim()
+          publicUrl: (process.env.PUBLIC_URL || '').trim(),
+          apiProbe: await probeStripeApi()
         });
         return {
           ok: report.ok,

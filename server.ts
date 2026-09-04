@@ -9,7 +9,7 @@ import { db, ensureSchema } from './src/db/db.js';
 import { keyValueStore } from './src/db/schema.js';
 import { eq } from 'drizzle-orm';
 import { createHermesRouter } from './hermes';
-import { scanSources, applyFix, previewFix, stripeDoctor } from './hermes/diagnostics.js';
+import { scanSources, applyFix, previewFix, stripeDoctor, probeStripeApi } from './hermes/diagnostics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -433,7 +433,8 @@ async function runStripeDoctor() {
     currency: await kvString('df_stripe_currency'),
     demoCheckout: (process.env.DEMO_CHECKOUT || '').trim(),
     products,
-    publicUrl: (process.env.PUBLIC_URL || '').trim()
+    publicUrl: (process.env.PUBLIC_URL || '').trim(),
+    apiProbe: await probeStripeApi()
   });
 }
 
@@ -691,14 +692,25 @@ app.post('/api/checkout/create-session', checkoutLimiter, async (req, res) => {
       });
     }
 
-    const stripeRes = await fetch('https://api.stripe.com/v1/checkout/sessions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${stripeSk}`,
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body: formParams.toString()
-    });
+    let stripeRes: Response;
+    try {
+      stripeRes = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${stripeSk}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: formParams.toString()
+      });
+    } catch (netErr: any) {
+      // « fetch failed » seul ne dit rien à l'utilisateur : la cause est réseau
+      // (egress/DNS/proxy), pas la clé. Le docteur de code tranche la question.
+      console.error('Stripe injoignable depuis le serveur:', netErr?.cause?.code || netErr?.message);
+      return res.status(502).json({
+        error: `api.stripe.com injoignable depuis le serveur (${netErr?.cause?.code || netErr?.message || 'erreur réseau'}). Vérifiez la sortie réseau (egress/DNS/proxy) — lancez le diagnostic : GET /api/diagnostics/stripe.`,
+        stripeUnreachable: true
+      });
+    }
 
     const sessionData = await stripeRes.json();
     if (sessionData.error) {
@@ -803,7 +815,12 @@ app.post('/api/checkout/verify-keys', requireAuth, webhookLimiter, async (req, r
     });
   } catch (err: any) {
     console.error('Stripe key verification error:', err);
-    res.status(500).json({ success: false, message: `Erreur de vérification : ${err.message || 'Erreur interne'}` });
+    // « fetch failed » = le serveur ne peut pas joindre api.stripe.com : ce
+    // n'est PAS la clé qui est en cause (egress/DNS/proxy).
+    const msg = /fetch failed|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|network/i.test(String(err?.message || ''))
+      ? `api.stripe.com injoignable depuis le serveur (${err?.cause?.code || err.message}). La clé n'est pas en cause : vérifiez la sortie réseau, puis GET /api/diagnostics/stripe.`
+      : `Erreur de vérification : ${err.message || 'Erreur interne'}`;
+    res.status(502).json({ success: false, message: msg });
   }
 });
 

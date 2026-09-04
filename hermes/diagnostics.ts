@@ -550,6 +550,26 @@ export interface StripeDoctorInput {
   demoCheckout: string;
   products: Array<{ id?: string; title?: string; status?: string; price?: number; pricing?: { recommendedPrice?: number } }>;
   publicUrl?: string;
+  /** Sonde réseau vers api.stripe.com (optionnelle) : egress/DNS du serveur. */
+  apiProbe?: { ok: boolean; status?: number; error?: string; ms?: number };
+}
+
+/**
+ * Sonde api.stripe.com depuis le serveur. Une réponse 401 signifie « joignable »
+ * (seule l'authentification manque). Sert à distinguer « clé invalide » de
+ * « le serveur ne peut pas sortir » — deux pannes aux causes opposées.
+ */
+export async function probeStripeApi(timeoutMs = 6000): Promise<{ ok: boolean; status?: number; error?: string; ms?: number }> {
+  const started = Date.now();
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const r = await fetch('https://api.stripe.com/v1/account', { signal: ctrl.signal });
+    clearTimeout(t);
+    return { ok: true, status: r.status, ms: Date.now() - started };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.cause?.code || e?.message || e).slice(0, 120), ms: Date.now() - started };
+  }
 }
 
 /**
@@ -646,7 +666,23 @@ export function stripeDoctor(i: StripeDoctorInput): { ok: boolean; checks: Strip
     checks.push({ id: 'catalog_prices', status: 'pass', message: 'Tous les produits publiés ont un prix > 0.' });
   }
 
-  // S8 — URL publique pour le webhook
+  // S8 — le serveur peut-il joindre api.stripe.com ? (egress/DNS)
+  if (i.apiProbe) {
+    if (!i.apiProbe.ok) {
+      checks.push({
+        id: 'stripe_api_reachable', status: 'fail',
+        message: `api.stripe.com INJOIGNABLE depuis le serveur (${i.apiProbe.error || 'erreur réseau'} en ${i.apiProbe.ms} ms) : aucune session de paiement ne peut être créée, quelle que soit la clé. Cause typique : egress/DNS bloqué, proxy, ou sandbox sans accès sortant.`,
+        fix: "Vérifier la sortie réseau du service (pare-feu/egress, DNS, proxy HTTP(S)) puis relancer ce diagnostic."
+      });
+    } else {
+      checks.push({
+        id: 'stripe_api_reachable', status: 'pass',
+        message: `api.stripe.com joignable (HTTP ${i.apiProbe.status} en ${i.apiProbe.ms} ms).`
+      });
+    }
+  }
+
+  // S9 — URL publique pour le webhook
   const url = (i.publicUrl || '').trim();
   if (whsec && !url) {
     checks.push({ id: 'public_url', status: 'warn', message: 'PUBLIC_URL non définie : l’URL du webhook affichée dans l’UI ne peut pas être devinée (à saisir dans le dashboard Stripe).', fix: 'Définir PUBLIC_URL=https://<votre-service>.onrender.com' });

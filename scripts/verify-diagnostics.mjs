@@ -185,8 +185,40 @@ async function req(method, p, { body, auth, headers = {} } = {}) {
   await req('POST', '/api/store', { body: { key: 'df_stripe_currency', value: 'EUR' }, ...A });
   r = await req('GET', '/api/diagnostics/stripe', A);
   doc = r.json || {};
-  check('Configuration cohérente → ok:true', doc.ok === true,
-    (doc.checks || []).filter(c => c.status === 'fail').map(c => c.id).join(','));
+  // NB : stripe_api_reachable est ENVIRONNEMENTAL (egress du serveur), pas une
+  // erreur de configuration — il est exclu de cette assertion.
+  const configFails = (doc.checks || []).filter(c => c.status === 'fail' && c.id !== 'stripe_api_reachable');
+  check('Configuration cohérente → aucun échec de configuration', configFails.length === 0,
+    configFails.map(c => c.id).join(',') || 'ok');
+
+  // Sonde réseau : api.stripe.com joignable depuis le serveur ? (egress/DNS)
+  r = await req('GET', '/api/diagnostics/stripe', A);
+  doc = r.json || {};
+  const reach = byId('stripe_api_reachable');
+  check('Le diagnostic sonde api.stripe.com (check stripe_api_reachable présent)',
+    Boolean(reach) && ['pass', 'fail'].includes(reach.status), JSON.stringify(reach || null).slice(0, 90));
+  check('Une sonde en échec explique la cause réseau (pas la clé)',
+    !reach || reach.status === 'pass' || /api\.stripe\.com INJOIGNABLE/.test(reach.message || ''),
+    String(reach?.message || '').slice(0, 70));
+
+  // Si le serveur ne peut pas sortir, create-session doit le dire clairement
+  // (502 + stripeUnreachable) au lieu d'un « fetch failed » opaque.
+  await req('POST', '/api/store', { body: { key: 'df_stripe_sk', value: 'sk_test_51ABCsecretKEY' }, ...A });
+  r = await req('POST', '/api/checkout/create-session', {
+    body: {
+      items: [{ productId: 'prod-test-1', productTitle: 'Guide IA', price: 47, quantity: 1 }],
+      customer: { email: 'client@example.com' },
+      origin: BASE
+    }
+  });
+  if (reach?.status === 'fail') {
+    check('create-session avec Stripe injoignable → 502 explicite (stripeUnreachable)',
+      r.status === 502 && r.json?.stripeUnreachable === true && /api\.stripe\.com injoignable/.test(String(r.json?.error || '')),
+      `HTTP ${r.status} ${String(r.json?.error || '').slice(0, 70)}`);
+  } else {
+    check('create-session rejoint Stripe (sonde OK) — pas de 502 réseau',
+      r.status !== 502, `HTTP ${r.status}`);
+  }
 
   // Nettoyage : on retire la clé de test (le serveur revient à « non configuré »)
   await req('POST', '/api/store', { body: { key: 'df_stripe_sk', value: '' }, ...A });
