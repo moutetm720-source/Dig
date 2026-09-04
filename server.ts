@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import net from 'net';
 import dns from 'dns/promises';
-import { db } from './src/db/db.js';
+import { db, ensureSchema } from './src/db/db.js';
 import { keyValueStore } from './src/db/schema.js';
 import { eq } from 'drizzle-orm';
 import { createHermesRouter } from './hermes';
@@ -2310,6 +2310,8 @@ app.get('*', (req, res) => {
   res.setHeader('Surrogate-Control', 'no-store');
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
+
+await ensureSchema();
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on port ${PORT}`);
