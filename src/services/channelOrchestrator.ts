@@ -1,6 +1,7 @@
 import { AutonomousChannel, ChannelBroadcastEvent, ChannelPlatform, DigitalProduct } from '../types';
 import { tokenManager } from './tokenManager';
 import { store } from './store';
+import { blockFakeData } from './realDataPolicy';
 import { safeSetItem, safeGetItem } from '../utils/safeStorage';
 import { socialIntegrationsService } from './socialIntegrationsService';
 import { getAuthBearer } from './authToken';
@@ -338,8 +339,10 @@ class ChannelOrchestratorService {
       status: 'active',
       autoPostEnabled: true,
       totalDispatches: 0,
-      subscriberCount: Math.floor(1500 + Math.random() * 4000),
-      engagementRate: Number((6.5 + Math.random() * 8.5).toFixed(1)),
+      // 100 % RÉEL : audience non mesurée (0) tant que l'API de la plateforme
+      // n'est pas branchée — aucun abonné ni taux d'engagement inventé.
+      subscriberCount: blockFakeData('channels.subscriberCount') ? 0 : Math.floor(1500 + Math.random() * 4000),
+      engagementRate: blockFakeData('channels.engagementRate') ? 0 : Number((6.5 + Math.random() * 8.5).toFixed(1)),
       authStrategy: platform === 'telegram' || platform === 'discord_webhook' ? 'webhook' : 'public_api',
       logs: [
         `Orchestra Pipe: Channel provisioned autonomously via AI Agent`,
@@ -426,11 +429,15 @@ class ChannelOrchestratorService {
         payloadBody: payload.body,
         status: 'sent',
         timestamp: new Date().toISOString(),
-        analytics: {
-          views: Math.floor(180 + Math.random() * 650),
-          clicks: Math.floor(25 + Math.random() * 95),
-          conversions: Math.random() > 0.4 ? 1 : 0
-        }
+        // 100 % RÉEL : performances de diffusion à 0 tant qu'aucune remontée
+        // d'analytics réelle n'est disponible pour ce canal.
+        analytics: blockFakeData('channels.dispatchAnalytics')
+          ? { views: 0, clicks: 0, conversions: 0 }
+          : {
+              views: Math.floor(180 + Math.random() * 650),
+              clicks: Math.floor(25 + Math.random() * 95),
+              conversions: Math.random() > 0.4 ? 1 : 0
+            }
       };
 
       channel.totalDispatches += 1;

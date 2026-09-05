@@ -1,5 +1,6 @@
 import { TargetCountryCode, TargetLanguageCode } from '../types';
 import { store } from './store';
+import { blockFakeData } from './realDataPolicy';
 import { safeSetItem, safeGetItem } from '../utils/safeStorage';
 
 export interface CountryKeywordData {
@@ -407,6 +408,11 @@ class CountryKeywordsEngine {
    * Dynamically adjusts search volume, trend scores, and injects fresh localized long-tail variations
    */
   public executeAutonomousKeywordOptimization(): string {
+    // 100 % RÉEL : plus de micro-ajustements aléatoires censés figurer les
+    // fluctuations du marché — le score reste celui de la dernière vraie mesure.
+    if (blockFakeData('countryKeywords.trendDrift')) {
+      return 'Optimisation mots-clés : scores figés sur la dernière mesure réelle (aucune variation inventée).';
+    }
     const updated = this.keywords.map(kw => {
       // Dynamic micro-adjustments simulating live market fluctuations
       const deltaTrend = (Math.random() * 4 - 1.8);

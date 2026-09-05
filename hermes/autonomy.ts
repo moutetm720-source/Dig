@@ -241,7 +241,8 @@ export async function runAutonomyCycle(trigger: 'timer' | 'api' = 'api'): Promis
 
     // 2) PLAN → ACTION
     const pool = await buildPool();
-    const real = pool.find(p => p.kind !== 'mock');
+    // Pool 100 % réel : le moindre fournisseur disponible pilote le cycle en langage naturel.
+    const real = pool[0];
     if (real) {
       const result = await runAgentChat({
         agentId: 'orchestrator',

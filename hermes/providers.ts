@@ -1,12 +1,17 @@
 /**
  * hermes/providers.ts — Couche multi-fournisseurs LLM (zéro dépendance ajoutée).
  *
+ * RÉEL UNIQUEMENT : le fournisseur « mock » (réponses simulées) a été SUPPRIMÉ.
+ * Hermes ne répond jamais avec une IA simulée — soit un fournisseur réel est
+ * configuré (et la bascule automatique du pool évite tout blocage), soit le
+ * moteur l'assume explicitement (skills exécutés sur données réelles, zéro
+ * simulation de langage).
+ *
  * Fournisseurs :
  *  - gemini   : @google/genai (dépendance existante) — gratuit (Gemini API tier)
  *  - openai   : n'importe quel endpoint compatible OpenAI /chat/completions :
  *               Ollama local (gratuit, modèles open-source : llama3.1, qwen2.5,
  *               mistral...), Groq, OpenRouter, Together, llama.cpp...
- *  - mock     : fournisseur déterministe pour les tests E2E (HERMES_PROVIDER=mock)
  *
  * Sélecteurs (env ou KV df_hermes_config, modifiable par le modérateur) :
  *  - auto : gemini si GEMINI_API_KEY, sinon openai si HERMES_OPENAI_BASE_URL, sinon aucun
@@ -22,6 +27,14 @@ import { AgentEvent, LLMChatOptions, LLMChatResult, LLMProvider, HermesConfig, D
 
 let configCache: { at: number; cfg: HermesConfig } | null = null;
 
+/** Choix de fournisseur acceptés : RÉELS uniquement ('mock' définitivement retiré). */
+const REAL_PROVIDER_CHOICES = ['auto', 'gemini', 'openai'] as const;
+
+/** Message d'aide, réutilisé partout (status, erreurs de chat, autonomie). */
+export function realProviderHelp(): string {
+  return 'Configurez un fournisseur IA RÉEL : GEMINI_API_KEY (Google AI Studio, gratuit) — ou HERMES_OPENAI_BASE_URL + HERMES_OPENAI_MODEL + HERMES_OPENAI_API_KEY (Ollama local, Groq, OpenRouter…) — ou ajoutez un fournisseur au pool (POST /api/hermes/providers).';
+}
+
 export async function getHermesConfig(): Promise<HermesConfig> {
   if (configCache && Date.now() - configCache.at < 15 * 1000) return configCache.cfg;
   let cfg: HermesConfig = { ...DEFAULT_HERMES_CONFIG };
@@ -30,7 +43,12 @@ export async function getHermesConfig(): Promise<HermesConfig> {
     if (r.length > 0 && r[0].value) {
       const v = typeof r[0].value === 'string' ? JSON.parse(r[0].value) : r[0].value;
       if (v && typeof v === 'object') {
-        if (['auto', 'gemini', 'openai', 'mock'].includes(v.provider)) cfg.provider = v.provider;
+        if ((REAL_PROVIDER_CHOICES as readonly string[]).includes(v.provider)) {
+          cfg.provider = v.provider;
+        } else if (v.provider) {
+          // Ancienne valeur « mock » (mode test) persistée en base → jamais réutilisée.
+          console.warn(`[hermes] provider « ${String(v.provider).slice(0, 20)} » refusé (non réel) — repli sur « auto ». ${realProviderHelp()}`);
+        }
         if (typeof v.geminiModel === 'string' && v.geminiModel) cfg.geminiModel = v.geminiModel.slice(0, 80);
         if (typeof v.openaiBaseUrl === 'string') cfg.openaiBaseUrl = v.openaiBaseUrl.slice(0, 300);
         if (typeof v.openaiModel === 'string' && v.openaiModel) cfg.openaiModel = v.openaiModel.slice(0, 120);
@@ -44,7 +62,10 @@ export async function getHermesConfig(): Promise<HermesConfig> {
 export async function saveHermesConfig(patch: Partial<HermesConfig>): Promise<HermesConfig> {
   const current = await getHermesConfig();
   const next: HermesConfig = { ...current, ...patch };
-  if (!['auto', 'gemini', 'openai', 'mock'].includes(next.provider)) next.provider = 'auto';
+  if (String(patch.provider || '').toLowerCase() === 'mock') {
+    throw new Error("Le fournisseur « mock » (mode test) a été supprimé : Hermes n'accepte qu'un fournisseur IA réel. Choisissez 'auto', 'gemini' ou 'openai'.");
+  }
+  if (!(REAL_PROVIDER_CHOICES as readonly string[]).includes(next.provider)) next.provider = 'auto';
   next.geminiModel = String(next.geminiModel || '').slice(0, 80) || DEFAULT_HERMES_CONFIG.geminiModel;
   next.openaiBaseUrl = String(next.openaiBaseUrl || '').slice(0, 300);
   next.openaiModel = String(next.openaiModel || '').slice(0, 120) || DEFAULT_HERMES_CONFIG.openaiModel;
@@ -206,194 +227,13 @@ class OpenAICompatProvider implements LLMProvider {
   }
 }
 
-// ---------- Mock (tests E2E déterministes) ----------
-
-/**
- * Fournisseur mock : simule un LLM à function calling de façon déterministe
- * afin de tester la BOUCLE AGENT COMPLÈTE (plan → outil → observation →
- * réponse) sans réseau ni clé API. Ne doit JAMAIS être utilisé en production.
- */
-class MockProvider implements LLMProvider {
-  id = 'mock' as const;
-  model = 'mock-deterministe-v1';
-  label = 'Mock (tests — pas d\u2019IA réelle)';
-
-  async chat(opts: LLMChatOptions): Promise<LLMChatResult> {
-    const lastUser = [...opts.events].reverse().find(e => e.type === 'text' && e.role === 'user') as any;
-    const lastToolResult = [...opts.events].reverse().find(e => e.type === 'tool_result') as any;
-    const prompt = String(lastUser?.text || '').toLowerCase();
-
-    // 1) Si un outil vient de renvoyer needsConfirmation → demander la confirmation
-    if (lastToolResult && typeof lastToolResult.result === 'object' && lastToolResult.result?.needsConfirmation) {
-      return { text: `⚠️ **Action sensible détectée** : ${lastToolResult.result.summary}\n\nJe ne l'exécute que si vous le confirmez explicitement (bouton « Confirmer l'action »).` };
-    }
-
-    // 2) Une observation vient d'arriver → synthèse finale (on ne relance pas d'outil)
-    if (lastToolResult && (lastToolResult.result === null || typeof lastToolResult.result !== 'object' || !lastToolResult.result.needsConfirmation)) {
-      const summary = JSON.stringify(lastToolResult.result).slice(0, 200);
-      return { text: `✅ **Action effectuée** (${lastToolResult.name})\n\nSynthèse du résultat : \`${summary}\`\n\nJe peux enchaîner d'autres actions — que souhaitez-vous faire ensuite ?` };
-    }
-
-    // 3) Changement de prix explicite : "met/passe le prix de <id> à <n>€"
-    const priceMatch = prompt.match(/(?:prix|price)[^\n]*?((?:prod-|bump-)[a-z0-9-]+)[^\n]*?(\d+(?:[.,]\d{1,2})?)\s*€/i)
-      || prompt.match(/((?:prod-|bump-)[a-z0-9-]+)[^\n]*?(\d+(?:[.,]\d{1,2})?)\s*€/i);
-    if (priceMatch) {
-      const id = priceMatch[1];
-      const price = Number(priceMatch[2].replace(',', '.'));
-      return { toolCalls: [{ name: 'catalog_set_price', args: { id, price, confirm: true } }] };
-    }
-
-    // 3) Suppression : "supprime le produit <id>"
-    const delMatch = prompt.match(/supprim[ea]?[^\n]*?((?:prod-|bump-)[a-z0-9-]+)/i) || prompt.match(/((?:prod-|bump-)[a-z0-9-]+)[^\n]*?supprim/i);
-    if (delMatch) {
-      return { toolCalls: [{ name: 'catalog_delete', args: { id: delMatch[1] } }] }; // sans confirm → confirmation requise
-    }
-
-    // 4) Création de produit explicite : "crée un produit X à Y€"
-    // Titre de préférence entre guillemets « ... », sinon segment 4-60 car. avant le prix
-    const quotedTitle = (prompt.match(/«([^«»\n]{4,60})»/) || [])[1];
-    const priceOnly = (prompt.match(/(\d+(?:[.,]\d{1,2})?)\s*€/) || [])[1];
-    const unquoted = prompt.match(/cr[ée]e[^«»\n]*?«?([A-Za-zÀ-ÿ'\- ]{4,60}?)[,;\s]»?[ ]*à [ ]?(\d+(?:[.,]\d{1,2})?)\s*€/i);
-    const createMatch = quotedTitle
-      ? { 1: quotedTitle, 2: priceOnly }
-      : (unquoted ? { 1: unquoted[1].trim(), 2: unquoted[2] } : null);
-    if (createMatch) {
-      const title = createMatch[1].trim();
-      const price = Number(createMatch[2].replace(',', '.'));
-      return { toolCalls: [{ name: 'catalog_create', args: { title, price, category: 'IA & Productivité', format: 'prompt_pack' } }] };
-    }
-
-    // 4b) DOCTEUR DE CODE — « Stripe ne marche pas » → diagnostic de la config
-    if (/(stripe|paiement|checkout|webhook)/.test(prompt)
-      && /(marche pas|ne fonctionne pas|fonctionne pas|erreur|[ée]chec|cass[ée]|probl[èe]me|diagnostique?|v[ée]rifie|invalid)/.test(prompt)) {
-      return { toolCalls: [{ name: 'stripe_doctor', args: {} }] };
-    }
-
-    // 4c) DOCTEUR DE CODE — « scanne le code / erreurs 401 / intégration » → code_scan
-    if (/(scan|scanne|docteur|code_doctor|401|403|int[ée]gration)/.test(prompt)
-      && /(code|api|client|[ée]cran|endpoint|appel|fonction)/.test(prompt)) {
-      return { toolCalls: [{ name: 'code_scan', args: {} }] };
-    }
-
-    // 4d) DOCTEUR DE CODE — « corrige/répare le finding <id> » → code_fix
-    // (sans confirm → le moteur exige une confirmation explicite)
-    const fixMatch = prompt.match(/\b((?:missing_auth|protected_write|protected_read|unchecked_response|unknown_endpoint)-[a-z0-9]{4,})\b/);
-    if (fixMatch && /(corrige|corrig|r[ée]pare|fix|applique)/.test(prompt)) {
-      return { toolCalls: [{ name: 'code_fix', args: { id: fixMatch[1] } }] };
-    }
-
-    // 4e) REPOS GITHUB — « détail du repo X » → repos_get
-    const repoDetail = String(lastUser?.text || '').match(/d[ée]tail[^\n]*?repo[^\n]*?\s+([a-zA-Z0-9_.\/-]+)/i);
-    if (repoDetail) {
-      return { toolCalls: [{ name: 'repos_get', args: { id: repoDetail[1] } }] };
-    }
-
-    // 4f) VEILLE GITHUB — « fais une veille github sur X » → repos_harvest
-    if (/(veille|harveste)\b[^\n]{0,40}github|github[^\n]{0,25}(veille|harveste)\b|fais[^\n]{0,30}veille/i.test(prompt)) {
-      const q = String(lastUser?.text || '').match(/sur\s+(?:le\s+|la\s+|les\s+)?([a-z0-9 ._-]{3,80})/i);
-      return { toolCalls: [{ name: 'repos_harvest', args: { query: q?.[1]?.trim() || 'ai agent' } }] };
-    }
-
-    // 4g) RÉFÉRENTIELS LOCAUX — « référentiels / awesome-llm-apps / OBLITERATUS » → reference_repos
-    if (/référentiel|reference_repos|references\/|awesome-llm-apps|obliteratus/i.test(prompt)) {
-      const nameM = String(lastUser?.text || '').match(/(OBLITERATUS|awesome-free-llm-apis|awesome-llm-apps)/i);
-      return { toolCalls: [{ name: 'reference_repos', args: nameM ? { name: nameM[1] } : {} }] };
-    }
-
-    // 4h) LIENS PLATEFORME — « liste les liens de la plateforme » → platform_links
-    if (/(liste|inventaire|quels|contrôle|verifie|vérifie)[^\n]*liens|liens[^\n]*(liste|inventaire|plateforme)/i.test(prompt)) {
-      return { toolCalls: [{ name: 'platform_links', args: { check: /vérifie|contrôle|check|santé/i.test(prompt) } }] };
-    }
-
-    // 4i) REPOS GITHUB — « liste les repos » → repos_list
-    if (/(liste|quels|montre|vois|show)[^\n]{0,40}(repo|github)|repos?[^\n]{0,30}(harvest|liste)/i.test(prompt)) {
-      return { toolCalls: [{ name: 'repos_list', args: {} }] };
-    }
-
-    // 4j) VUE GLOBALE — « vue globale de la plateforme » → platform_overview
-    if (/vue globale|aper[çc]u de la plateforme|overview de la plateforme/i.test(prompt)) {
-      return { toolCalls: [{ name: 'platform_overview', args: {} }] };
-    }
-
-    // 5) Audit → outil audit_system
-    if (prompt.includes('audit') || prompt.includes('statut') || prompt.includes('diagnostic')) {
-      return { toolCalls: [{ name: 'audit_system', args: {} }] };
-    }
-
-    // 6) Métriques
-    if (prompt.includes('vente') || prompt.includes('ca ') || prompt.includes('revenu') || prompt.includes('métrique') || prompt.includes('métrique')) {
-      return { toolCalls: [{ name: 'metrics_summary', args: {} }] };
-    }
-
-    // 7) API LLM gratuites (awesome-free-llm-apis) : "quelle API LLM gratuite…"
-    if (/(llm|large language|modèle ia|modele ia|gpt|chatbot|ia)/.test(prompt) && /(gratuit|free|sans coût|sans cout|0 ?€|zéro euro|zero cost)/.test(prompt)) {
-      const args: Record<string, any> = { query: String(lastUser?.text || '').slice(0, 200) };
-      return { toolCalls: [{ name: 'free_llm_lookup', args }] };
-    }
-
-    // 8) Base gratuite (free-for.dev) : "quels outils gratuits pour héberger…"
-    if (prompt.includes('free-for') || (/(gratuit|sans coût|sans cout|0 ?€|zero cost)/.test(prompt) && /(outil|service|hébergement|heberg|base|api|infrastructure)/.test(prompt))) {
-      const catMatch = prompt.match(/\b(ia|llm|hebergement|hébergement|base|email|e-mail|paiement|monitoring|analytics|cdn|stockage|recherche|authentification|communication|api_divers|dev_ci)\b/);
-      const args: Record<string, any> = { query: String(lastUser?.text || '').slice(0, 200) };
-      if (catMatch) args.category = catMatch[1].toLowerCase();
-      return { toolCalls: [{ name: 'free_tier_lookup', args }] };
-    }
-
-    // 9) Contrôle de liens : "vérifie les liens…"
-    if (/(vérifie|verifie|check)[^\n]*(lien|url)/.test(prompt) || prompt.includes('liens cassés') || prompt.includes('liens casses')) {
-      const urls = [...String(lastUser?.text || '').matchAll(/https?:\/\/[^\s"'»\]]+/gi)].map(m => m[0]).slice(0, 10);
-      if (urls.length > 0) return { toolCalls: [{ name: 'web_link_check', args: { urls } }] };
-    }
-
-    // 10) Lecture de page : "lis/analyse cette page https://…"
-    const urlInPrompt = [...String(lastUser?.text || '').matchAll(/https?:\/\/[^\s"'»\]]+/gi)].map(m => m[0])[0];
-    if (urlInPrompt && /(lis|lit|page|contenu|analyse cette|résume cette|resume cette)/.test(prompt)) {
-      return { toolCalls: [{ name: 'web_fetch', args: { url: urlInPrompt } }] };
-    }
-
-    // 11) Recherche web : "cherche/recherche sur internet…"
-    if (/(cherch[ée]e|recherche|sur internet|sur le web|veille|tendances web)/.test(prompt)) {
-      return { toolCalls: [{ name: 'web_search', args: { query: String(lastUser?.text || '').slice(0, 200), count: 5 } }] };
-    }
-
-    // 12) Gestionnaire d'API & tokens : « ajoute X au pool (+ baseUrl/model/clé) » → providers_add
-    if (/(ajoute|add|branche)[^\n]*(pool|fournisseur)/.test(prompt) || /fournisseur[^\n]*(ajoute|add|branche)/.test(prompt)) {
-      const nameMatch = prompt.match(/(?:ajoute|add|branche)\s+(?:le\s+|la\s+|un\s+|une\s+|nouveau\s+|nouvelle\s+)?([a-z0-9][a-z0-9-_]{1,39})/i);
-      const rawName = (nameMatch?.[1] || 'fournisseur').toLowerCase();
-      const name = ['le', 'la', 'un', 'une', 'nouveau', 'fournisseur', 'pool'].includes(rawName) ? 'fournisseur' : rawName;
-      const baseUrl = (String(lastUser?.text || '').match(/https?:\/\/[^\s"'»\]]+/i) || [])[0];
-      const model = (String(lastUser?.text || '').match(/\bmod[èe]le\s*[:=]?\s*([a-z0-9./:_-]{2,60})/i) || [])[1];
-      const key = (String(lastUser?.text || '').match(/\b(?:api[_ -]?key|cl[ée]|token)\s*[:=]?\s*(sk-[A-Za-z0-9_\-]{4,})/i) || [])[1];
-      const args: Record<string, any> = { name, kind: baseUrl ? 'openai' : 'gemini' };
-      if (baseUrl) args.baseUrl = baseUrl;
-      if (model) args.model = model;
-      if (key) args.apiKey = key;
-      return { toolCalls: [{ name: 'providers_add', args }] };
-    }
-
-    // 13) « supprime le fournisseur X » → providers_remove
-    if (/supprim[ée]e?[^\n]*fournisseur|fournisseur[^\n]*supprim/.test(prompt)) {
-      const nameMatch = String(lastUser?.text || '').match(/fournisseur\s+([a-z0-9][a-z0-9-_]{1,39})/i);
-      const name = (nameMatch?.[1] || 'fournisseur').toLowerCase();
-      return { toolCalls: [{ name: 'providers_remove', args: { name } }] };
-    }
-
-    // 14) « teste le fournisseur X » → providers_test
-    if (/(test[ée]e?|vérifie|verifie)[^\n]*fournisseur|fournisseur[^\n]*(test[ée]e?|vérifie)/.test(prompt)) {
-      const nameMatch = String(lastUser?.text || '').match(/fournisseur\s+([a-z0-9][a-z0-9-_]{1,39})/i);
-      const name = (nameMatch?.[1] || '').toLowerCase();
-      return { toolCalls: [{ name: 'providers_test', args: name ? { name } : {} }] };
-    }
-
-    // 15) « liste les fournisseurs » / « statut du pool » → providers_list
-    if (/(liste|statut|état|etat|montre|vois|show)[^\n]*(fournisseur|pool)|fournisseur[^\n]*(liste|statut)/.test(prompt)) {
-      return { toolCalls: [{ name: 'providers_list', args: {} }] };
-    }
-
-    // 7) Défaut : texte honnête
-    return { text: `🤖 **Hermes (mode mock — tests)**\n\nMessage reçu : « ${String(lastUser?.text || '').slice(0, 120)} ».\n\nCe fournisseur est le **mock déterministe de test** : il exécutera les actions explicites (prix, création, suppression, audit, gestion du pool de fournisseurs) via les outils réels du serveur, mais ne fait aucune génération de langage. Configurez un fournisseur réel (Gemini, Ollama local, Groq...) pour l'interprétation libre.` };
-  }
-}
+// ---------- Mode test SUPPRIMÉ ----------
+//
+// Le fournisseur « mock » (réponses d'IA simulées) a été RETIRÉ du moteur :
+// Hermes ne fabrique plus jamais de texte qui imite une IA. Sans fournisseur
+// réel, le moteur l'annonce et exécute uniquement des skills sur des données
+// réelles (voir hermes/engine.ts). Les tests E2E (scripts/verify-hermes.mjs)
+// s'exécutent désormais contre un fournisseur réel.
 
 // ---------- Sélection ----------
 
@@ -404,7 +244,16 @@ export async function getActiveProvider(): Promise<{ provider: LLMProvider | nul
 
   try {
     if (choice === 'mock') {
-      return { provider: new MockProvider(), reason: 'mock' };
+      // HERMES_PROVIDER=mock (mode test) n'est plus supporté : on ne simule pas.
+      console.warn(`[hermes] HERMES_PROVIDER=mock ignoré (mode test supprimé) — repli sur « auto ». ${realProviderHelp()}`);
+      const env = process.env.HERMES_PROVIDER ? ' (env)' : ' (base)';
+      if (process.env.GEMINI_API_KEY) {
+        return { provider: new GeminiProvider(cfg.geminiModel), reason: `auto→gemini${env} (mock refusé)` };
+      }
+      if (cfg.openaiBaseUrl) {
+        return { provider: new OpenAICompatProvider(cfg.openaiBaseUrl, cfg.openaiModel), reason: `auto→openai-compatible${env} (mock refusé)` };
+      }
+      return { provider: null, reason: `HERMES_PROVIDER=mock refusé (mode test supprimé) et aucun fournisseur réel configuré. ${realProviderHelp()}` };
     }
     if (choice === 'gemini') {
       if (!process.env.GEMINI_API_KEY) return { provider: null, reason: 'gemini configuré mais GEMINI_API_KEY absente' };
@@ -421,7 +270,7 @@ export async function getActiveProvider(): Promise<{ provider: LLMProvider | nul
     if (cfg.openaiBaseUrl) {
       return { provider: new OpenAICompatProvider(cfg.openaiBaseUrl, cfg.openaiModel), reason: 'auto→openai-compatible' };
     }
-    return { provider: null, reason: 'aucun fournisseur disponible (configurez GEMINI_API_KEY ou un endpoint OpenAI-compatible type Ollama)' };
+    return { provider: null, reason: `aucun fournisseur IA réel configuré. ${realProviderHelp()}` };
   } catch (e: any) {
     return { provider: null, reason: `erreur de sélection fournisseur : ${e?.message}` };
   }
@@ -429,18 +278,17 @@ export async function getActiveProvider(): Promise<{ provider: LLMProvider | nul
 
 // ---------- POOL MULTI-FOURNISSEURS (gestionnaire d'API & tokens + bascule automatique) ----------
 //
-// Objectif : ne JAMAIS être bloqué. Le pool mélange :
+// Objectif : ne JAMAIS être bloqué, et toujours avec une IA RÉELLE. Le pool mélange :
 //   1. les fournisseurs déclarés dans l'environnement (GEMINI_API_KEY, HERMES_OPENAI_BASE_URL) ;
 //   2. les fournisseurs gérés au RUNTIME (KV df_hermes_provider_pool — protégée,
-//      modifiable par Hermes via les skills providers_* ou l'API REST) ;
-//   3. le mock déterministe en dernier recours (réponse toujours honnête).
+//      modifiable par Hermes via les skills providers_* ou l'API REST).
 // À chaque appel LLM, si un fournisseur renvoie 429/5xx/timeout, il passe en
 // cooldown (30 s sur rate-limit — ou Retry-After — ; 15 s sur erreur) et le
 // suivant est essayé automatiquement.
 
 export interface PoolEntry {
   name: string;
-  kind: 'gemini' | 'openai' | 'mock';
+  kind: 'gemini' | 'openai';
   model: string;
   baseUrl?: string;
   local?: boolean;
@@ -479,9 +327,15 @@ async function loadPoolSpecs(): Promise<ProviderSpec[]> {
     if (r.length > 0 && r[0].value) {
       const v = typeof r[0].value === 'string' ? JSON.parse(r[0].value) : r[0].value;
       if (Array.isArray(v)) {
-        return v
-          .filter((x: any) => x && typeof x === 'object' && typeof x.name === 'string' && ['gemini', 'openai', 'mock'].includes(x.kind))
+        const real = v
+          .filter((x: any) => x && typeof x === 'object' && typeof x.name === 'string' && ['gemini', 'openai'].includes(x.kind))
           .slice(0, HERMES_POOL.MAX_PROVIDERS);
+        // Nettoyage : un ancien fournisseur « mock » persisté est retiré du pool.
+        if (real.length !== v.length) {
+          console.warn(`[hermes] ${v.length - real.length} fournisseur(s) non réel(s) (mock) purgé(s) du pool.`);
+          void savePoolSpecs(real).catch(() => {});
+        }
+        return real;
       }
     }
   } catch {}
@@ -496,14 +350,19 @@ async function savePoolSpecs(specs: ProviderSpec[]): Promise<void> {
 function providerFromSpec(spec: ProviderSpec): LLMProvider {
   if (spec.kind === 'gemini') return new GeminiProvider(spec.model || DEFAULT_HERMES_CONFIG.geminiModel);
   if (spec.kind === 'openai') return new OpenAICompatProvider(spec.baseUrl || '', spec.model || '', spec.apiKey);
-  return new MockProvider();
+  throw new Error(`Fournisseur « ${spec.name} » de type inconnu (fournisseurs réels uniquement : gemini, openai).`);
 }
 
 /** Pool complet, trié par priorité (1 = premier, 999 = dernier recours). */
 export async function buildPool(): Promise<PoolEntry[]> {
   const cfg = await getHermesConfig();
   const envForce = (process.env.HERMES_PROVIDER || '').toLowerCase();
-  const choice = envForce || cfg.provider;
+  // « mock » = ancien mode test : REFUSÉ. On retombe sur « auto » (fournisseurs réels).
+  let choice = envForce || cfg.provider;
+  if (choice === 'mock') {
+    console.warn(`[hermes] HERMES_PROVIDER=mock ignoré dans le pool (mode test supprimé) — « auto » appliqué. ${realProviderHelp()}`);
+    choice = 'auto';
+  }
   const specs: ProviderSpec[] = [];
   const envLocal = cfg.openaiBaseUrl ? /localhost|127\.0\.0\.1|\[::1\]/i.test(cfg.openaiBaseUrl) : false;
 
@@ -514,11 +373,10 @@ export async function buildPool(): Promise<PoolEntry[]> {
     if (cfg.openaiBaseUrl) specs.push(specFromEnv('openai-env', 'openai', cfg.openaiModel, 20, cfg.openaiBaseUrl, process.env.HERMES_OPENAI_API_KEY || undefined, envLocal));
   }
   // Fournisseurs gérés au runtime (KV) — hors verrou exclusif gemini/openai
-  if (choice === 'auto' || choice === 'mock') {
+  if (choice === 'auto') {
     for (const s of await loadPoolSpecs()) specs.push(s);
   }
-  // Filet de sécurité : le mock déterministe répond TOUJOURS (jamais bloqué, réponse honnête)
-  specs.push({ name: 'mock-env', kind: 'mock', model: 'mock-deterministe-v1', priority: 999 });
+  // AUCUN filet mock : si le pool est vide, le moteur l'annonce explicitement.
 
   const entries: PoolEntry[] = specs.map(spec => {
     const isEnv = spec.name.endsWith('-env');
@@ -536,8 +394,8 @@ export async function buildPool(): Promise<PoolEntry[]> {
       priority: Number.isFinite(Number(spec.priority)) ? Number(spec.priority) : 500,
       source: isEnv ? 'env' : 'pool',
       provider: providerFromSpec(spec),
-      hasKey: spec.kind === 'mock' ? true : Boolean(actualKey),
-      keyMasked: spec.kind === 'mock' ? null : (actualKey ? maskSecret(actualKey) : 'absente')
+      hasKey: Boolean(actualKey),
+      keyMasked: actualKey ? maskSecret(actualKey) : 'absente'
     };
   });
   entries.sort((a, b) => a.priority - b.priority);
@@ -580,7 +438,7 @@ const RETRY_AFTER_RE = /retry[- ]after[:\s=]*(\d+)/i;
  */
 export async function chatWithFailover(opts: LLMChatOptions): Promise<{ result: LLMChatResult; entry: PoolEntry }> {
   const entries = (await getUsablePool()).slice(0, HERMES_POOL.MAX_FALLBACKS_PER_CALL);
-  if (entries.length === 0) throw new Error('Aucun fournisseur IA disponible (pool vide).');
+  if (entries.length === 0) throw new Error(`Aucun fournisseur IA RÉEL disponible (pool vide — le mode mock de test a été supprimé). ${realProviderHelp()}`);
   const tried: string[] = [];
   for (const entry of entries) {
     try {
@@ -595,7 +453,7 @@ export async function chatWithFailover(opts: LLMChatOptions): Promise<{ result: 
       reportOutcome(entry.name, rate ? 'rate_limited' : 'error', m ? Number(m[1]) : undefined, msg.slice(0, 300));
     }
   }
-  throw new Error(`Tous les fournisseurs IA sont indisponibles. Essayés : ${tried.join(' | ')}`);
+  throw new Error(`Tous les fournisseurs IA réels sont indisponibles (en cooldown ou en erreur). Essayés : ${tried.join(' | ')}`);
 }
 
 /** État du pool, secrets masqués (jamais de clé en clair — UI, API, logs). */
@@ -624,7 +482,7 @@ export async function addProvider(spec: Partial<ProviderSpec>): Promise<{ ok: tr
   const name = String(spec.name || '').trim().toLowerCase();
   if (!PROVIDER_NAME_RE.test(name)) throw new Error('Nom invalide : 2-40 caractères [a-z0-9-_].');
   const kind = spec.kind;
-  if (!['gemini', 'openai'].includes(kind as string)) throw new Error("Kind invalide : 'gemini' ou 'openai' (le mock n'est pas ajoutable — c'est le filet de sécurité local).");
+  if (!['gemini', 'openai'].includes(kind as string)) throw new Error("Kind invalide : 'gemini' ou 'openai' (fournisseurs IA réels uniquement — le mock de test n'existe plus).");
 
   const existing = await loadPoolSpecs();
   if (existing.some(s => s.name === name)) throw new Error(`Un fournisseur « ${name} » existe déjà.`);

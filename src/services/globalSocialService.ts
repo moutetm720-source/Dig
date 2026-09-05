@@ -11,6 +11,7 @@ import {
   ContentTargetDuration
 } from '../types';
 import { store } from './store';
+import { blockFakeData } from './realDataPolicy';
 import { countryKeywordsEngine } from './countryKeywordsEngine';
 import { safeSetItem, safeGetItem } from '../utils/safeStorage';
 
@@ -934,11 +935,19 @@ class GlobalSocialService {
     post.publishedAt = new Date().toISOString();
     post.directPublishingTriggered = true;
 
-    // Organic reach initialization
-    post.metrics.views = Math.round(1500 + Math.random() * 2000);
-    post.metrics.likes = Math.round(post.metrics.views * 0.08);
-    post.metrics.shares = Math.round(post.metrics.views * 0.02);
-    post.metrics.linkClicks = Math.round(post.metrics.views * 0.04);
+    // 100 % RÉEL : AUCUNE portée organique inventée. Les compteurs démarrent à
+    // 0 et ne montent que via une vraie remontée de la plateforme (API/webhook).
+    if (blockFakeData('globalSocial.publishPostNow.metrics')) {
+      post.metrics.views = 0;
+      post.metrics.likes = 0;
+      post.metrics.shares = 0;
+      post.metrics.linkClicks = 0;
+    } else {
+      post.metrics.views = Math.round(1500 + Math.random() * 2000);
+      post.metrics.likes = Math.round(post.metrics.views * 0.08);
+      post.metrics.shares = Math.round(post.metrics.views * 0.02);
+      post.metrics.linkClicks = Math.round(post.metrics.views * 0.04);
+    }
 
     const account = this.state.accounts.find(a => a.id === post.accountId);
     if (account) {

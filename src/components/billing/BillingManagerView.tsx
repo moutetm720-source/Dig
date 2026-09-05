@@ -54,7 +54,9 @@ export const BillingManagerView: React.FC = () => {
     e.preventDefault();
     if (!manualClientName.trim() || !manualClientEmail.trim() || manualAmount <= 0) return;
 
-    const mockOrder = {
+    // 100 % RÉEL : une facture manuelle n'est JAMAIS présentée comme un
+    // paiement Stripe (pas de faux identifiant de session « cs_test_… »).
+    const manualOrder = {
       id: `ord-man-${Date.now().toString().slice(-6)}`,
       orderNumber: `ORD-${Date.now().toString().slice(-5)}`,
       customer: {
@@ -71,8 +73,8 @@ export const BillingManagerView: React.FC = () => {
       totalAmount: manualAmount,
       currency: 'EUR',
       paymentStatus: 'paid' as const,
-      paymentMethod: 'Carte Bancaire (Stripe)',
-      stripeSessionId: 'cs_test_manual_' + Date.now(),
+      paymentMethod: 'Facturation manuelle (hors passerelle)',
+      stripeSessionId: '',
       downloadToken: 'tok_man_' + Math.random().toString(36).substring(2),
       downloadExpiresAt: new Date(Date.now() + 30 * 86400000).toISOString(),
       downloadCount: 0,
@@ -80,7 +82,7 @@ export const BillingManagerView: React.FC = () => {
       createdAt: new Date().toISOString()
     };
 
-    const newInv = billingService.generateInvoiceForOrder(mockOrder);
+    const newInv = billingService.generateInvoiceForOrder(manualOrder);
     setIsManualModalOpen(false);
     setManualClientName('');
     setManualClientEmail('');

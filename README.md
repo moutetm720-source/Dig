@@ -2,14 +2,42 @@
 
 Application full-stack de création et de vente de **produits digitaux** (kits, templates, guides, packs de prompts) :
 back-office React, moteur d'agent **Hermes v5** côté serveur, paiements Stripe + crypto (vérification on-chain),
-tunnel de démo sans Stripe, et une sécurité durcie (voir [`AUDIT_SECURITE.md`](AUDIT_SECURITE.md)).
+**100 % réel** (aucune IA simulée, aucun paiement fictif, aucune donnée inventée),
+et une sécurité durcie (voir [`AUDIT_SECURITE.md`](AUDIT_SECURITE.md)).
 
 ## Stack
 
 - **Serveur** : Node.js + Express (TypeScript, `tsx`), PostgreSQL (drizzle-orm, key-value store), `server.ts`
 - **Client** : React 18 + Vite + Tailwind (`src/`)
 - **IA** : moteur d'agent Hermes (`hermes/`) — boucle tool-calling réelle, **pool multi-fournisseurs avec bascule automatique** (anti rate-limit), gestionnaire d'API & tokens pilotable par Hermes, **docteur de code** (`code_doctor`) qui détecte et corrige les erreurs d'intégration client ↔ API, **autonomie serveur** (cycles planifiés, actions sûres, journal) et skills **repos GitHub / liens / référentiels locaux**
-- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (77 tests, mode mock), `scripts/verify-diagnostics.mjs` (40 tests — docteur de code)
+- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (82 tests — fournisseur IA **réel** requis, les tests d'interprétation sont ignorés si aucun n'est configuré), `scripts/verify-diagnostics.mjs` (40 tests — docteur de code)
+
+## Mode « 100 % réel »
+
+Trois règles, sans exception ni repli silencieux :
+
+1. **IA réelle uniquement** — le fournisseur `mock` (ancien mode TEST) a été **supprimé du
+   moteur**. Hermes utilise Gemini, un endpoint compatible OpenAI (Ollama, Groq,
+   OpenRouter…) ou n'importe quel fournisseur **réel** du pool, avec bascule automatique
+   (429/erreur → cooldown → suivant). `HERMES_PROVIDER=mock` (env ou base) est refusé avec
+   un avertissement et `auto` s'applique ; `POST /api/hermes/config {provider:"mock"}` → 400 ;
+   un fournisseur `kind: "mock"` ne peut plus être ajouté au pool. Sans aucun fournisseur
+   réel, Hermes l'annonce et exécute ses skills sur **données réelles** — il ne simule aucun
+   langage.
+2. **Paiement réel uniquement** — `DEMO_CHECKOUT` et `/api/checkout/demo-complete`
+   (livraison sans encaissement) ont été **supprimés** (410 Gone). Une commande n'est
+   livrée que sur paiement vérifié (webhook Stripe signé ou contrôle on-chain). Sans clé
+   Stripe : checkout indisponible, aucune commande créée.
+3. **Données réelles uniquement** — plus aucun chiffre inventé : ventes, conversions, vues,
+   clics, abonnés, tendances de marché, volumes de mots-clés, backlinks « live »… ne sont
+   plus générés aléatoirement (`DIG_REAL_DATA_ONLY=1` par défaut). Les compteurs restent à
+   0 (« non mesuré ») jusqu'au branchement d'une vraie source (API plateforme, Search
+   Console, Stripe, marché). Les données de démo historiques ont été purgées des seeds et
+   l'ancien mode démo est détectable par la skill `data_reality_audit` (purge :
+   `data_purge_demo`, confirmation requise).
+
+Au démarrage, le serveur affiche un bandeau : IA réelle / passerelle de paiement / politique
+de données.
 
 ## Démarrage
 
@@ -55,7 +83,8 @@ npm start          # production
    | `MODERATOR_PASSCODE` | **obligatoire** : votre code modérateur (jamais `2026`) |
    | `HERMES_PROVIDER` | `auto` (défaut) — Hermes bascule entre vos fournisseurs IA |
    | `GEMINI_API_KEY` | optionnel — clé Google AI Studio gratuite |
-   | `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` | optionnel — sans Stripe, posez `DEMO_CHECKOUT=1` |
+   | `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` | **requis pour encaisser** — sans Stripe, le checkout est indisponible (le mode démo a été supprimé) |
+   | `DIG_REAL_DATA_ONLY` | `1` (défaut) — aucune métrique inventée ; `0` réactive les générateurs simulés (**jamais en prod**) |
 5. **Déployer** — *Deploy branch* (première fois : *Create Web Service* lance le build).
    Vérifiez dans les logs : `Server listening on port` + `postgres connecté`.
    Le SSL est forcé automatiquement sur un hôte `*.render.com` (`db.ts`).
@@ -77,29 +106,32 @@ Render n'est fournie ici.
 
 | Variable | Rôle |
 |---|---|
-| `HERMES_PROVIDER` | `auto` (défaut) \| `gemini` \| `openai` \| `mock` — voir sémantique pool ci-dessous |
+| `HERMES_PROVIDER` | `auto` (défaut) \| `gemini` \| `openai` — **fournisseurs réels uniquement** (`mock` supprimé) |
 | `GEMINI_API_KEY` | Clé Google AI Studio (gratuit) — source **env uniquement**, jamais en base |
 | `HERMES_GEMINI_MODEL` | Modèle Gemini (défaut `gemini-2.5-flash`) |
 | `HERMES_OPENAI_BASE_URL` / `_MODEL` / `_API_KEY` | Endpoint compatible OpenAI : **Ollama local** (`http://127.0.0.1:11434/v1`), Groq, OpenRouter… |
 
-Sans fournisseur réel : le serveur reste **honnête** (en mode `auto` sans rien de configuré,
-état `provider: aucun` + raison + métriques réelles) — les skills exécutent toujours les
-actions réelles, l'interprétation libre est simplement indisponible.
+Sans fournisseur réel : le serveur reste **honnête** (`status: offline`,
+`providerReason` explicite + métriques réelles issues des skills) — les skills exécutent
+toujours les actions réelles, l'interprétation libre est simplement indisponible. Aucune
+réponse n'est simulée.
 
 ### Gestionnaire d'API & tokens — pool multi-fournisseurs (« ne jamais être bloqué »)
 
 Hermes ne dépend plus d'un seul fournisseur. Un **pool** mélange, par priorité :
 
 1. les fournisseurs de l'environnement (`GEMINI_API_KEY`, `HERMES_OPENAI_BASE_URL`),
-2. les fournisseurs **ajoutés au runtime** (base clé-valeur protégée `df_hermes_provider_pool`),
-3. le mock déterministe en dernier recours (réponse toujours honnête).
+2. les fournisseurs **ajoutés au runtime** (base clé-valeur protégée `df_hermes_provider_pool`).
+
+Le pool ne contient que des fournisseurs **réels** : l'ancien filet « mock » a été retiré
+(les specs mock encore présentes en base sont purgées automatiquement au chargement).
 
 À chaque appel LLM, un fournisseur qui rate-limite (429) ou échoue (5xx/timeout) passe en
 **cooldown** (30 s sur rate-limit — ou `Retry-After` — ; 15 s sur erreur) et le **suivant est
 essayé automatiquement**. Échec annoncé seulement si TOUS les fournisseurs ont échoué.
 
-Sémantique de `HERMES_PROVIDER` : `mock` = mock + pool géré · `auto` = env + pool géré ·
-`gemini`/`openai` = verrou exclusif sur ce type.
+Sémantique de `HERMES_PROVIDER` : `auto` = env + pool géré · `gemini`/`openai` = verrou
+exclusif sur ce type · `mock` = **refusé** (avertissement + repli `auto`).
 
 **Hermes gère le pool lui-même** (4 skills : `providers_list`, `providers_add`,
 `providers_remove`, `providers_test` — agent Ops + orchestrateur) : « ajoute Groq au pool »,
@@ -139,9 +171,9 @@ Interagit avec internet via 4 skills, toutes gardées (https uniquement, anti-SS
 - `free_tier_lookup` — base gratuite free-for.dev (hébergement, BDD, IA, e-mail, paiement, monitoring…)
 - `free_llm_lookup` — base des API LLM gratuites (provider, limite gratuite, **baseUrl** souvent compatible OpenAI → branchable directement via `HERMES_OPENAI_BASE_URL`)
 
-Le LLM (Gemini/OpenAI-compat) pilote l'agent ; en mode mock, un jeu de règles déterministe
-permet de tester la boucle complète sans réseau ni clé. **Honnêteté** : si le réseau du serveur
-est bloqué, l'échec est signalé — aucun résultat n'est inventé.
+Le LLM **réel** (Gemini/OpenAI-compat) pilote l'agent. **Honnêteté** : si le réseau du serveur
+est bloqué, l'échec est signalé — aucun résultat n'est inventé. Sans fournisseur configuré,
+Hermes exécute ses skills sur données réelles et le dit (aucune interprétation simulée).
 
 ### Ajouter un skill
 
@@ -215,16 +247,28 @@ risques résiduels documentés, commandes de déploiement et suites de test.
 # 1. Postgres de test (5432) + seed (catalogue, commandes PII, webhook)
 node scripts/start-test-pg.mjs
 
-# 2. Serveur en mode mock (fournisseur IA déterministe)
+# 2. Serveur avec un fournisseur IA RÉEL (le mode mock n'existe plus)
 PORT=3211 DB_HOST=127.0.0.1 DB_USER=postgres DB_PASSWORD=*** DB_NAME=applet \
-  DEMO_CHECKOUT=1 MODERATOR_PASSCODE=*** HERMES_PROVIDER=mock \
+  MODERATOR_PASSCODE=*** GEMINI_API_KEY=<votre-clé> \
   node_modules/.bin/tsx server.ts
+#   (alternative sans clé : Ollama local — HERMES_OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+#    HERMES_OPENAI_MODEL=llama3.1 HERMES_OPENAI_API_KEY=ollama)
+#   Sans fournisseur : la suite tourne quand même, les tests d'interprétation sont SKIPPÉS
+#   (jamais validés par une réponse simulée).
 
 # 3. Suites
 node scripts/verify-security.mjs --base http://127.0.0.1:3211 --passcode <code> --whsec <secret>
 node scripts/verify-hermes.mjs    --base http://127.0.0.1:3211 --passcode <code>
 node scripts/verify-diagnostics.mjs --base http://127.0.0.1:3211 --passcode <code>
+
+# 4. Audit statique du mode « 100 % réel » (aucun serveur requis)
+node scripts/verify-real-data.mjs
 ```
+
+`scripts/verify-real-data.mjs` (30 contrôles) vérifie qu'aucun chemin « test / démo /
+simulé » n'est réintroduit : fournisseur mock supprimé, tunnel de démo en 410,
+générateurs de données simulés neutralisés (`src/services/realDataPolicy.ts`), seeds sans
+événements inventés, aucune métrique métier tirée au hasard.
 
 ⚠️ Les rate-limiters (IA 6/min, webhooks 10/min, crypto 10/5 min, auth 10/10 min) sont
 en mémoire : **les deux suites gèrent elles-mêmes les pauses sur 429** (attente de la fin
@@ -241,7 +285,8 @@ Le docteur de code (`hermes/diagnostics.ts`) rend ça détectable et corrigeable
 | Skill / endpoint | Rôle |
 |---|---|
 | `code_scan` · `GET /api/diagnostics/scan` | Analyse les `fetch('/api/…')` du client : 401 garanti, 403 garanti, réponse jamais vérifiée, endpoint hors contrat |
-| `stripe_doctor` · `GET /api/diagnostics/stripe` | État réel de la config Stripe : source/format de clé (une clé `pk_…` est refusée), cohérence mode live/test, webhook, devise, mode démo, prix, **et joignabilité de `api.stripe.com` depuis le serveur** (egress/DNS) — **jamais de secret en clair** |
+| `stripe_doctor` · `GET /api/diagnostics/stripe` | État réel de la config Stripe : source/format de clé (une clé `pk_…` est refusée), cohérence mode live/test, webhook, devise, absence de mode démo, commandes démo héritées, prix, **et joignabilité de `api.stripe.com` depuis le serveur** (egress/DNS) — **jamais de secret en clair** |
+| `data_reality_audit` / `data_purge_demo` | Audit « 100 % réel » : détecte les commandes non réelles (ancien mode démo, sans encaissement) et les purge sur confirmation |
 | `code_fix` · `POST /api/diagnostics/fix` | Applique le correctif (en-tête `Authorization` + import, garde `res.ok`), **confirmation obligatoire**, fichier original sauvegardé dans `.dig-doctor/` |
 
 Dans le chat Hermes : *« Les fonctions Stripe ne fonctionnent pas, diagnostique »* →

@@ -5,6 +5,7 @@ import {
   CompetitorGapAnalysis 
 } from '../types';
 import { store } from './store';
+import { blockFakeData } from './realDataPolicy';
 import { safeSetItem, safeGetItem } from '../utils/safeStorage';
 
 const STORAGE_TOPICAL_KEY = 'df_seo_topical_clusters_v1';
@@ -302,8 +303,10 @@ class SeoLeaderEngine {
     const newCluster: TopicalClusterNode = {
       id: 'cluster-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
       pillarKeyword: pillarKeyword,
-      searchVolumeMonthly: Math.floor(Math.random() * 50000) + 10000,
-      keywordDifficulty: Math.floor(Math.random() * 30) + 15,
+      // 100 % RÉEL : sans source de mots-clés branchée, aucun volume ni
+      // difficulté n'est inventé (0 = « non mesuré »).
+      searchVolumeMonthly: blockFakeData('seo.cluster.searchVolume') ? 0 : Math.floor(Math.random() * 50000) + 10000,
+      keywordDifficulty: blockFakeData('seo.cluster.keywordDifficulty') ? 0 : Math.floor(Math.random() * 30) + 15,
       searchIntent: 'transactional',
       subtopics: [
         category + ' templates for developers',
@@ -313,10 +316,10 @@ class SeoLeaderEngine {
       ],
       semanticEntities: [pillarKeyword, 'SaaS', 'Automation', 'Templates'],
       internalLinkTargets: ['/products/1', '/store', '/blog'],
-      rankingPositionCurrent: Math.floor(Math.random() * 20) + 10,
-      rankingPositionTarget: Math.floor(Math.random() * 3) + 1,
-      estimatedTrafficMonthly: Math.floor(Math.random() * 20000) + 1000,
-      status: 'ranking_top_3'
+      rankingPositionCurrent: blockFakeData('seo.cluster.ranking') ? 0 : Math.floor(Math.random() * 20) + 10,
+      rankingPositionTarget: blockFakeData('seo.cluster.ranking') ? 0 : Math.floor(Math.random() * 3) + 1,
+      estimatedTrafficMonthly: blockFakeData('seo.cluster.traffic') ? 0 : Math.floor(Math.random() * 20000) + 1000,
+      status: blockFakeData('seo.cluster.status') ? 'identified' as any : 'ranking_top_3'
     };
     this.clusters.unshift(newCluster);
     if (this.clusters.length > 20) {
@@ -557,10 +560,13 @@ class SeoLeaderEngine {
         domainAuthority: targetDir.da,
         prospectType: targetDir.type,
         anchorTextSuggested: anchorText,
-        relevanceScore: Math.floor(Math.random() * 10) + 90, // 90% à 99%
+        // 100 % RÉEL : pertinence non mesurée (0) tant qu'aucune analyse réelle.
+        relevanceScore: blockFakeData('seo.backlink.relevanceScore') ? 0 : Math.floor(Math.random() * 10) + 90,
         pitchEmailTemplate: `PR & Submission for ${targetDir.domainName} featuring verified codebase "${anchorText}" with 100% test coverage and live demo.`,
-        status: Math.random() < 0.35 ? 'live' : Math.random() < 0.65 ? 'acquired' : 'identified',
-        acquiredBacklinkUrl: targetUrl,
+        // 100 % RÉEL : un prospect découvert reste « identified » jusqu'à
+        // vérification — jamais marqué live/acquired au hasard.
+        status: blockFakeData('seo.backlink.status') ? 'identified' : (Math.random() < 0.35 ? 'live' : Math.random() < 0.65 ? 'acquired' : 'identified'),
+        acquiredBacklinkUrl: blockFakeData('seo.backlink.status') ? undefined : targetUrl,
         createdAt: new Date().toISOString()
       };
 
@@ -585,6 +591,11 @@ class SeoLeaderEngine {
    */
   public autoAcquireAllPendingBacklinks(): number {
     let count = 0;
+    if (blockFakeData('seo.backlink.autoAcquire')) {
+      // 100 % RÉEL : aucune acquisition de backlink déclarée sans vérification.
+      store.addLog('info', 'marketing', '⚡ Backlinks : acquisition automatique désactivée (100 % réel) — un backlink n’est validé qu’après vérification.');
+      return 0;
+    }
     this.backlinkProspects.forEach(b => {
       if (b.status === 'identified' || b.status === 'contacted') {
         b.status = Math.random() < 0.75 ? 'live' : 'acquired';
@@ -647,7 +658,9 @@ class SeoLeaderEngine {
 
   // Background Autonomous SEO Loop (Exécuté en tâche de fond 24/24)
   public runAutonomousSeoTick() {
-    // 1. Simulate organic impression & click increments
+    // 1. (100 % RÉEL) Plus d'impressions/clics simulés : imputés à la Search
+    // Console ou à une vraie source, sinon 0.
+    if (!blockFakeData('seo.tick.impressions'))
     this.programmaticPages.forEach(page => {
       const addedViews = Math.floor(Math.random() * 8) + 1;
       const addedClicks = Math.random() < 0.35 ? 1 : 0;
@@ -670,12 +683,15 @@ class SeoLeaderEngine {
       this.harvestUnlimitedBacklinks(1);
     }
 
-    // 4. Auto-validation périodique des backlinks identifiés vers live
-    const identified = this.backlinkProspects.filter(b => b.status === 'identified');
-    if (identified.length > 0 && Math.random() < 0.4) {
-      const candidate = identified[0];
-      candidate.status = 'live';
-      candidate.acquiredBacklinkUrl = candidate.url;
+    // 4. (100 % RÉEL) Un backlink ne passe « live » QUE s'il est vérifié
+    // (contrôle HTTP réel) — jamais par tirage aléatoire.
+    if (!blockFakeData('seo.tick.backlinkAutoValidation')) {
+      const identified = this.backlinkProspects.filter(b => b.status === 'identified');
+      if (identified.length > 0 && Math.random() < 0.4) {
+        const candidate = identified[0];
+        candidate.status = 'live';
+        candidate.acquiredBacklinkUrl = candidate.url;
+      }
     }
 
     this.saveState();

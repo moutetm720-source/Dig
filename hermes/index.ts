@@ -13,7 +13,7 @@
  */
 import { Router } from 'express';
 import { runAgentChat, confirmPendingAction, getAgents, skills } from './engine';
-import { buildPool, getPoolStatus, addProvider, removeProvider, testProvider, getHermesConfig, saveHermesConfig } from './providers';
+import { buildPool, getPoolStatus, addProvider, removeProvider, testProvider, getHermesConfig, saveHermesConfig, realProviderHelp } from './providers';
 import { getAutonomyConfig, saveAutonomyConfig, runAutonomyCycle, getRecentAutonomyReports, isAutonomyRunning } from './autonomy';
 import { DEFAULT_HERMES_CONFIG } from './types';
 import { db } from '../src/db/db';
@@ -46,9 +46,11 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
       const reposList = Array.isArray(reposVal) ? reposVal : (typeof reposVal === 'string' ? (() => { try { const p = JSON.parse(reposVal); return Array.isArray(p) ? p : []; } catch { return []; } })() : []);
       res.json({
         status: active ? 'active' : 'offline',
-        engine: 'hermes-core-v5 (boucle tool-calling réelle, pool multi-fournisseurs avec bascule automatique, multi-agents, autonomie serveur)',
+        engine: 'hermes-core-v5 (boucle tool-calling réelle, pool multi-fournisseurs RÉELS avec bascule automatique, multi-agents, autonomie serveur)',
         provider: active?.provider.label || 'aucun',
-        providerReason: active ? undefined : 'aucun fournisseur disponible',
+        providerReason: active ? undefined : realProviderHelp(),
+        realOnly: true,           // aucun fournisseur mock/simulé : IA réelle ou rien
+        mockProvider: 'supprimé', // ancien mode test — retiré du moteur
         model: active?.model || '-',
         failover: pool.length > 1 ? `bascule automatique : ${pool.length} fournisseurs en cascade (rate-limit/erreur → cooldown → suivant)` : undefined,
         providerPool: pool.map(e => ({ name: e.name, kind: e.kind, model: e.model, priority: e.priority, source: e.source, key: e.keyMasked })),
@@ -217,9 +219,10 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
       const cfg = await saveHermesConfig(patch);
       const pool = await buildPool();
       const active = pool[0] || null;
-      res.json({ updated: true, config: cfg, activeProvider: active?.provider.label || 'aucun', activeReason: active ? undefined : 'aucun fournisseur disponible' });
+      res.json({ updated: true, config: cfg, activeProvider: active?.provider.label || 'aucun', activeReason: active ? undefined : realProviderHelp() });
     } catch (err: any) {
-      res.status(500).json({ error: err.message });
+      // Erreur de validation de la config (ex. provider « mock ») → 400, pas 500.
+      res.status(400).json({ error: err.message, allowedProviders: ['auto', 'gemini', 'openai'] });
     }
   });
 
