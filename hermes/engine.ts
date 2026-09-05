@@ -2,7 +2,7 @@
  * hermes/engine.ts — Boucle agent HERMES (v4 réelle).
  *
  * Boucle plan → action → observation (pattern ReAct / hermes-agent) :
- *   1. LLM (Gemini / OpenAI-compatible / mock) reçoit le system prompt de
+ *   1. LLM RÉEL (Gemini / endpoint compatible OpenAI) reçoit le system prompt de
  *      l'agent + l'historique + les déclarations des skills.
  *   2. S'il appelle des skills → exécution SERVEUR (validation, budgets,
  *      porte de confirmation, audit) → résultat renvoyé comme observation.
@@ -12,7 +12,9 @@
  *  - budgets durs : MAX_STEPS appels LLM, MAX_TOOL_CALLS exécutions
  *  - skills destructifs : jamais sans confirm:true (flux pending + /confirm)
  *  - chaque appel de skill : entrée d'audit (df_hermes_activity)
- *  - mode HONNÊTE sans LLM : données réelles + explication, zéro simulation
+ *  - AUCUN MODE TEST : le fournisseur mock a été supprimé. Sans fournisseur
+ *    réel, le moteur l'annonce et se limite aux skills sur données réelles
+ *    (zéro simulation de langage, zéro chiffre inventé).
  */
 import crypto from 'node:crypto';
 import * as fs from 'node:fs';
@@ -204,27 +206,27 @@ export async function runAgentChat(opts: {
     conversation: opts.prompt.slice(0, 500)
   };
 
-  // POOL MULTI-FOURNISSEURS : le mock reste en dernier recours (jamais bloqué) ;
-  // en mode « auto » SANS aucun fournisseur réel, on reste honnête (zéro simulation).
+  // POOL MULTI-FOURNISSEURS RÉELS : bascule automatique (429/erreur → cooldown →
+  // suivant). S'il n'y a AUCUN fournisseur réel, pas de simulation : on exécute
+  // des skills sur les données réelles et on l'annonce.
   const pool = await buildPool();
-  const cfgChoice = (process.env.HERMES_PROVIDER || '').toLowerCase() || (await getHermesConfig()).provider;
-  const onlyMock = pool.length === 1 && pool[0].name === 'mock-env';
-  if (onlyMock && cfgChoice === 'auto') {
+  if (pool.length === 0) {
     const steps: AgentStep[] = [];
     const callCount = { n: 0 };
     const metrics = await executeSkill('metrics_summary', {}, ctx, steps, callCount);
     const audit = await executeSkill('audit_system', {}, ctx, steps, callCount);
     const response =
-      `⚠️ **Aucun fournisseur IA configuré** — je ne peux pas interpréter librement votre demande.\n\n` +
+      `⚠️ **Aucun fournisseur IA RÉEL configuré** — je ne simule rien (le mode test/mock a été supprimé) :\n\n` +
+      `je ne peux donc pas interpréter librement votre demande, mais j'exécute mes skills sur vos **données réelles**.\n\n` +
       `Pour m'activer pleinement :\n` +
       `- **Gemini** (gratuit) : \`GEMINI_API_KEY\` — ou\n` +
       `- **Modèles open-source locaux** : Ollama sur \`HERMES_OPENAI_BASE_URL=http://localhost:11434/v1\` + \`HERMES_OPENAI_MODEL=llama3.1\` — ou\n` +
       `- tout endpoint compatible OpenAI (Groq, OpenRouter...) — ou\n` +
       `- **ajoutez un fournisseur au pool** (je le fais moi-même : « ajoute Groq au pool de fournisseurs IA »)\n\n` +
-      `En attendant, voici l'état **réel** de votre plateforme :\n\n` +
+      `Voici l'état **réel** de votre plateforme (aucun chiffre inventé) :\n\n` +
       `**Métriques** : \`${summarizeResult(metrics.result)}\`\n\n` +
       `**Audit système** : \`${summarizeResult(audit.result)}\`\n\n` +
-      `Les outils restent opérationnels : dès qu'un LLM sera configuré, je pourrai exécuter vos demandes via mes ${skillRegistry.length} skills.`;
+      `Mes ${skillRegistry.length} skills restent opérationnels : dès qu'un fournisseur réel sera configuré, je les piloterai en langage naturel.`;
     await pushMemory(agent.id, opts.prompt, steps, response);
     return { response, provider: 'aucun', model: '-', agent: agent.id, steps };
   }

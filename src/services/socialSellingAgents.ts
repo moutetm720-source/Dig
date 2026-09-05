@@ -1,4 +1,5 @@
 import { store } from './store';
+import { blockFakeData } from './realDataPolicy';
 import { DigitalProduct, ContentItem, ContentChannel } from '../types';
 import { safeSetItem, safeGetItem } from '../utils/safeStorage';
 
@@ -424,6 +425,13 @@ class SocialSellingAgentsService {
 
   // Limitless Creator & Influencer Scanner & Recruiter
   public recruitUnlimitedCreators(batchCount = 4): InfluencerOutreachCampaign[] {
+    // 100 % RÉEL : plus de créateurs FABRIQUÉS (profils fictifs, fausses
+    // audiences, statut « partnered » tiré au hasard). Le recrutement ne
+    // liste que de vrais partenaires — sinon 0.
+    if (blockFakeData('socialSelling.recruitCreators')) {
+      store.addLog('info', 'marketing', '🤝 Créateurs : le recrutement automatique fictif est désactivé (100 % réel) — aucun influenceur inventé n’est ajouté.');
+      return [];
+    }
     const creatorPool = [
       { name: 'Julien AI & Code', handle: '@julien_dev_ai', platform: 'youtube' as const, followers: '118k abonnés', niche: 'IA Générative & Boilerplates', reach: 65000 },
       { name: 'Sophie SaaS Growth', handle: '@sophie_growth', platform: 'twitter' as const, followers: '54k followers', niche: 'Micro-SaaS & Solopreneuriat', reach: 38000 },
@@ -495,7 +503,9 @@ class SocialSellingAgentsService {
       this.generateFastHooksForProduct(prod, true);
     }
 
-    // 2. Simulate viral clicks and social engagement
+    // 2. (100 % RÉEL) Plus de vues/clics de complaisance : les compteurs ne
+    // bougent que sur une vraie remontée de la plateforme.
+    if (!blockFakeData('socialSelling.tick.engagement'))
     this.hooks = this.hooks.map(h => {
       if (h.status === 'ready' || h.status === 'viral' || h.status === 'posted') {
         const addViews = Math.floor(Math.random() * 450) + 50;
@@ -509,7 +519,9 @@ class SocialSellingAgentsService {
       return h;
     });
 
-    // 3. Simulate DM triggers and auto-replies
+    // 3. (100 % RÉEL) Plus de DM ni de conversion inventés : les déclenchements
+    // et conversions ne sont comptés que s'ils sont réellement constatés.
+    if (!blockFakeData('socialSelling.tick.dmConversions'))
     this.dmRules = this.dmRules.map(rule => {
       if (rule.isActive && Math.random() > 0.4) {
         const addedTriggers = Math.floor(1 + Math.random() * 3);

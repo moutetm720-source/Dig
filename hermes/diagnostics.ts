@@ -547,7 +547,8 @@ export interface StripeDoctorInput {
   dbWhsec: string;
   mode: string;
   currency: string;
-  demoCheckout: string;
+  /** Commandes non réelles encore présentes en base (source 'demo' / paymentMethod 'demo'). */
+  demoOrdersCount?: number;
   products: Array<{ id?: string; title?: string; status?: string; price?: number; pricing?: { recommendedPrice?: number } }>;
   publicUrl?: string;
   /** Sonde réseau vers api.stripe.com (optionnelle) : egress/DNS du serveur. */
@@ -642,13 +643,25 @@ export function stripeDoctor(i: StripeDoctorInput): { ok: boolean; checks: Strip
     checks.push({ id: 'stripe_currency', status: 'pass', message: `Devise ${currency} valide.` });
   }
 
-  // S6 — mode démo vs Stripe configuré
-  if (i.demoCheckout === '1' && sk) {
-    checks.push({ id: 'demo_vs_stripe', status: 'warn', message: 'DEMO_CHECKOUT=1 alors qu’une clé Stripe est configurée : le tunnel réel prime, le mode démo est ignoré (comportement voulu).', fix: 'Retirer DEMO_CHECKOUT pour éviter toute ambiguïté.' });
-  } else if (i.demoCheckout === '1' && !sk) {
-    checks.push({ id: 'demo_vs_stripe', status: 'warn', message: 'Mode démo actif (DEMO_CHECKOUT=1, aucune clé Stripe) : les commandes sont finalisées sans paiement réel.', fix: 'Configurer Stripe pour encaisser réellement.' });
+  // S6 — 100 % RÉEL : plus aucun mode démo. Sans passerelle réelle, le checkout
+  // est indisponible (aucune commande n'est créée ni livrée sans paiement).
+  if (!sk) {
+    checks.push({
+      id: 'no_demo_fallback', status: 'fail',
+      message: 'Aucune passerelle de paiement réelle configurée et le mode démo a été supprimé : le checkout est indisponible (aucune commande créée).',
+      fix: 'Configurer STRIPE_SECRET_KEY (env ou clé KV df_stripe_sk) + STRIPE_WEBHOOK_SECRET. Le tunnel démo (DEMO_CHECKOUT) n’existe plus.'
+    });
   } else {
-    checks.push({ id: 'demo_vs_stripe', status: 'pass', message: 'Mode de paiement cohérent (démo inactif).' });
+    checks.push({ id: 'no_demo_fallback', status: 'pass', message: 'Paiement 100 % réel : aucune commande n’est livrée sans paiement vérifié (mode démo supprimé).' });
+  }
+
+  // S6b — données héritées du mode démo encore présentes en base
+  if ((i.demoOrdersCount || 0) > 0) {
+    checks.push({
+      id: 'legacy_demo_orders', status: 'warn',
+      message: `${i.demoOrdersCount} commande(s) héritée(s) du mode démo (source « demo », sans paiement réel) polluent encore les statistiques.`,
+      fix: 'Lancer le skill data_reality_audit (Hermes) puis purger ces commandes : elles ne correspondent à aucun encaissement.'
+    });
   }
 
   // S7 — prix du catalogue (Stripe refuse unit_amount <= 0)
@@ -698,7 +711,8 @@ export function stripeDoctor(i: StripeDoctorInput): { ok: boolean; checks: Strip
       whsecMasked: maskSecret(whsec),
       mode,
       currency,
-      demoCheckout: i.demoCheckout === '1'
+      realOnly: true,
+      demoOrders: i.demoOrdersCount || 0
     }
   };
 }

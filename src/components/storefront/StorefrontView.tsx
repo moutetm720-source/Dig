@@ -98,13 +98,9 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
   const [selectedProduct, setSelectedProduct] = useState<DigitalProduct | null>(null);
   const [cart, setCart] = useState<Array<{ product: DigitalProduct; quantity: number }>>([]);
   const [isCartOpen, setIsCartOpen] = useState(false);
-  const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
   const [isCryptoModalOpen, setIsCryptoModalOpen] = useState(false);
   const [completedOrder, setCompletedOrder] = useState<Order | null>(null);
   const [generatedInvoice, setGeneratedInvoice] = useState<FrenchInvoice | null>(null);
-  // Commande PENDING créée côté serveur (mode démo) — la livraison n'est
-  // accordée que par /api/checkout/demo-complete (token serveur).
-  const [pendingServerOrderId, setPendingServerOrderId] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [selectedClusterId, setSelectedClusterId] = useState<string>('all');
   const [promoCode, setPromoCode] = useState('');
@@ -374,7 +370,6 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
               setGeneratedInvoice(invoice);
               setCompletedOrder(order);
               setCart([]);
-              setIsCheckoutOpen(false);
               setIsCartOpen(false);
               store.addLog('success', 'stripe', `Confirmation Stripe : Paiement de ${finalTotal}€ validé — commande ${order.orderNumber} livrée par le serveur (Session: ${sessionId}, Client: ${custEmail || custName}).`);
             } else {
@@ -471,67 +466,14 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
         return;
       }
 
-      // SÉCURITÉ : mode démo — la commande PENDING a été créée CÔTÉ SERVEUR.
-      // La livraison n'aura lieu que via /api/checkout/demo-complete (token serveur).
-      if (data.mode === 'demo' && data.serverOrderId) {
-        setPendingServerOrderId(data.serverOrderId);
-        setIsCartOpen(false);
-        setIsCheckoutOpen(true);
-        return;
-      }
-
-      // Paiement indisponible (aucune passerelle configurée, pas de mode démo) :
-      // pas de modal, pas de livraison — message explicite.
+      // 100 % RÉEL : il n'existe plus de mode démo. Sans passerelle de paiement
+      // configurée, aucune commande n'est créée et rien n'est livré.
       setIsCartOpen(false);
       alert(data.message || 'Paiement indisponible : aucune passerelle de paiement configurée. Contactez le support.');
     } catch (e) {
       console.error("Checkout dispatch error:", e);
       setIsCartOpen(false);
       alert('Erreur lors de la création de la commande. Réessayez.');
-    } finally {
-      setIsProcessingPayment(false);
-    }
-  };
-
-  // Mode démo : la livraison est accordée UNIQUEMENT par le serveur
-  // (commande PENDING créée à l'ouverture du modal + token de téléchargement
-  // généré côté serveur). Le navigateur ne s'auto-accorde plus d'accès.
-  const handleDemoCheckout = async () => {
-    if (!customerEmail.trim() || !customerName.trim() || cart.length === 0) return;
-    if (!pendingServerOrderId) {
-      alert('Commande serveur introuvable. Fermez ce modal et relancez le paiement.');
-      return;
-    }
-
-    setIsProcessingPayment(true);
-
-    try {
-      const res = await fetch('/api/checkout/demo-complete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ serverOrderId: pendingServerOrderId })
-      });
-      const data = await res.json();
-      if (res.ok && data?.serverOrder) {
-        const order = await store.completeOrderFromServer(data.serverOrder, {
-          customerName,
-          customerEmail,
-          customerAddress
-        });
-        const invoice = billingService.generateInvoiceForOrder(order, customerAddress);
-        setGeneratedInvoice(invoice);
-        setCompletedOrder(order);
-        setCart([]);
-        setIsCheckoutOpen(false);
-        setIsCartOpen(false);
-        setPendingServerOrderId(null);
-        store.addLog('success', 'stripe', `Simulation de paiement (Mode Démo) validée : commande ${order.orderNumber} livrée par le serveur.`);
-      } else {
-        alert(data?.error || "La commande démo n'a pas pu être finalisée côté serveur.");
-      }
-    } catch (e) {
-      console.error(e);
-      alert("La commande démo n'a pas pu être finalisée (serveur injoignable).");
     } finally {
       setIsProcessingPayment(false);
     }
@@ -2002,127 +1944,6 @@ export const StorefrontView: React.FC<StorefrontViewProps> = ({
                 </div>
               </div>
             )}
-          </div>
-        </div>
-      )}
-
-      {/* Simulated Stripe Checkout Modal with French Compliance & Billing Info */}
-      {isCheckoutOpen && (
-        <div className="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50 animate-fade-in">
-          <div className="bg-slate-900 border border-slate-800 w-full max-w-md rounded-3xl p-6 space-y-5 shadow-2xl max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-              <div className="flex items-center gap-2">
-                <CreditCard className="w-5 h-5 text-indigo-400" />
-                <div>
-                  <h3 className="text-base font-bold text-white">Mode Démo (Stripe non configuré)</h3>
-                  <div className="text-[10px] text-slate-400">Simulation de paiement & facturation</div>
-                </div>
-              </div>
-              <button onClick={() => {
-                setIsCheckoutOpen(false);
-                if (customerEmail && cart.length > 0) {
-                  salesExplosionAgents.captureAbandonedCart({
-                    customerName,
-                    email: customerEmail,
-                    productId: cart[0].product.id,
-                    productTitle: cart[0].product.title,
-                    cartValue: cartTotalEur,
-                    aiHesitationReason: 'price_point'
-                  });
-                }
-              }} className="text-slate-400 hover:text-white">✕</button>
-            </div>
-
-            <div className="space-y-3.5 text-xs">
-              <div>
-                <label className="block text-slate-300 font-medium mb-1">Nom & Prénom / Raison Sociale</label>
-                <input
-                  type="text"
-                  value={customerName}
-                  onChange={e => setCustomerName(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-300 font-medium mb-1">Adresse E-mail (pour livraison & facture PDF)</label>
-                <input
-                  type="email"
-                  value={customerEmail}
-                  onChange={e => setCustomerEmail(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-300 font-medium mb-1">Adresse Postale (Facturation Légale)</label>
-                <input
-                  type="text"
-                  value={customerAddress}
-                  onChange={e => setCustomerAddress(e.target.value)}
-                  placeholder="Adresse, Code Postal, Ville"
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white"
-                />
-              </div>
-
-              <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
-                <div className="text-[11px] text-slate-400">Paiement par Carte Bancaire Sécurisée</div>
-                <div className="font-mono text-xs text-indigo-300 flex items-center justify-between">
-                  <span>•••• •••• •••• 4242</span>
-                  <span>12/28 • CVC 888</span>
-                </div>
-              </div>
-
-              {/* Legal Checkbox for Digital Content Waiver & 7-Day Guarantee (Article L221-28 13° Code Consommation) */}
-              <label className="flex items-start gap-2 text-[11px] text-slate-400 cursor-pointer pt-1">
-                <input
-                  type="checkbox"
-                  checked={agreeTerms}
-                  onChange={e => setAgreeTerms(e.target.checked)}
-                  className="mt-0.5 rounded border-slate-700 text-indigo-600 focus:ring-0"
-                />
-                <span>
-                  J'accepte les <button type="button" onClick={() => openLegal('cgv')} className="text-indigo-400 underline">CGV</button>. Conformément à l'article L.221-28 13° du Code de la Consommation, je renonce au délai de rétractation pour le téléchargement immédiat et je bénéficie de la <strong className="text-emerald-400 font-semibold">garantie satisfait ou remboursé de 7 jours</strong>.
-                </span>
-              </label>
-
-              <div className="flex items-center justify-between font-bold text-sm pt-2 border-t border-slate-800">
-                <span className="text-slate-300">Montant Total :</span>
-                <span className="text-emerald-400 text-lg">{currencyAgent.formatPrice(cartTotalEur)}</span>
-              </div>
-            </div>
-
-            <div className="pt-2 space-y-2">
-              <button
-                onClick={handleDemoCheckout}
-                disabled={isProcessingPayment || !agreeTerms}
-                className="w-full py-3.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs shadow-lg shadow-emerald-600/30 flex items-center justify-center gap-2"
-              >
-                {isProcessingPayment ? (
-                  <>
-                    <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                    <span>Validation & Génération Facture...</span>
-                  </>
-                ) : (
-                  <>
-                    <Lock className="w-3.5 h-3.5" />
-                    <span>Valider le paiement Démo ({currencyAgent.formatPrice(cartTotalEur)})</span>
-                  </>
-                )}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setIsCheckoutOpen(false);
-                  setIsCryptoModalOpen(true);
-                }}
-                className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
-              >
-                <Coins className="w-3.5 h-3.5 text-amber-400" />
-                <span>Préférer un paiement en Crypto (BTC, ETH, SOL, USDT)</span>
-              </button>
-            </div>
           </div>
         </div>
       )}

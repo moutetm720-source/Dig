@@ -6,6 +6,7 @@ import {
   TargetCountryCode 
 } from '../types';
 import { store } from './store';
+import { blockFakeData } from './realDataPolicy';
 import { safeSetItem, safeGetItem } from '../utils/safeStorage';
 
 const STORAGE_KEY = 'df_real_world_telemetry_engine_v1';
@@ -233,6 +234,13 @@ class RealWorldTelemetryService {
 
   // Trigger immediate live synchronization of real-world macro data (0€)
   public syncRealWorldDataNow(): void {
+    // 100 % RÉEL : tant qu'aucune API macro (taux de change, tendances) n'est
+    // branchée, aucune valeur n'est inventée ni « jitterée » au hasard.
+    if (blockFakeData('telemetry.macroSync')) {
+      store.addLog('info', 'ai', '📡 Télémétrie : synchronisation macro désactivée (100 % réel) — aucune donnée de marché ou de change inventée.');
+      return;
+    }
+
     // 1. Update currency jitter realistically
     this.state.currencies = this.state.currencies.map(curr => {
       const delta = (Math.random() - 0.48) * 0.005;

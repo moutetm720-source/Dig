@@ -187,14 +187,22 @@ export const SalesExplosionView: React.FC = () => {
     setTimeout(() => {
       const res = salesExplosionAgents.recoverAllCartsImmediately();
       setIsBatchRecovering(false);
-      setBatchFeedback(`⚡ ${res.recoveredCount} paniers récupérés avec succès (+€${res.totalGmvAddedEur} ajoutés au chiffre d'affaires) !`);
+      setBatchFeedback(
+        res.recoveredCount > 0
+          ? `⚡ ${res.recoveredCount} panier(s) réellement converti(s) (commandes payées vérifiées) — +€${Math.round(res.totalGmvAddedEur * 100) / 100} de CA confirmé.`
+          : '⏳ Aucune conversion réelle à confirmer : aucun de ces paniers n’est relié à une commande payée (aucun chiffre inventé).'
+      );
       setTimeout(() => setBatchFeedback(null), 5000);
     }, 500);
   };
 
   const handleSimulateDropoff = () => {
     const newCart = salesExplosionAgents.generateSimulatedDropoffCart();
-    setBatchFeedback(`🛒 Abandon simulé pour ${newCart.customerName} (${newCart.productTitle} - €${newCart.cartValue}). Séquence autonome initiée.`);
+    setBatchFeedback(
+      newCart
+        ? `🛒 Abandon simulé pour ${newCart.customerName} (${newCart.productTitle} - €${newCart.cartValue}). Séquence autonome initiée.`
+        : '🔒 Données réelles uniquement : les paniers abandonnés simulés sont désactivés. Seuls les vrais visiteurs alimentent la relance.'
+    );
     setTimeout(() => setBatchFeedback(null), 4000);
   };
 
@@ -1071,7 +1079,7 @@ export const SalesExplosionView: React.FC = () => {
                 </div>
                 <h4 className="text-sm font-bold text-white">Aucun abandon de panier en attente</h4>
                 <p className="text-xs text-slate-400 max-w-sm mx-auto">
-                  Le système est en écoute active. Vous pouvez tester le déclenchement instantané via le bouton de simulation.
+                  Le système est en écoute active sur de vrais visiteurs (aucun panier ni conversion n’est simulé : 100 % réel).
                 </p>
                 <button
                   onClick={handleSimulateDropoff}

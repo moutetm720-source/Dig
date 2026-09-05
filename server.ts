@@ -435,7 +435,6 @@ async function runStripeDoctor() {
     dbWhsec: await kvString('df_stripe_whsec'),
     mode: await kvString('df_stripe_mode'),
     currency: await kvString('df_stripe_currency'),
-    demoCheckout: (process.env.DEMO_CHECKOUT || '').trim(),
     products,
     publicUrl: (process.env.PUBLIC_URL || '').trim(),
     apiProbe: await probeStripeApi()
@@ -565,10 +564,9 @@ app.post('/api/checkout/create-session', checkoutLimiter, async (req, res) => {
 
     // Retrieve Stripe Secret Key from env or DB only (jamais du corps/header client)
     const stripeSk = await readStripeSk();
-    // Mode démo : UNIQUEMENT si explicitement activé (env DEMO_CHECKOUT=1) et
-    // si aucune clé Stripe n'est configurée. Jamais de livraison "gratuite" par
-    // défaut — sans ce flag, le paiement est simplement indisponible.
-    const demoCheckoutEnabled = (process.env.DEMO_CHECKOUT || '').trim() === '1' && !stripeSk;
+    // RÉEL UNIQUEMENT : le mode démo (DEMO_CHECKOUT=1) a été SUPPRIMÉ. Aucune
+    // commande n'est finalisée sans paiement vérifié (Stripe webhook signé ou
+    // vérification on-chain). Sans passerelle configurée → paiement indisponible.
 
     // Remise : uniquement via un code promo validé côté serveur
     let promoDiscount = 0;
@@ -666,33 +664,11 @@ app.post('/api/checkout/create-session', checkoutLimiter, async (req, res) => {
     const orderId = `srv-${Date.now().toString(36)}-${crypto.randomBytes(5).toString('hex')}`;
     const orderNumber = `DPF-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
 
-    // ---- Mode démo : explicitement activé (env) et Stripe non configuré ----
-    if (!stripeSk && demoCheckoutEnabled) {
-      const demoOrder: ServerOrder = {
-        id: orderId,
-        orderNumber,
-        items: serverItems,
-        totalCents,
-        currency: 'EUR',
-        status: 'pending_payment',
-        paymentMethod: 'demo',
-        source: 'demo',
-        customerEmail: typeof customerEmail === 'string' ? customerEmail.slice(0, 254) : undefined,
-        customerName: typeof (req.body as any)?.customerName === 'string' ? String((req.body as any).customerName).slice(0, 200) : undefined,
-        createdAt: nowIso
-      };
-      const orders = await readServerOrders();
-      orders.unshift(demoOrder);
-      await writeServerOrders(orders);
-      console.log(`[ORDER] Commande démo ${orderId} créée côté serveur (${totalCents} cents).`);
-      return res.json({ mode: 'demo', serverOrderId: orderId, totalCents });
-    }
-
-    // ---- Stripe non configuré ET pas de mode démo : paiement indisponible ----
+    // ---- Pas de passerelle réelle : aucune commande créée (plus de mode démo) ----
     if (!stripeSk) {
       return res.status(200).json({
         mode: 'unconfigured',
-        message: 'Aucune passerelle de paiement configurée sur le serveur. La commande n\'a pas été créée.'
+        message: 'Aucune passerelle de paiement configurée sur le serveur (le mode démo a été supprimé : 100 % réel). La commande n\'a pas été créée.'
       });
     }
 
@@ -903,54 +879,18 @@ app.get('/api/checkout/verify-session/:sessionId', checkoutLimiter, async (req, 
   }
 });
 
-// Mode démo (DEMO_CHECKOUT=1 + Stripe non configuré) : finalise la commande
-// démo côté serveur et retourne le token de livraison. C'est le SEUL chemin de
-// livraison en mode démo — le navigateur ne peut pas s'auto-accorder un accès.
-app.post('/api/checkout/demo-complete', checkoutLimiter, async (req, res) => {
-  try {
-    if ((process.env.DEMO_CHECKOUT || '').trim() !== '1') {
-      return res.status(404).json({ error: 'Mode démo indisponible.' });
-    }
-    const stripeSk = await readStripeSk();
-    if (stripeSk) {
-      return res.status(400).json({ error: 'Stripe configuré : utilisez le tunnel de paiement réel.' });
-    }
-    const serverOrderId = String(req.body?.serverOrderId || '');
-    if (!/^[a-z0-9-]{8,64}$/i.test(serverOrderId)) {
-      return res.status(400).json({ error: 'Identifiant de commande invalide.' });
-    }
-    const orders = await readServerOrders();
-    const order = orders.find((o) => o.id === serverOrderId);
-    if (!order) {
-      return res.status(404).json({ error: 'Commande introuvable.' });
-    }
-    if (order.source !== 'demo') {
-      return res.status(400).json({ error: 'Cette commande ne relève pas du mode démo.' });
-    }
-    if (order.status === 'paid') {
-      return res.status(409).json({ error: 'Commande déjà livrée.', serverOrderId: order.id });
-    }
-    const paid = await markServerOrderPaid(order.id, 'demo');
-    if (!paid) {
-      return res.status(404).json({ error: 'Commande introuvable.' });
-    }
-    res.json({
-      success: true,
-      serverOrder: {
-        id: paid.id,
-        orderNumber: paid.orderNumber,
-        items: paid.items,
-        totalCents: paid.totalCents,
-        currency: paid.currency,
-        paymentMethod: paid.paymentMethod,
-        downloadToken: paid.downloadToken,
-        confirmedAt: paid.confirmedAt
-      }
-    });
-  } catch (err: any) {
-    console.error('Demo checkout error:', err);
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
+// ANCIEN MODE DÉMO — SUPPRIMÉ (410 Gone).
+// Ce endpoint finalisait une commande SANS paiement (DEMO_CHECKOUT=1) : il
+// livrait le produit sans encaissement. Le projet est désormais 100 % réel :
+// une commande n'est livrée que sur paiement vérifié (webhook Stripe signé ou
+// vérification on-chain). Les commandes « demo » déjà en base ne sont plus
+// honorées — voir /api/hermes (skill data_reality_audit) pour les purger.
+app.all('/api/checkout/demo-complete', (_req, res) => {
+  res.status(410).json({
+    error: 'Mode démo supprimé : le paiement doit être réel (Stripe vérifié ou on-chain).',
+    gone: true,
+    removed: 'DEMO_CHECKOUT / /api/checkout/demo-complete'
+  });
 });
 
 // ============================================================
@@ -1290,7 +1230,10 @@ app.get('/api/checkout/config', apiLimiter, async (req, res) => {
     const stripeSk = await readStripeSk();
     res.json({
       stripeConfigured: Boolean(stripeSk),
-      demoEnabled: !stripeSk && (process.env.DEMO_CHECKOUT || '').trim() === '1'
+      demoEnabled: false,
+      note: stripeSk
+        ? 'Paiement réel uniquement (Stripe).'
+        : 'Aucune passerelle configurée : le checkout est indisponible (le mode démo a été supprimé).'
     });
   } catch (e) {
     res.json({ stripeConfigured: false, demoEnabled: false });
@@ -2458,6 +2401,31 @@ app.get('*', (req, res) => {
 
 await ensureSchema();
 
+// ---------- Bandeau de démarrage « 100 % RÉEL » ----------
+// Le serveur annonce explicitement s'il dispose d'une IA réelle, d'une
+// passerelle de paiement réelle, et si la politique « données réelles » est
+// active. Aucun fallback silencieux vers une simulation.
+async function logRealModeBanner(): Promise<void> {
+  try {
+    const { buildPool } = await import('./hermes/providers');
+    const pool = await buildPool();
+    const llm = pool.length > 0
+      ? `IA RÉELLE : ${pool.map(e => `${e.name} (${e.kind})`).join(' → ')}`
+      : 'IA RÉELLE : AUCUNE (configurez GEMINI_API_KEY ou un endpoint compatible OpenAI — le mode mock a été supprimé)';
+    const stripeSk = await readStripeSk();
+    const realData = (process.env.DIG_REAL_DATA_ONLY || '1').trim() !== '0';
+    console.log('============================================================');
+    console.log(' DIG — MODE 100 % RÉEL');
+    console.log(` ${llm}`);
+    console.log(` PAIEMENT : ${stripeSk ? 'Stripe configuré (encaissement réel)' : 'AUCUNE passerelle — checkout indisponible (mode démo supprimé)'}`);
+    console.log(` DONNÉES : ${realData ? 'aucune métrique inventée (DIG_REAL_DATA_ONLY=1)' : '⚠️ générateurs simulés RÉACTIVÉS (DIG_REAL_DATA_ONLY=0) — ne pas utiliser en production'}`);
+    console.log('============================================================');
+  } catch (e) {
+    console.warn('[real-mode] bandeau de démarrage indisponible :', (e as Error)?.message || e);
+  }
+}
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on port ${PORT}`);
+  void logRealModeBanner();
 });

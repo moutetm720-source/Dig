@@ -7,6 +7,7 @@ import {
   DigitalProduct
 } from '../types';
 import { store } from './store';
+import { blockFakeData } from './realDataPolicy';
 import { affiliatePromoKitService } from './affiliatePromoKitService';
 import { safeSetItem, safeGetItem } from '../utils/safeStorage';
 import { serverState, onSyncReady } from './syncState';
@@ -482,8 +483,14 @@ class SalesExplosionEngine {
     return newCart;
   }
 
-  // Generate real dropoff from store products for continuous stream
-  public generateSimulatedDropoffCart(customProduct?: DigitalProduct): AbandonedCartLead {
+  // 100 % RÉEL : plus de panier abandonné FABRIQUÉ (faux prospect, faux e-mail).
+  // Les paniers proviennent uniquement de vrais visiteurs (captureAbandonedCart).
+  // Renvoie null en mode « données réelles uniquement ».
+  public generateSimulatedDropoffCart(customProduct?: DigitalProduct): AbandonedCartLead | null {
+    if (blockFakeData('salesExplosion.generateSimulatedDropoffCart')) {
+      store.addLog('info', 'marketing', '🛒 Relance Panier IA : les paniers abandonnés simulés sont désactivés (100 % réel — seuls les vrais visiteurs alimentent la relance).');
+      return null;
+    }
     const products = store.getProducts();
     const product = customProduct || products[Math.floor(Math.random() * products.length)] || {
       id: 'prod-auto-1',
@@ -564,41 +571,85 @@ class SalesExplosionEngine {
     );
   }
 
-  // Fully convert cart to actual store sale & verified social proof
-  private verifyCartPayment(cart: AbandonedCartLead) {
+  /**
+   * cherche la COMMANDE RÉELLE qui correspond à ce panier (même e-mail, payée
+   * après l'abandon). Aucune conversion n'est déclarée sans commande réelle.
+   */
+  private findRealOrderForCart(cart: AbandonedCartLead): any | null {
+    const email = String(cart.email || '').trim().toLowerCase();
+    const name = String(cart.customerName || '').trim().toLowerCase();
+    const since = Date.parse(cart.abandonedAt || '') || 0;
+    const orders = store.getOrders() || [];
+    for (const o of orders) {
+      if (!o || o.paymentStatus !== 'paid') continue;
+      const created = Date.parse(o.createdAt || '') || 0;
+      if (since && created < since) continue;
+      const oEmail = String(o.customer?.email || '').trim().toLowerCase();
+      const oName = String(o.customer?.name || '').trim().toLowerCase();
+      if (email && oEmail && oEmail === email) return o;
+      if (name && oName && oName === name) return o;
+    }
+    return null;
+  }
+
+  /**
+   * Conversion d'un panier abandonné — 100 % RÉEL.
+   * Le panier n'est marqué « recovered » QUE si une commande réellement payée
+   * (Stripe vérifié / on-chain) existe. Aucun faux hash de transaction, aucun
+   * montant inventé : la preuve sociale reprend les données de la commande.
+   */
+  private verifyCartPayment(cart: AbandonedCartLead): boolean {
+    if (!cart.recoveryHistory) cart.recoveryHistory = [];
+    const realOrder = this.findRealOrderForCart(cart);
+
+    if (!realOrder) {
+      // Aucun encaissement réel : on ne fabrique ni paiement ni conversion.
+      if (cart.recoveryStep !== 'awaiting_payment') cart.recoveryStep = 'awaiting_payment';
+      cart.recoveryHistory.push({
+        timestamp: new Date().toISOString(),
+        step: 5,
+        discount: cart.recoveryDiscountPercent,
+        channel: cart.recoveryChannel,
+        note: '⏳ Séquence envoyée — en attente d’un paiement réel (aucune commande payée correspondante à ce jour).'
+      });
+      store.addLog(
+        'info',
+        'marketing',
+        `🛒 Relance Panier IA : séquence terminée pour ${cart.customerName || cart.email} — conversion NON confirmée (aucun paiement réel enregistré).`
+      );
+      return false;
+    }
+
     cart.recoveryStep = 'recovered';
     cart.recoveredAt = new Date().toISOString();
+    const finalAmount = Number(realOrder.totalAmount) || 0;
+    const method = String(realOrder.paymentMethod || 'stripe').toLowerCase();
+    const paymentMethod = (['btc', 'eth', 'sol', 'usdt'].includes(method) ? method : 'stripe') as 'stripe' | 'btc' | 'eth' | 'sol' | 'usdt';
 
-    const discountRate = (cart.recoveryDiscountPercent || 15) / 100;
-    const finalAmount = Number((cart.cartValue * (1 - discountRate)).toFixed(2));
-    const isCrypto = Math.random() > 0.7;
-    const paymentMethod = isCrypto ? 'btc' : 'stripe';
-    const txHash = isCrypto ? `0x${Math.random().toString(16).substring(2, 10)}...` : `pi_${Math.random().toString(36).substring(2, 12)}`;
-
-    if (!cart.recoveryHistory) cart.recoveryHistory = [];
     cart.recoveryHistory.push({
       timestamp: new Date().toISOString(),
       step: 5,
       discount: cart.recoveryDiscountPercent,
       channel: cart.recoveryChannel,
-      note: `🎉 Conversion confirmée : Paiement validé de €${finalAmount} (via ${paymentMethod.toUpperCase()})`
+      note: `🎉 Conversion confirmée : commande ${realOrder.orderNumber} payée de €${finalAmount} (via ${paymentMethod.toUpperCase()}).`
     });
 
-    // Push Verified Social Proof without polluting real financial orders
+    // Preuve sociale : données de la VRAIE commande (aucun hash inventé).
     this.pushVerifiedPurchase(
-      cart.customerName || 'Développeur VIP',
-      cart.country || 'France',
+      realOrder.customer?.name || cart.customerName || 'Client',
+      realOrder.customer?.country || cart.country || 'France',
       cart.productTitle,
       finalAmount,
       paymentMethod,
-      txHash
+      realOrder.stripeSessionId || realOrder.orderNumber
     );
 
     store.addLog(
       'success',
       'marketing',
-      `🎉 Relance Panier IA : Séquence terminée pour ${cart.customerName || cart.email}. Remise appliquée: ${cart.recoveryDiscountPercent}%.`
+      `🎉 Relance Panier IA : conversion réelle confirmée — commande ${realOrder.orderNumber} (€${finalAmount}) pour ${cart.customerName || cart.email}.`
     );
+    return true;
   }
 
   // 1-Click Limitless Batch Recovery
@@ -607,12 +658,15 @@ class SalesExplosionEngine {
     let gmv = 0;
 
     const unrecovered = this.abandonedCarts.filter(c => c.recoveryStep !== 'recovered' && c.recoveryStep !== 'expired');
-    
+
+    // 100 % RÉEL : seuls les paniers reliés à une commande réellement payée
+    // sont comptés (aucun GMV inventé).
     unrecovered.forEach(cart => {
-      this.verifyCartPayment(cart);
-      const discounted = cart.cartValue * (1 - (cart.recoveryDiscountPercent || 15) / 100);
-      gmv += discounted;
-      count++;
+      if (this.verifyCartPayment(cart)) {
+        const order = this.findRealOrderForCart(cart);
+        gmv += Number(order?.totalAmount) || 0;
+        count++;
+      }
     });
 
     this.saveState();
@@ -717,6 +771,13 @@ class SalesExplosionEngine {
     newlyRecruited: AffiliatePartner[];
     rejectedCandidates: AffiliatePartner[];
   } {
+    // 100 % RÉEL : plus de créateurs/affiliés FABRIQUÉS (faux profils, fausses
+    // audiences, faux taux d'engagement). Le recrutement se fait avec de vrais
+    // partenaires (recruitNewAffiliate) — sinon 0 candidat.
+    if (blockFakeData('salesExplosion.scoutAffiliates')) {
+      store.addLog('info', 'marketing', '🤝 Affiliation : le « scout » automatique de créateurs est désactivé (100 % réel) — aucun partenaire fictif n’est ajouté.');
+      return { totalScouted: 0, viableRecruitedCount: 0, rejectedCount: 0, newlyRecruited: [], rejectedCandidates: [] };
+    }
     const newlyRecruited: AffiliatePartner[] = [];
     const rejectedCandidates: AffiliatePartner[] = [];
     const requestedCount = Math.max(1, Math.min(50, count));

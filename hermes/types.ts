@@ -4,7 +4,8 @@
  * Architecture inspirée des frameworks open-source (hermes-agent de
  * NousResearch, LoCoAgent/ReAct) : boucle plan → action → observation avec
  * function calling réel, registres de skills et d'agents spécialisés,
- * multi-fournisseurs LLM (Gemini, compatible OpenAI/Ollama, mock test).
+ * multi-fournisseurs LLM RÉELS (Gemini, compatible OpenAI/Ollama/Groq…).
+ * Aucun fournisseur mock : le moteur ne simule jamais d'IA.
  */
 
 // ---------- LLM ----------
@@ -47,7 +48,8 @@ export interface LLMChatResult {
 }
 
 export interface LLMProvider {
-  id: 'gemini' | 'openai' | 'mock';
+  /** RÉEL UNIQUEMENT : le fournisseur mock de test a été supprimé du moteur. */
+  id: 'gemini' | 'openai';
   label: string;
   model: string;
   chat(opts: LLMChatOptions): Promise<LLMChatResult>;
@@ -115,7 +117,8 @@ export interface HermesChatResponse {
 // ---------- Config ----------
 
 export interface HermesConfig {
-  provider: 'auto' | 'gemini' | 'openai' | 'mock';
+  /** 'mock' a été retiré : Hermes n'accepte plus qu'un fournisseur IA RÉEL. */
+  provider: 'auto' | 'gemini' | 'openai';
   geminiModel: string;
   openaiBaseUrl: string;
   openaiModel: string;
@@ -141,12 +144,12 @@ export const HERMES_LIMITS = {
 
 export interface ProviderSpec {
   name: string;                    // identifiant ^[a-z0-9-_]{2,40}$
-  kind: 'gemini' | 'openai' | 'mock';
+  kind: 'gemini' | 'openai';       // fournisseurs RÉELS uniquement (plus de mock)
   model?: string;                  // openai : requis ; gemini : défaut gemini-2.5-flash
   baseUrl?: string;                // openai : requis (Ollama local autorisé via local:true)
   apiKey?: string;                 // stockée KV protégée, JAMAIS exposée (UI, audit, logs, /api/store)
   local?: boolean;                 // true = endpoint local (Ollama http loopback) — exception SSRF documentée
-  priority: number;                // 1 = priorité (le mock d'environnement est en 999)
+  priority: number;                // 1 = le plus prioritaire
 }
 
 export const HERMES_POOL = {

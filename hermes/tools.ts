@@ -894,7 +894,8 @@ export function buildSkillRegistry(): HermesTool[] {
             stripeConfigured: Boolean(stripeSk),
             stripeWebhookConfigured: Boolean(whsec),
             cryptoAddressConfigured: Boolean(cryptoBtc),
-            demoCheckoutEnabled: (process.env.DEMO_CHECKOUT || '') === '1' && !stripeSk
+            realOnly: true,
+            demoMode: 'supprimé (aucune commande livrée sans paiement vérifié)'
           },
           moderatorAuth: { passcodeConfigured: passcodeSet, sessionSecretConfigured: sessionSecret },
           channels: { total: integrations.length, connected: integrations.filter((i: any) => i.connected).length },
@@ -1649,7 +1650,7 @@ export function buildSkillRegistry(): HermesTool[] {
           model: { type: 'string', description: "Modèle (openai : requis ; gemini : défaut gemini-2.5-flash)" },
           baseUrl: { type: 'string', description: "URL de base compatible OpenAI (openai : requis) — https public, ou http localhost si local=true" },
           apiKey: { type: 'string', description: "Clé API (jamais exposée : stockée KV protégée, masquée partout) — requise pour gemini" },
-          priority: { type: 'number', description: '1 = le plus prioritaire (défaut 500, le mock est en 999)' },
+          priority: { type: 'number', description: '1 = le plus prioritaire (défaut 500)' },
           local: { type: 'boolean', description: 'true = endpoint local de confiance (Ollama http://localhost:11434/v1)' }
         },
         required: ['name', 'kind']
@@ -1670,7 +1671,7 @@ export function buildSkillRegistry(): HermesTool[] {
     },
     {
       name: 'providers_remove',
-      description: "Retire un fournisseur du pool (le pool reste au moins sur le mock — jamais bloqué). Les fournisseurs d'environnement (gemini-env, openai-env) ne sont pas retirables : changez HERMES_PROVIDER à la place.",
+      description: "Retire un fournisseur du pool (fournisseurs IA réels uniquement). Les fournisseurs d'environnement (gemini-env, openai-env) ne sont pas retirables : changez HERMES_PROVIDER à la place.",
       access: 'write',
       parameters: {
         type: 'object',
@@ -1782,7 +1783,7 @@ export function buildSkillRegistry(): HermesTool[] {
           envKey, dbKey, envWhsec, dbWhsec,
           mode: String((await kvGet('df_stripe_mode')) || 'test'),
           currency: String((await kvGet('df_stripe_currency')) || 'EUR'),
-          demoCheckout: (process.env.DEMO_CHECKOUT || '').trim(),
+          demoOrdersCount: (await readList('dpf_server_orders_v1')).filter(o => o && (o.source === 'demo' || o.paymentMethod === 'demo')).length,
           products,
           publicUrl: (process.env.PUBLIC_URL || '').trim(),
           apiProbe: await probeStripeApi()
@@ -1794,6 +1795,69 @@ export function buildSkillRegistry(): HermesTool[] {
           nextStep: report.ok
             ? 'Configuration Stripe cohérente : si le paiement échoue encore, lancer code_scan (erreur d’intégration client) puis vérifier le webhook dans le dashboard Stripe.'
             : 'Corriger les points en statut fail avant de re-tester un paiement.'
+        };
+      }
+    },
+
+    // ---------- 100 % RÉEL : audit et purge des données non réelles ----------
+    {
+      name: 'data_reality_audit',
+      description: "Audit « 100 % réel » : détecte les données NON réelles encore stockées (commandes héritées de l'ancien mode démo — aucun encaissement —, commandes marquées payées sans preuve de paiement) et indique la marche à suivre. Lecture seule : ne modifie rien et n'invente aucun chiffre.",
+      access: 'read',
+      parameters: { type: 'object', properties: {} },
+      async run() {
+        const serverOrders = await readList('dpf_server_orders_v1');
+        const uiOrders = await readList('dpf_app_v2_orders');
+        const isDemo = (o: any) => Boolean(o && (o.source === 'demo' || o.paymentMethod === 'demo' || o.source === 'simulation' || o.mode === 'demo'));
+        const demoServer = serverOrders.filter(isDemo);
+        const demoUi = uiOrders.filter(isDemo);
+        const paidWithoutProof = serverOrders.filter(o => o && o.status === 'paid' && !o.confirmedAt && !o.paidAt && o.source !== 'crypto');
+        const total = demoServer.length + demoUi.length;
+        return {
+          policy: 'real-only',
+          demoModeEnv: (process.env.DEMO_CHECKOUT || '').trim() || null,
+          demoModeNote: "DEMO_CHECKOUT est obsolète : le tunnel de démo a été supprimé (410 Gone). Aucune commande n'est livrée sans paiement vérifié.",
+          serverOrders: { total: serverOrders.length, nonReal: demoServer.length, ids: demoServer.slice(0, 25).map(o => o.id) },
+          clientOrders: { total: uiOrders.length, nonReal: demoUi.length, ids: demoUi.slice(0, 25).map(o => o.id) },
+          paidWithoutProof: {
+            count: paidWithoutProof.length,
+            ids: paidWithoutProof.slice(0, 25).map(o => o.id),
+            note: 'Commandes « paid » sans horodatage de confirmation (webhook/contrôle serveur) : à vérifier avant de les compter comme du CA.'
+          },
+          clean: total === 0,
+          nextStep: total === 0
+            ? 'Aucune donnée non réelle détectée : les statistiques ne reposent que sur de vraies commandes.'
+            : `Lancer le skill data_purge_demo (confirmation requise) pour retirer ces ${total} commande(s) sans encaissement des statistiques.`
+        };
+      }
+    },
+    {
+      name: 'data_purge_demo',
+      description: "Purge les commandes NON réelles (héritées de l'ancien mode démo : livrées sans encaissement) du stockage serveur (dpf_server_orders_v1) et du stockage UI (dpf_app_v2_orders). Destructif : confirm:true obligatoire, action journalisée.",
+      access: 'destructive',
+      requiresConfirmation: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          confirm: { type: 'boolean', description: 'Confirmation explicite requise (vrai seulement si l’utilisateur a confirmé)' }
+        },
+        required: []
+      },
+      async run(args) {
+        const isDemo = (o: any) => Boolean(o && (o.source === 'demo' || o.paymentMethod === 'demo' || o.source === 'simulation' || o.mode === 'demo'));
+        const serverOrders = await readList('dpf_server_orders_v1');
+        const uiOrders = await readList('dpf_app_v2_orders');
+        const keptServer = serverOrders.filter(o => !isDemo(o));
+        const keptUi = uiOrders.filter(o => !isDemo(o));
+        const removedServer = serverOrders.length - keptServer.length;
+        const removedUi = uiOrders.length - keptUi.length;
+        if (removedServer > 0) await kvSet('dpf_server_orders_v1', keptServer);
+        if (removedUi > 0) await writeList('dpf_app_v2_orders', keptUi);
+        return {
+          purged: true,
+          removed: { serverOrders: removedServer, clientOrders: removedUi },
+          remaining: { serverOrders: keptServer.length, clientOrders: keptUi.length },
+          note: 'Seules les commandes sans encaissement réel ont été retirées. Les commandes payées (Stripe vérifié / on-chain) sont conservées.'
         };
       }
     }
