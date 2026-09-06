@@ -495,14 +495,14 @@ export const initialIntegrations: IntegrationStatus[] = [
   },
   {
     id: 'int-gemini',
-    name: 'Google Gemini 2.5 AI',
+    name: 'Google Gemini 3 AI',
     service: 'gemini',
     connected: true,
-    statusText: 'Connected (gemini-2.5-flash & gemini-2.5-pro active)',
-    lastSync: '2026-08-19T08:00:00.000Z',
+    statusText: 'Connected (gemini-3.5-flash-lite & gemini-3.8-flash active)',
+    lastSync: '2026-09-06T08:00:00.000Z',
     config: {
-      model: 'gemini-2.5-flash',
-      fallbackModel: 'gemini-2.5-pro',
+      model: 'gemini-3.5-flash-lite',
+      fallbackModel: 'gemini-3.8-flash',
       temperature: '0.7',
       maxTokens: '8192'
     }

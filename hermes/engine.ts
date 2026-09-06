@@ -291,10 +291,15 @@ export async function runAgentChat(opts: {
 
   await pushMemory(agent.id, opts.prompt, steps, finalText);
 
+  // Modèle réellement utilisé : après un repli automatique (ex. 404 modèle
+  // Gemini déprécié), on rapporte le modèle EFFECTIF, pas le configuré.
+  const effectiveModel = (active?.provider as any)?.effectiveModel;
+  const reportedModel = effectiveModel && active ? `${active.model} → ${effectiveModel} (repli auto)` : active?.model || '-';
+
   return {
     response: finalText,
     provider: active?.provider.label || 'aucun',
-    model: active?.model || '-',
+    model: reportedModel,
     agent: agent.id,
     steps,
     pendingConfirmation,

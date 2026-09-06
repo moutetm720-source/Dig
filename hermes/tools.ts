@@ -1647,7 +1647,7 @@ export function buildSkillRegistry(): HermesTool[] {
         properties: {
           name: { type: 'string', description: 'Identifiant 2-40 car. [a-z0-9-_-]' },
           kind: { type: 'string', enum: ['gemini', 'openai'], description: "Type d'endpoint" },
-          model: { type: 'string', description: "Modèle (openai : requis ; gemini : défaut gemini-2.5-flash)" },
+          model: { type: 'string', description: "Modèle (openai : requis ; gemini : défaut gemini-3.5-flash-lite — repli automatique sur un modèle disponible si déprécié)" },
           baseUrl: { type: 'string', description: "URL de base compatible OpenAI (openai : requis) — https public, ou http localhost si local=true" },
           apiKey: { type: 'string', description: "Clé API (jamais exposée : stockée KV protégée, masquée partout) — requise pour gemini" },
           priority: { type: 'number', description: '1 = le plus prioritaire (défaut 500)' },
