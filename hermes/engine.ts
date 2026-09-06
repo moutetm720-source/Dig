@@ -282,11 +282,17 @@ export async function runAgentChat(opts: {
       usage.outputTokens = (usage.outputTokens || 0) + (out.usage.outputTokens || 0);
     }
 
-    // Appel(s) d'outils
+    // Appel(s) d'outils - FIX thought_signature préservé pour Gemini 2.5/3.x
     if (out.toolCalls && out.toolCalls.length > 0) {
       for (const call of out.toolCalls.slice(0, 4)) {
         if (!call?.name) continue;
-        events.push({ type: 'tool_call', name: call.name, args: call.args || {} });
+        events.push({
+          type: 'tool_call',
+          name: call.name,
+          args: call.args || {},
+          ...( (call as any).thoughtSignature ? { thoughtSignature: (call as any).thoughtSignature } : {} ),
+          ...( (call as any).thought_signature ? { thought_signature: (call as any).thought_signature } : {} )
+        });
         const exec = await executeSkill(call.name, call.args || {}, ctx, steps, callCount);
         if (exec.status === 'confirmation_required' && exec.actionId) {
           pendingConfirmation = { actionId: exec.actionId, tool: call.name, summary: exec.result.summary };
@@ -372,7 +378,13 @@ export async function runSubAgent(agent: { id: string; name: string; systemPromp
       let blocked = false;
       for (const call of out.toolCalls.slice(0, 3)) {
         if (!call?.name) continue;
-        events.push({ type: 'tool_call', name: call.name, args: call.args || {} });
+        events.push({
+          type: 'tool_call',
+          name: call.name,
+          args: call.args || {},
+          ...((call as any).thoughtSignature ? { thoughtSignature: (call as any).thoughtSignature } : {}),
+          ...((call as any).thought_signature ? { thought_signature: (call as any).thought_signature } : {})
+        });
         const exec = await executeSkill(call.name, call.args || {}, ctx, steps, callCount);
         if (exec.status === 'confirmation_required') {
           blocked = true;

@@ -290,5 +290,61 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
     }
   });
 
+  // ---- Catalogue des providers gratuits (sans clé / free tier) ----
+  router.get('/free-catalog', apiLimiter, async (req, res) => {
+    try {
+      const { getFreeCatalogForUI, FREE_CATALOG } = await import('./freeProviders');
+      const pool = await getPoolStatus();
+      res.json({
+        total: FREE_CATALOG.length,
+        configuredEnv: FREE_CATALOG.filter(f => f.envKey && process.env[f.envKey]).map(f => f.id),
+        anonymousAlwaysOn: ['ovh-free', 'llm7-free'],
+        poolActive: pool.map(p => p.name),
+        catalog: getFreeCatalogForUI(),
+        howTo: {
+          ovh: 'Aucune clé nécessaire — fonctionne directement (2 RPM/IP). Déjà actif en fallback.',
+          llm7: 'Aucune clé nécessaire — turbo models en anonyme. Déjà actif en fallback.',
+          groq: 'Inscrivez-vous sur https://console.groq.com/keys (gratuit, sans CB) puis définissez GROQ_API_KEY dans .env — auto-détecté au démarrage.',
+          openrouter: 'Inscrivez-vous sur https://openrouter.ai/keys (gratuit) puis OPENROUTER_API_KEY — donne accès aux modèles :free',
+          mistral: 'https://console.mistral.ai/api-keys — free mode $10 crédits',
+        }
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ---- Installation rapide d'un provider gratuit ----
+  router.post('/free-install/:id', requireAuth, apiLimiter, async (req, res) => {
+    try {
+      const { FREE_CATALOG } = await import('./freeProviders');
+      const id = String(req.params.id || '').toLowerCase();
+      const info = FREE_CATALOG.find(f => f.id === id);
+      if (!info) return res.status(404).json({ error: `Provider gratuit inconnu : ${id}. Disponibles : ${FREE_CATALOG.map(f => f.id).join(', ')}` });
+
+      const apiKey = req.body?.apiKey ? String(req.body.apiKey).trim() : undefined;
+      if (info.needsKey && !apiKey && !process.env[info.envKey || '']) {
+        return res.status(400).json({
+          error: `Ce provider nécessite une clé gratuite. Obtenez-la sur ${info.docsUrl} puis fournissez {\"apiKey\":\"...\"} ou définissez ${info.envKey} dans .env`,
+          docsUrl: info.docsUrl,
+          envKey: info.envKey
+        });
+      }
+
+      const { addProvider } = await import('./providers');
+      const { entry } = await addProvider({
+        name: info.id,
+        kind: 'openai',
+        model: req.body?.model ? String(req.body.model) : info.model,
+        baseUrl: info.baseUrl,
+        apiKey: apiKey || (info.envKey ? process.env[info.envKey] : undefined),
+        priority: info.priority
+      });
+      res.json({ installed: true, entry, catalog: info });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
   return router;
 }

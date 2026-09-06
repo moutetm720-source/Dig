@@ -36,8 +36,31 @@ const REAL_PROVIDER_CHOICES = ['auto', 'gemini', 'openai'] as const;
 
 /** Message d'aide, réutilisé partout (status, erreurs de chat, autonomie). */
 export function realProviderHelp(): string {
-  return 'Configurez un fournisseur IA RÉEL : GEMINI_API_KEY (Google AI Studio, gratuit — modèle conseillé : gemini-3.5-flash-lite) — ou HERMES_OPENAI_BASE_URL + HERMES_OPENAI_MODEL + HERMES_OPENAI_API_KEY (Ollama local : `node scripts/setup-local-llm.mjs`, Groq, OpenRouter…) — ou ajoutez un fournisseur au pool (POST /api/hermes/providers).';
+  return 'Configurez un fournisseur IA RÉEL : GEMINI_API_KEY (Google AI Studio, gratuit — modèle conseillé : gemini-3.5-flash-lite) — ou HERMES_OPENAI_BASE_URL + HERMES_OPENAI_MODEL + HERMES_OPENAI_API_KEY (Ollama local : `node scripts/setup-local-llm.mjs`, Groq, OpenRouter…) — ou ajoutez un fournisseur au pool (POST /api/hermes/providers). Providers gratuits sans clé disponibles automatiquement : OVHcloud AI Endpoints (2 RPM/IP), LLM7.io (free tier), OpenRouter :free, Groq (free tier). Voir GET /api/hermes/providers et skill free_llm_lookup.';
 }
+
+// ---------- Fournisseurs gratuits sans clé (toujours disponibles en fallback) ----------
+// Ces endpoints sont 100% gratuits et ne nécessitent pas de clé API.
+// Ils sont ajoutés automatiquement au pool avec basse priorité (800+) pour
+// garantir qu'Hermes fonctionne même sans GEMINI_API_KEY ni Ollama local.
+// Source : hermes/knowledge/free-llm-apis.json
+// Seuls OVH et LLM7 sont vraiment anonymes ; Groq/OpenRouter exigent une clé gratuite.
+export const FREE_ANONYMOUS_PROVIDERS: ProviderSpec[] = [
+  {
+    name: 'ovh-free',
+    kind: 'openai',
+    model: 'gpt-oss-20b',
+    baseUrl: 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1',
+    priority: 800,
+  },
+  {
+    name: 'llm7-free',
+    kind: 'openai',
+    model: 'gpt-oss:20b',
+    baseUrl: 'https://api.llm7.io/v1',
+    priority: 810,
+  },
+];
 
 export async function getHermesConfig(): Promise<HermesConfig> {
   if (configCache && Date.now() - configCache.at < 15 * 1000) return configCache.cfg;
@@ -175,15 +198,36 @@ export class GeminiProvider implements LLMProvider {
 
   private async chatOnce(model: string, opts: LLMChatOptions): Promise<LLMChatResult> {
     // Conversion du log plat en contents Gemini (texte + functionCall/functionResponse)
+    // FIX thought_signature : Gemini 2.5/3.x avec thinking renvoie un thoughtSignature
+    // dans chaque functionCall. Si on ne le renvoie pas à l'historique, l'API répond
+    // 400 "Function call is missing a thought_signature". On le préserve donc.
     const contents: any[] = [];
     for (const ev of opts.events) {
       if (ev.type === 'text') {
         contents.push({ role: ev.role === 'model' ? 'model' : 'user', parts: [{ text: ev.text }] });
       } else if (ev.type === 'tool_call') {
-        contents.push({
-          role: 'model',
-          parts: [{ functionCall: { name: ev.name, args: ev.args || {} } }]
-        });
+        const sig = (ev as any).thoughtSignature || (ev as any).thought_signature;
+        const fc: any = { name: ev.name, args: ev.args || {} };
+        // Le SDK @google/genai attend thoughtSignature en camelCase, mais on met les deux pour compat
+        if (sig) {
+          fc.thoughtSignature = sig;
+          fc.thought_signature = sig;
+        }
+        // Si la signature était dans un champ séparé du part, on doit aussi l'injecter comme part thoughtSignature
+        if (sig) {
+          contents.push({
+            role: 'model',
+            parts: [
+              { thoughtSignature: sig } as any,
+              { functionCall: fc }
+            ]
+          });
+        } else {
+          contents.push({
+            role: 'model',
+            parts: [{ functionCall: fc }]
+          });
+        }
       } else if (ev.type === 'tool_result') {
         contents.push({
           role: 'user',
@@ -208,13 +252,26 @@ export class GeminiProvider implements LLMProvider {
 
     const candidate = (res as any)?.candidates?.[0];
     const parts: any[] = candidate?.content?.parts || [];
-    const toolCalls: Array<{ name: string; args: Record<string, any> }> = [];
+    const toolCalls: Array<{ name: string; args: Record<string, any>; thoughtSignature?: string }> = [];
     let text = '';
+    let lastThoughtSignature: string | undefined;
     for (const p of parts) {
+      // Le thoughtSignature peut arriver comme part séparée juste avant functionCall
+      if (p.thoughtSignature || p.thought_signature) {
+        lastThoughtSignature = p.thoughtSignature || p.thought_signature;
+        continue;
+      }
       if (p.functionCall) {
-        toolCalls.push({ name: String(p.functionCall.name), args: p.functionCall.args || {} });
+        const sig = p.functionCall.thoughtSignature || p.functionCall.thought_signature || lastThoughtSignature || p.thoughtSignature || (p as any).thought_signature;
+        toolCalls.push({
+          name: String(p.functionCall.name),
+          args: p.functionCall.args || {},
+          ...(sig ? { thoughtSignature: sig, thought_signature: sig } : {})
+        });
+        lastThoughtSignature = undefined;
       } else if (typeof p.text === 'string') {
         text += p.text;
+        lastThoughtSignature = undefined;
       }
     }
     return {
@@ -467,8 +524,40 @@ export async function buildPool(): Promise<PoolEntry[]> {
   // Fournisseurs gérés au runtime (KV) — hors verrou exclusif gemini/openai
   if (choice === 'auto') {
     for (const s of await loadPoolSpecs()) specs.push(s);
+    // --- GRATUITS : toujours présents en fallback (priorité 800+) ---
+    // OVH et LLM7 sont sans clé, donc disponibles immédiatement.
+    // Les autres (Groq, OpenRouter) ne seront utilisables que si une clé est fournie via env ou pool.
+    // On filtre ceux qui nécessitent une clé si elle est absente, sauf si déjà en pool géré.
+    const hasOvh = specs.some(s => s.baseUrl?.includes('kepler.ai.cloud.ovh.net'));
+    const hasLlm7 = specs.some(s => s.baseUrl?.includes('llm7.io'));
+    if (!hasOvh) {
+      const ovh = FREE_ANONYMOUS_PROVIDERS.find(p => p.name === 'ovh-free')!;
+      specs.push(specFromEnv(ovh.name, ovh.kind, ovh.model!, ovh.priority, ovh.baseUrl, undefined, false));
+    }
+    if (!hasLlm7) {
+      const llm7 = FREE_ANONYMOUS_PROVIDERS.find(p => p.name === 'llm7-free')!;
+      specs.push(specFromEnv(llm7.name, llm7.kind, llm7.model!, llm7.priority, llm7.baseUrl, undefined, false));
+    }
+    // Si une clé Groq/OpenRouter est dispo dans l'env, on les ajoute aussi comme gratuits
+    const groqKey = (process.env.GROQ_API_KEY || '').trim();
+    if (groqKey && !specs.some(s => s.name === 'groq-free')) {
+      specs.push(specFromEnv('groq-free', 'openai', 'llama-3.1-8b-instant', 100, 'https://api.groq.com/openai/v1', groqKey, false));
+    }
+    const openRouterKey = (process.env.OPENROUTER_API_KEY || '').trim();
+    if (openRouterKey && !specs.some(s => s.name === 'openrouter-free')) {
+      specs.push(specFromEnv('openrouter-free', 'openai', 'openai/gpt-oss-20b:free', 120, 'https://openrouter.ai/api/v1', openRouterKey, false));
+    }
+    // Compat : ancien nom kilo-free (même endpoint)
+    if (openRouterKey && !specs.some(s => s.name === 'kilo-free') && specs.some(s => s.name === 'openrouter-free')) {
+      // ne duplique pas, openrouter-free suffit
+    }
   }
-  // AUCUN filet mock : si le pool est vide, le moteur l'annonce explicitement.
+  // Si le pool reste vide (aucun env, aucun KV), on garde quand même les anonymes gratuits en dernier recours
+  if (specs.length === 0) {
+    for (const fp of FREE_ANONYMOUS_PROVIDERS.slice(0, 2)) {
+      specs.push(specFromEnv(fp.name, fp.kind, fp.model!, fp.priority, fp.baseUrl, undefined, false));
+    }
+  }
 
   const entries: PoolEntry[] = specs.map(spec => {
     const isEnv = spec.name.endsWith('-env');
