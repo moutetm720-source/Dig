@@ -10,7 +10,7 @@ et une sécurité durcie (voir [`AUDIT_SECURITE.md`](AUDIT_SECURITE.md)).
 - **Serveur** : Node.js + Express (TypeScript, `tsx`), PostgreSQL (drizzle-orm, key-value store), `server.ts`
 - **Client** : React 18 + Vite + Tailwind (`src/`)
 - **IA** : moteur d'agent Hermes (`hermes/`) — boucle tool-calling réelle, **pool multi-fournisseurs avec bascule automatique** (anti rate-limit), gestionnaire d'API & tokens pilotable par Hermes, **docteur de code** (`code_doctor`) qui détecte et corrige les erreurs d'intégration client ↔ API, **autonomie serveur** (cycles planifiés, actions sûres, journal) et skills **repos GitHub / liens / référentiels locaux**
-- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (82 tests — fournisseur IA **réel** requis, les tests d'interprétation sont ignorés si aucun n'est configuré), `scripts/verify-diagnostics.mjs` (40 tests — docteur de code), `scripts/verify-providers.mjs` (8 tests — transport fournisseurs : repli de modèle Gemini, erreurs réseau, clés du pool)
+- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (82 tests — fournisseur IA **réel** requis, les tests d'interprétation sont ignorés si aucun n'est configuré), `scripts/verify-diagnostics.mjs` (40 tests — docteur de code), `scripts/verify-providers.mjs` (8 tests — transport fournisseurs : repli de modèle Gemini, erreurs réseau, clés du pool), `scripts/verify-capabilities.mjs` (9 tests — capacités « agent évolutif » : implantation de code, clone GitHub live, mémoire, skills custom webhook)
 
 ## Mode « 100 % réel »
 
@@ -129,6 +129,19 @@ télécharge un modèle qui supporte le *function calling*, vérifie le tool-cal
 par un appel réel, puis affiche les lignes `.env` exactes (`HERMES_OPENAI_BASE_URL`
 etc.). Hermes fonctionne ainsi même sans `GEMINI_API_KEY` — et le pool bascule
 automatiquement cloud → local en cas d'erreur.
+
+#### Capacités « agent intelligent, apprenant, évolutif » (vérifiées par `scripts/verify-capabilities.mjs`)
+
+| Capacité | Skills | Réel comment ? |
+|---|---|---|
+| **Implanter du code** | `code_read`, `code_write` | Lecture/écriture RÉELLE de fichiers projet (src/, hermes/, scripts/, public/ — périmètre + extensions contrôlés, secrets `.env*` refusés, backup automatique dans `.dig-doctor/backups/`, **confirmation obligatoire**, puis `npm run lint`/`build`) |
+| **Recherche internet** | `web_search`, `web_fetch`, `web_link_check` | DuckDuckGo SANS clé (repli automatique html → lite), lecture de pages (https, anti-SSRF), contrôle de liens |
+| **Télécharger des skills** | `skills_custom_list/install/remove` | Skills **webhook** installés À CHAUD (KV `df_hermes_custom_skills`) : spec JSON inline ou servie par URL — GET (lecture) ou POST (confirmation), endpoint https public ou localhost déclaré ; rejoués au démarrage, visibles de tous les agents immédiatement |
+| **Implanter des repos** | `repo_clone`, `repo_files`, `repo_remove` | `git clone --depth 1` RÉEL d'un repo GitHub public dans `references/_clones/` (25 max, gitignoré), puis liste / lecture / grep de ses fichiers |
+| **Apprendre / se souvenir** | `memory_search` (+ injection auto) | Les 50 derniers échanges (KV `df_hermes_memories`) sont **rappelés automatiquement** dans le prompt système et **consultables** par recherche plein-texte |
+| **Multi-agents & autonomie** | `list_agents`, `dispatch_agent`, cycles planifiés | Orchestrateur + 8 spécialistes, sous-agents budgétés, cycles autonomes en lecture/brouillons uniquement (skills custom exclus du périmètre d'autonomie) |
+
+Sécurité : toutes les écritures destructives passent par la **porte de confirmation** (`confirm: true` → `POST /api/hermes/confirm`), la garde anti-SSRF s'applique à tout appel sortant (y compris webhooks des skills custom), et aucun secret n'est jamais exposé en clair.
 
 #### Dépannage : « Tous les fournisseurs IA réels sont indisponibles »
 
@@ -286,6 +299,7 @@ node scripts/verify-security.mjs --base http://127.0.0.1:3211 --passcode <code> 
 node scripts/verify-hermes.mjs    --base http://127.0.0.1:3211 --passcode <code>
 node scripts/verify-diagnostics.mjs --base http://127.0.0.1:3211 --passcode <code>
 node_modules/.bin/tsx scripts/verify-providers.mjs   # transport (stubs locaux, sans serveur ni clé)
+DB_HOST=127.0.0.1 node_modules/.bin/tsx scripts/verify-capabilities.mjs   # capacités réelles (clone GitHub live si réseau)
 
 # 4. Audit statique du mode « 100 % réel » (aucun serveur requis)
 node scripts/verify-real-data.mjs

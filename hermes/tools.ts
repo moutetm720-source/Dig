@@ -21,6 +21,13 @@ import { keyValueStore } from '../src/db/schema';
 import { eq } from 'drizzle-orm';
 import { assertSafeOutbound } from '../ssrfGuard';
 import { HermesContext, HermesTool, ToolParameterSchema } from './types';
+import {
+  customSkillTools, ensureCustomSkillsLoaded, installCustomSkill, removeCustomSkill,
+  listCustomSkillSpecs, cloneRepo, listClones, readCloneFile, grepClone, removeClone,
+  walkFiles, searchMemories, cloneDirChecked
+} from './extendSkills';
+
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // ---------- Helpers KV ----------
 
@@ -88,6 +95,46 @@ const num = (v: any, min = -Infinity, max = Infinity) => {
   return n;
 };
 
+// ---------- Helpers fichiers projet (skills code_read / code_write) ----------
+
+/** Extensions code/texte lisibles et implantables (tout binaire refusé). */
+const CODE_FILE_EXT = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.md', '.mdx', '.txt', '.css', '.scss', '.html', '.htm', '.yml', '.yaml', '.svg', '.sh', '.py', '.sql', '.xml', '.toml', '.gitignore', '.gitattributes', '.dockerignore', '.example', '.patch', '.editorconfig']);
+/** Répertoires où code_write peut créer/modifier des fichiers. */
+const CODE_WRITE_DIRS = new Set(['src', 'hermes', 'scripts', 'public']);
+
+/**
+ * Résout un chemin RELATIF du projet en chemin absolu sûr pour code_read /
+ * code_write. Refus : chemins absolus, remontée (..), segments vides, secrets
+ * (.env*, *.pem, *.key), dépendances (node_modules, .git, dist, build,
+ * coverage), binaires, fichiers verrous. forWrite=true restreint en plus aux
+ * répertoires auteurs (src/, hermes/, scripts/, public/, racine).
+ */
+export function resolveProjectFile(input: string, forWrite: boolean): { abs: string; rel: string } {
+  const rel = String(input || '').trim().replace(/\\/g, '/');
+  if (!rel) throw new Error('Chemin vide.');
+  if (rel.startsWith('/') || /^[a-zA-Z]:/.test(rel)) throw new Error('Chemin absolu interdit — utilisez un chemin relatif au projet.');
+  const parts = rel.split('/').filter(p => p.length > 0);
+  if (parts.some(p => p === '..' || p === '.')) throw new Error('Segments "." / ".." interdits.');
+  if (parts.length > 8) throw new Error('Chemin trop profond (max 8 niveaux).');
+  const lower = rel.toLowerCase();
+  if (lower.startsWith('.env') || lower.startsWith('env.')) throw new Error('Fichiers .env* interdits (secrets).');
+  if (/\.(pem|key|p12|pfx|crt)$/i.test(lower)) throw new Error('Fichiers de secrets/certificats interdits.');
+  if (['node_modules', '.git', 'dist', 'build', 'coverage', '.local-llm', '.dig-doctor', 'references'].includes(parts[0])) {
+    throw new Error(`Répertoire interdit : ${parts[0]} (périmètre : src/, hermes/, scripts/, public/, racine).`);
+  }
+  const base = path.basename(lower);
+  if (base === 'package-lock.json' || base === 'bun.lock' || lower.endsWith('.lock')) throw new Error('Fichiers verrous interdits.');
+  if (parts.length > 1 && !CODE_FILE_EXT.has(path.extname(lower)) && !base.startsWith('.')) {
+    throw new Error(`Extension non autorisée (${path.extname(lower) || 'aucune'}) — fichiers code/texte uniquement.`);
+  }
+  if (forWrite && parts.length > 1 && !CODE_WRITE_DIRS.has(parts[0])) {
+    throw new Error(`Écriture limitée aux répertoires src/, hermes/, scripts/, public/ (et fichiers racine) — pas « ${parts[0]}/ ».`);
+  }
+  const abs = path.resolve(PROJECT_ROOT, rel);
+  if (!abs.startsWith(PROJECT_ROOT + path.sep)) throw new Error('Chemin hors du projet.');
+  return { abs, rel: parts.join('/') };
+}
+
 // ---------- Helpers réseau / HTML (skills internet) ----------
 
 async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -112,6 +159,57 @@ function decodeEntities(s: string): string {
 export function stripTags(html: string): string {
   return decodeEntities(html.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
 }
+
+// ---------- Parseurs DuckDuckGo (exportés pour tests hors-ligne) ----------
+
+export interface WebSearchResult { title: string; url: string; snippet: string }
+
+/** Résout les liens de redirection DDG (…?uddg=<url encodée>). */
+function ddgDirectLink(rawHref: string): string | null {
+  let url = rawHref;
+  const uddg = rawHref.match(/[?&]uddg=([^&]+)/);
+  if (uddg) { try { url = decodeURIComponent(uddg[1]); } catch { /* garde raw */ } }
+  return /^https?:\/\//i.test(url) ? url : null;
+}
+
+/** Parse la page html.duckduckgo.com/html/ (blocs result__a / result__snippet).
+ * Attributs insensibles à l'ordre (href avant ou après class). */
+export function parseDdgHtmlResults(html: string, count: number): WebSearchResult[] {
+  const results: WebSearchResult[] = [];
+  const blockRe = /<a([^>]*result__a[^>]*)>([\s\S]*?)<\/a>([\s\S]*?)<\/div>/g;
+  let m: RegExpExecArray | null;
+  while ((m = blockRe.exec(html)) !== null && results.length < count) {
+    const href = /href="([^"]+)"/.exec(m[1]);
+    if (!href) continue;
+    const url = ddgDirectLink(href[1]);
+    if (!url) continue;
+    const title = stripTags(m[2]).trim();
+    const snip = stripTags((m[3].match(/result__snippet[\s\S]*?>([\s\S]*?)<\/a>/) || [])[1] || '').trim();
+    if (title) results.push({ title: title.slice(0, 150), url: url.slice(0, 400), snippet: snip.slice(0, 250) });
+  }
+  return results;
+}
+
+/** Parse la page lite.duckduckgo.com/lite/ (tableaux : a.result-link + td.result-snippet).
+ * Attributs insensibles à l'ordre (href avant ou après class). */
+export function parseDdgLiteResults(html: string, count: number): WebSearchResult[] {
+  const results: WebSearchResult[] = [];
+  const linkRe = /<a([^>]*result-link[^>]*)>([\s\S]*?)<\/a>/g;
+  const snippets = [...html.matchAll(/result-snippet[^>]*>([\s\S]*?)<\/td>/g)].map(m => stripTags(m[1]).trim());
+  let i = 0;
+  let m: RegExpExecArray | null;
+  while ((m = linkRe.exec(html)) !== null && results.length < count) {
+    const href = /href="([^"]+)"/.exec(m[1]);
+    const url = href ? ddgDirectLink(href[1]) : null;
+    const title = stripTags(m[2]).trim();
+    if (url && title) {
+      results.push({ title: title.slice(0, 150), url: url.slice(0, 400), snippet: (snippets[i] || '').slice(0, 250) });
+    }
+    i++;
+  }
+  return results;
+}
+
 
 /** HTML → texte lisible (supprime script/style/nav, conserve la structure). */
 export function htmlToText(html: string): string {
@@ -997,12 +1095,12 @@ export function buildSkillRegistry(): HermesTool[] {
     // de résultat inventé).
     {
       name: 'web_search',
-      description: "Recherche sur internet (DuckDuckGo, sans clé API). Renvoie les N premiers résultats (titre, URL, extrait).",
+      description: "Recherche sur internet (DuckDuckGo, sans clé API — repli automatique html vers lite si l'un des endpoints est indisponible). Renvoie les N premiers résultats (titre, URL, extrait).",
       access: 'read',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Requête de recherche (≤300 car.)' },
+          query: { type: 'string', description: 'Requête de recherche (max 300 car.)' },
           count: { type: 'number', description: 'Nombre de résultats (1-10, défaut 5)' }
         },
         required: ['query']
@@ -1011,33 +1109,40 @@ export function buildSkillRegistry(): HermesTool[] {
         const query = str(args.query, 300);
         if (!query) throw new Error('query vide.');
         const count = Math.min(10, Math.max(1, Math.trunc(Number(args.count) || 5)));
-        const target = 'https://html.duckduckgo.com/html/';
-        await assertSafeOutbound(target);
-        const res = await netFetch(target, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
-          },
-          body: `q=${encodeURIComponent(query)}`
-        }, 15_000, 'web_search');
-        if (!res.ok) throw new Error(`Moteur de recherche indisponible (HTTP ${res.status}).`);
-        const html = await res.text();
-        const results: Array<{ title: string; url: string; snippet: string }> = [];
-        // Blocs de résultats : <a class="result__a" href="...">Titre</a> ... <a class="result__snippet">Extrait</a>
-        const blockRe = /<a[^>]*class="[^"]*result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>([\s\S]*?)<\/div>/g;
-        let m: RegExpExecArray | null;
-        while ((m = blockRe.exec(html)) !== null && results.length < count) {
-          const rawHref = m[1];
-          let url = rawHref;
-          const uddg = rawHref.match(/[?&]uddg=([^&]+)/);
-          if (uddg) { try { url = decodeURIComponent(uddg[1]); } catch { /* garde raw */ } }
-          if (!/^https?:\/\//i.test(url)) continue;
-          const title = stripTags(m[2]).trim();
-          const snip = stripTags((m[3].match(/class="[^"]*result__snippet[^"]*"[\s\S]*?>([\s\S]*?)<\/a>/) || [])[1] || '').trim();
-          if (title) results.push({ title: title.slice(0, 150), url: url.slice(0, 400), snippet: snip.slice(0, 250) });
-        }
-        return { query, source: 'duckduckgo', count: results.length, results };
+        const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+        const errors: string[] = [];
+
+        // Endpoint 1 : html.duckduckgo.com/html/
+        try {
+          const target = 'https://html.duckduckgo.com/html/';
+          await assertSafeOutbound(target);
+          const res = await netFetch(target, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA },
+            body: `q=${encodeURIComponent(query)}`
+          }, 15_000, 'web_search');
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const results = parseDdgHtmlResults(await res.text(), count);
+          if (results.length > 0) return { query, source: 'duckduckgo-html', count: results.length, results };
+          errors.push(`html: 0 résultat (HTTP ${res.status})`);
+        } catch (e: any) { errors.push(`html: ${String(e?.message || e).slice(0, 100)}`); }
+
+        // Endpoint 2 (repli) : lite.duckduckgo.com/lite/
+        try {
+          const target = 'https://lite.duckduckgo.com/lite/';
+          await assertSafeOutbound(target);
+          const res = await netFetch(target, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA },
+            body: `q=${encodeURIComponent(query)}`
+          }, 15_000, 'web_search');
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const results = parseDdgLiteResults(await res.text(), count);
+          if (results.length > 0) return { query, source: 'duckduckgo-lite', count: results.length, results };
+          errors.push(`lite: 0 résultat (HTTP ${res.status})`);
+        } catch (e: any) { errors.push(`lite: ${String(e?.message || e).slice(0, 100)}`); }
+
+        throw new Error(`Moteur de recherche indisponible (${errors.join(' | ')}). Réessayez plus tard, ou utilisez web_fetch sur une URL connue.`);
       }
     },
     {
@@ -1860,21 +1965,259 @@ export function buildSkillRegistry(): HermesTool[] {
           note: 'Seules les commandes sans encaissement réel ont été retirées. Les commandes payées (Stripe vérifié / on-chain) sont conservées.'
         };
       }
+    },
+
+    // ════════════ MÉMOIRE — APPRENTISSAGE (échanges passés consultables) ════════════
+    {
+      name: 'memory_search',
+      description: "MÉMOIRE D'HERMES : recherche dans vos échanges précédents (prompts, tools utilisés, réponses — 50 derniers conservés). Sans query : derniers souvenirs. Utilisez-la pour vous souvenir des décisions, IDs et prix discutés avec l'utilisateur (apprentissage réel, aucune invention).",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Mot-clé (ex: "prix", "prod-test-1", "bundle SEO") — vide = derniers souvenirs' },
+          agent: { type: 'string', description: 'Filtrer par agent (orchestrator, product_factory…) — vide = tous' },
+          limit: { type: 'number', description: 'Max 25, défaut 10' }
+        }
+      },
+      async run(args) {
+        return searchMemories(str(args.query, 200), args.agent ? str(args.agent, 60) : undefined, Math.min(25, Math.max(1, Math.trunc(Number(args.limit) || 10))));
+      }
+    },
+
+    // ════════════ CODE — LECTURE / IMPLANTATION DE FICHIERS SOURCE ════════════
+    // Sécurité : chemins relatifs au projet uniquement, extensions texte seules,
+    // secrets (.env*) et dépendances (node_modules, .git, dist) interdits,
+    // tailles plafonnées, sauvegarde avant chaque écriture (.dig-doctor/backups/).
+    {
+      name: 'code_read',
+      description: "LIT un fichier source du projet (src/, hermes/, scripts/, public/, racine). Chemin relatif — jamais de secret (.env* refusé). Retourne le contenu plafonné (défaut 4 000 car.). Sert à comprendre le code avant de le modifier (code_write) ou pour diagnostiquer.",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          file: { type: 'string', description: "Chemin relatif (ex: 'src/services/storeService.ts', 'server.ts')" },
+          maxChars: { type: 'number', description: 'Plafond de caractères (1 000-20 000, défaut 4 000)' }
+        },
+        required: ['file']
+      },
+      async run(args) {
+        const { abs, rel } = resolveProjectFile(str(args.file, 300), false);
+        const stat = fs.statSync(abs);
+        if (!stat.isFile()) throw new Error('Ce chemin désigne un répertoire.');
+        const maxChars = Math.min(20_000, Math.max(1000, Math.trunc(Number(args.maxChars) || 4000)));
+        const content = fs.readFileSync(abs, 'utf-8');
+        return {
+          file: rel, bytes: stat.size, lines: content.split('\n').length,
+          truncated: content.length > maxChars,
+          content: content.slice(0, maxChars)
+        };
+      }
+    },
+    {
+      name: 'code_write',
+      description: "IMPLANTE/MODIFIE un fichier source du projet (création ou réécriture complète). Périmètre : src/, hermes/, scripts/, public/, fichiers racine — extensions code/texte seules, max 64 Ko, JAMAIS .env*, node_modules, .git, dist, *.lock. L'original est sauvegardé dans .dig-doctor/backups/ avant écriture. Un `npm run build` est ensuite requis pour publier. Confirmation obligatoire.",
+      access: 'destructive',
+      requiresConfirmation: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          file: { type: 'string', description: "Chemin relatif cible (ex: 'src/services/nouveauService.ts')" },
+          content: { type: 'string', description: "Contenu COMPLET du fichier (max 64 Ko, UTF-8)" },
+          confirm: { type: 'boolean', description: 'Confirmation explicite obligatoire' }
+        },
+        required: ['file', 'content']
+      },
+      async run(args) {
+        const content = String(args.content ?? '');
+        if (!content.length) throw new Error('content vide — pour supprimer, demandez à l\'utilisateur (aucune suppression de fichier par skill).');
+        if (Buffer.byteLength(content, 'utf-8') > 64 * 1024) throw new Error('content trop volumineux (max 64 Ko).');
+        const { abs, rel } = resolveProjectFile(str(args.file, 300), true);
+        const existed = fs.existsSync(abs);
+        let backup: string | undefined;
+        if (existed) {
+          const backupDir = path.join(PROJECT_ROOT, '.dig-doctor', 'backups');
+          fs.mkdirSync(backupDir, { recursive: true });
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          backup = path.join(backupDir, `${stamp}-${rel.replace(/[\\/]/g, '_')}`);
+          fs.copyFileSync(abs, backup);
+          backup = path.relative(PROJECT_ROOT, backup);
+        } else {
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+        }
+        fs.writeFileSync(abs, content, 'utf-8');
+        return {
+          written: true, file: rel, bytes: Buffer.byteLength(content, 'utf-8'),
+          created: !existed, backup,
+          note: 'Fichier réellement implanté sur le disque. Vérifiez avec code_read, puis `npm run lint` / `npm run build` pour valider.'
+        };
+      }
+    },
+
+    // ════════════ REPOS GITHUB — CLONAGE RÉEL DANS LE PROJET ════════════
+    {
+      name: 'repo_clone',
+      description: "IMPLANTE un repo GitHub public dans le projet : clone superficiel RÉEL (git clone --depth 1) sous references/_clones/<owner>__<repo> (25 max). Ensuite : repo_files pour lister/lire/chercher dans ses fichiers. Exemple d'usage : étudier une lib, s'inspirer d'un template, extraire de la doc. Confirmation requise.",
+      access: 'write',
+      requiresConfirmation: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'URL du repo public (https://github.com/<owner>/<repo>)' },
+          confirm: { type: 'boolean', description: 'Confirmation explicite obligatoire' }
+        },
+        required: ['url']
+      },
+      async run(args, ctx) {
+        return cloneRepo(str(args.url, 300), ctx.actor);
+      }
+    },
+    {
+      name: 'repo_files',
+      description: "EXPLORE les repos clonés dans le projet (repo_clone). Sans argument : liste des clones. name seul : liste des fichiers (300 max). name+file : lit un fichier texte du clone (plafonné 4 000 car.). name+search : recherche textuelle (grep) dans le clone.",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Nom du clone (owner__repo, cf. liste)' },
+          file: { type: 'string', description: 'Chemin du fichier à lire dans le clone' },
+          search: { type: 'string', description: 'Recherche textuelle (grep) dans le clone' },
+          limit: { type: 'number', description: 'Max fichiers listés (défaut 300) / matches grep (défaut 40)' }
+        }
+      },
+      async run(args) {
+        if (!args.name) {
+          const clones = await listClones();
+          return {
+            count: clones.length,
+            clones,
+            note: clones.length === 0 ? 'Aucun clone — installez-en un avec repo_clone (ex: https://github.com/octocat/Hello-World).' : undefined
+          };
+        }
+        const name = str(args.name, 100);
+        if (args.search) {
+          return grepClone(name, str(args.search, 200), Math.min(40, Math.max(1, Math.trunc(Number(args.limit) || 40))));
+        }
+        if (args.file) {
+          return readCloneFile(name, str(args.file, 300), Math.min(20_000, Math.max(1000, Math.trunc(Number(args.limit) || 4000))));
+        }
+        const dir = cloneDirChecked(name); // valide le périmètre (aucune traversée possible)
+        const files = walkFiles(dir);
+        const limit = Math.min(300, Math.max(1, Math.trunc(Number(args.limit) || 300)));
+        return {
+          clone: name, totalFiles: files.length,
+          files: files.slice(0, limit),
+          truncated: files.length > limit,
+          note: 'file=… pour lire un fichier, search=… pour chercher.'
+        };
+      }
+    },
+    {
+      name: 'repo_remove',
+      description: "SUPPRIME un repo cloné (references/_clones/<name>) et son entrée de registre. Confirmation requise.",
+      access: 'destructive',
+      requiresConfirmation: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Nom du clone (owner__repo)' },
+          confirm: { type: 'boolean', description: 'Confirmation explicite obligatoire' }
+        },
+        required: ['name']
+      },
+      async run(args) {
+        return removeClone(str(args.name, 100));
+      }
+    },
+
+    // ════════════ SKILLS CUSTOM — ÉVOLUTION À CHAUD (webhook tools) ════════════
+    {
+      name: 'skills_custom_list',
+      description: "LISTE les skills personnalisés installés à chaud (webhook tools : chaque skill = un appel à un endpoint https public — ou local déclaré). Les secrets d'en-têtes sont masqués. Ces skills apparaissent ensuite comme des tools normaux pour tous les agents.",
+      access: 'read',
+      parameters: { type: 'object', properties: {} },
+      async run() {
+        const specs = await listCustomSkillSpecs();
+        return {
+          builtin: skillRegistry.length,
+          custom: specs.length,
+          max: 20,
+          skills: specs
+        };
+      }
+    },
+    {
+      name: 'skills_custom_install',
+      description: "INSTALLE (à chaud, sans redéploiement) un skill personnalisé = un webhook tool : { name, description, url, method GET|POST, parameters (schéma JSON des args), headers?, local? (http://localhost uniquement), timeoutMs? }. Fournir la spec inline (argument spec) OU une URL https qui sert le JSON (argument url). Les skills POST exigent la confirmation à chaque appel ; les GET sont en lecture. Jamais le nom d'un skill builtin. Confirmation d'installation requise.",
+      access: 'write',
+      requiresConfirmation: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          spec: { type: 'object', description: "Spec inline : { name:'meteo', description:'…', url:'https://…/api', method:'GET', parameters:{type:'object',…} }" },
+          url: { type: 'string', description: 'URL https servant la spec JSON (alternative à spec)' },
+          local: { type: 'boolean', description: 'true si l\'URL est un endpoint local de confiance (http://localhost…)' },
+          confirm: { type: 'boolean', description: 'Confirmation explicite obligatoire' }
+        }
+      },
+      async run(args, ctx) {
+        const entry = await installCustomSkill({
+          spec: args.spec,
+          url: args.url ? str(args.url, 400) : undefined,
+          local: Boolean(args.local),
+          actor: ctx.actor,
+          reservedNames: skillRegistry.map(s => s.name)
+        });
+        return {
+          installed: true, entry,
+          note: `Skill « ${entry.name} » opérationnel immédiatement (visible via skills_custom_list, utilisable par tous les agents).`
+        };
+      }
+    },
+    {
+      name: 'skills_custom_remove',
+      description: "RETIRE un skill personnalisé installé à chaud. Les skills builtin ne sont pas concernés. Confirmation requise.",
+      access: 'destructive',
+      requiresConfirmation: true,
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Nom du skill custom à retirer' },
+          confirm: { type: 'boolean', description: 'Confirmation explicite obligatoire' }
+        },
+        required: ['name']
+      },
+      async run(args) {
+        const removed = await removeCustomSkill(str(args.name, 60));
+        return { removed, note: 'Skill retiré du registre (les agents ne le voient plus).' };
+      }
     }
   ];
 }
 
 export const skillRegistry = buildSkillRegistry();
 
+/**
+ * Registre COMPLET : skills builtin + skills CUSTOM installés à chaud
+ * (hermes/extendSkills.ts — chargés de façon asynchrone via ensureCustomSkillsLoaded).
+ */
+export function getAllSkills(): HermesTool[] {
+  return [...skillRegistry, ...customSkillTools()];
+}
+
 export function getSkill(name: string): HermesTool | undefined {
-  return skillRegistry.find(t => t.name === name);
+  const builtin = skillRegistry.find(t => t.name === name);
+  if (builtin) return builtin;
+  return customSkillTools().find(t => t.name === name);
 }
 
 export function declareSkills(names?: string[], allowedOnly?: string[]): ToolDeclarationSchemaList {
-  let list = names ? skillRegistry.filter(t => names.includes(t.name)) : skillRegistry;
+  let list = names ? getAllSkills().filter(t => names.includes(t.name)) : getAllSkills();
   if (allowedOnly) list = list.filter(t => allowedOnly.includes(t.name));
   return list.map(t => ({ name: t.name, description: t.description, parameters: t.parameters }));
 }
+
+export { ensureCustomSkillsLoaded };
 
 /**
  * Périmètre AUTONOMIE (cycle planifié sans utilisateur à l'écran) —
@@ -1891,8 +2234,13 @@ export const AUTONOMY_SAFE_SKILLS: string[] = [
   'campaigns_list', 'channels_list', 'seo_get', 'kv_get', 'logs_add',
   'list_agents', 'web_search', 'web_fetch', 'web_link_check',
   'free_tier_lookup', 'free_llm_lookup',
+  'code_read', 'repo_files', 'memory_search', 'skills_custom_list',
   // Veille & création de brouillons (jamais de publication)
   'repos_harvest', 'catalog_create', 'content_create', 'bundles_create', 'opportunities_add'
 ];
+// NB : les skills CUSTOM (webhook tools) ne font JAMAIS partie du périmètre
+// d'autonomie : un cycle planifié ne doit pas appeler d'endpoint externe
+// inconnu sans humain à l'écran (les POST exigent de toute façon une
+// confirmation, bloquée en autonomie).
 
 type ToolDeclarationSchemaList = Array<{ name: string; description: string; parameters: ToolParameterSchema }>;

@@ -12,7 +12,8 @@
  *  - GET  /activity        : audit des actions exécutées (auth)
  */
 import { Router } from 'express';
-import { runAgentChat, confirmPendingAction, getAgents, skills } from './engine';
+import { runAgentChat, confirmPendingAction, getAgents } from './engine';
+import { getAllSkills, ensureCustomSkillsLoaded } from './tools';
 import { buildPool, getPoolStatus, addProvider, removeProvider, testProvider, getHermesConfig, saveHermesConfig, realProviderHelp } from './providers';
 import { getAutonomyConfig, saveAutonomyConfig, runAutonomyCycle, getRecentAutonomyReports, isAutonomyRunning } from './autonomy';
 import { DEFAULT_HERMES_CONFIG } from './types';
@@ -55,7 +56,7 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
         failover: pool.length > 1 ? `bascule automatique : ${pool.length} fournisseurs en cascade (rate-limit/erreur → cooldown → suivant)` : undefined,
         providerPool: pool.map(e => ({ name: e.name, kind: e.kind, model: e.model, priority: e.priority, source: e.source, key: e.keyMasked })),
         hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
-        skillsCount: skills.length,
+        skillsCount: getAllSkills().length,
         agentsCount: getAgents().length,
         memoriesCount: memCount,
         reposCount: reposList.length,
@@ -80,6 +81,8 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
 
   router.get('/skills', apiLimiter, async (req, res) => {
     try {
+      await ensureCustomSkillsLoaded(); // builtin + skills custom installés à chaud
+      const skills = getAllSkills();
       res.json({
         count: skills.length,
         skills: skills.map(t => ({
