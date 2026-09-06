@@ -8,10 +8,14 @@
  * simulation de langage).
  *
  * Fournisseurs :
- *  - gemini   : @google/genai (dépendance existante) — gratuit (Gemini API tier)
+ *  - gemini   : @google/genai (dépendance existante) — gratuit (Gemini API tier).
+ *               Repli automatique de modèle (GEMINI_MODEL_FALLBACKS) : Google
+ *               bloque les modèles dépréciés (ex. gemini-2.5-flash) pour les
+ *               nouvelles clés API bien avant l'arrêt officiel.
  *  - openai   : n'importe quel endpoint compatible OpenAI /chat/completions :
  *               Ollama local (gratuit, modèles open-source : llama3.1, qwen2.5,
  *               mistral...), Groq, OpenRouter, Together, llama.cpp...
+ *               (installation locale guidée : node scripts/setup-local-llm.mjs)
  *
  * Sélecteurs (env ou KV df_hermes_config, modifiable par le modérateur) :
  *  - auto : gemini si GEMINI_API_KEY, sinon openai si HERMES_OPENAI_BASE_URL, sinon aucun
@@ -32,7 +36,7 @@ const REAL_PROVIDER_CHOICES = ['auto', 'gemini', 'openai'] as const;
 
 /** Message d'aide, réutilisé partout (status, erreurs de chat, autonomie). */
 export function realProviderHelp(): string {
-  return 'Configurez un fournisseur IA RÉEL : GEMINI_API_KEY (Google AI Studio, gratuit) — ou HERMES_OPENAI_BASE_URL + HERMES_OPENAI_MODEL + HERMES_OPENAI_API_KEY (Ollama local, Groq, OpenRouter…) — ou ajoutez un fournisseur au pool (POST /api/hermes/providers).';
+  return 'Configurez un fournisseur IA RÉEL : GEMINI_API_KEY (Google AI Studio, gratuit — modèle conseillé : gemini-3.5-flash-lite) — ou HERMES_OPENAI_BASE_URL + HERMES_OPENAI_MODEL + HERMES_OPENAI_API_KEY (Ollama local : `node scripts/setup-local-llm.mjs`, Groq, OpenRouter…) — ou ajoutez un fournisseur au pool (POST /api/hermes/providers).';
 }
 
 export async function getHermesConfig(): Promise<HermesConfig> {
@@ -79,10 +83,49 @@ export async function saveHermesConfig(patch: Partial<HermesConfig>): Promise<He
 
 let geminiClient: GoogleGenAI | null = null;
 
-class GeminiProvider implements LLMProvider {
+/**
+ * Chaîne de repli des modèles Gemini, du plus récent au plus ancien.
+ *
+ * Google bloque les modèles dépréciés pour les NOUVELLES clés API bien avant
+ * leur arrêt officiel : `gemini-2.5-flash` renvoie déjà 404
+ * « This model is no longer available to new users » pour une clé récente,
+ * alors que l'arrêt officiel est le 20/10/2026. Sur ce type d'erreur 404, le
+ * fournisseur bascule automatiquement sur le modèle suivant et mémorise le
+ * premier qui répond (plus aucun 404 ensuite pour ce process).
+ * Source : https://ai.google.dev/gemini-api/docs/deprecations
+ * Remplaçant recommandé de gemini-2.5-flash : gemini-3.5-flash-lite.
+ */
+export const GEMINI_MODEL_FALLBACKS: readonly string[] = [
+  'gemini-3.5-flash-lite', // remplaçant recommandé (GA 21/07/2026) — défaut
+  'gemini-3.8-flash',      // dernier flash GA (02/09/2026)
+  'gemini-3.5-flash',
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',      // encore actif pour les ANCIENNES clés (arrêt 20/10/2026)
+  'gemini-2.5-flash-lite'
+];
+
+/** Erreurs déclenchant le repli sur le modèle Gemini suivant (404 modèle déprécié/absent). */
+const GEMINI_MODEL_GONE_RE = /no longer available|not found|NOT_FOUND|does not exist|isn't supported|unsupported model|unknown model|invalid model/i;
+
+/** Modèle configuré → modèle qui répond réellement (mémoire process : évite les 404 en rafale). */
+const geminiResolvedModels = new Map<string, string>();
+/** Avertissement de repli émis une seule fois par modèle configuré (pas de spam de logs). */
+const geminiFallbackWarned = new Set<string>();
+
+/** Chaîne effective essayée pour un modèle configuré (dédupe, sans vides). */
+export function geminiModelChain(model: string): string[] {
+  const resolved = geminiResolvedModels.get(model);
+  // Modèle résolu EN PREMIER (sinon chaque appel paierait un 404 avant repli),
+  // puis modèle configuré, puis la chaîne de repli officielle.
+  return [...new Set([...(resolved ? [resolved] : []), model, ...GEMINI_MODEL_FALLBACKS].filter(Boolean))];
+}
+
+export class GeminiProvider implements LLMProvider {
   id = 'gemini' as const;
   model: string;
   label: string;
+  /** Dernier modèle ayant réellement répondu (diagnostic statut/UI). */
+  effectiveModel?: string;
   constructor(model: string) {
     this.model = model;
     this.label = `Gemini (${model})`;
@@ -92,12 +135,45 @@ class GeminiProvider implements LLMProvider {
     if (!geminiClient) {
       const key = process.env.GEMINI_API_KEY;
       if (!key) throw new Error('GEMINI_API_KEY absente.');
+      // GEMINI_BASE_URL (optionnel) : endpoint alternatif (proxy d'entreprise,
+      // tests). Par défaut : endpoint public Google AI Studio.
+      const baseUrl = process.env.GEMINI_BASE_URL || undefined;
       geminiClient = new GoogleGenAI({
         apiKey: key,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+        httpOptions: { ...(baseUrl ? { baseUrl } : {}), headers: { 'User-Agent': 'aistudio-build' } }
       });
     }
 
+    const lastErrors: string[] = [];
+    for (const model of geminiModelChain(this.model)) {
+      try {
+        const result = await this.chatOnce(model, opts);
+        this.effectiveModel = model;
+        if (model !== this.model) {
+          geminiResolvedModels.set(this.model, model);
+          if (!geminiFallbackWarned.has(this.model)) {
+            geminiFallbackWarned.add(this.model);
+            console.warn(`[hermes] Modèle Gemini « ${this.model} » indisponible (déprécié pour cette clé ?) — repli automatique sur « ${model} », mémorisé pour ce process. Dernière erreur : ${lastErrors[lastErrors.length - 1] || '?'}`);
+          }
+        } else {
+          geminiResolvedModels.delete(this.model); // le modèle configuré répond à nouveau
+          geminiFallbackWarned.delete(this.model);
+        }
+        return result;
+      } catch (e: any) {
+        const msg = String(e?.message || e);
+        // 404 « modèle déprécié / inexistant » → essai du modèle suivant.
+        if (GEMINI_MODEL_GONE_RE.test(msg)) {
+          lastErrors.push(`${model}: ${msg.slice(0, 120)}`);
+          continue;
+        }
+        throw e;
+      }
+    }
+    throw new Error(`Aucun modèle Gemini disponible (essayés : ${geminiModelChain(this.model).join(', ')}). Dernières erreurs : ${lastErrors.join(' | ').slice(0, 300)}`);
+  }
+
+  private async chatOnce(model: string, opts: LLMChatOptions): Promise<LLMChatResult> {
     // Conversion du log plat en contents Gemini (texte + functionCall/functionResponse)
     const contents: any[] = [];
     for (const ev of opts.events) {
@@ -117,7 +193,7 @@ class GeminiProvider implements LLMProvider {
     }
 
     const res = await withTimeout(geminiClient.models.generateContent({
-      model: this.model,
+      model,
       contents,
       config: {
         systemInstruction: opts.system,
@@ -153,7 +229,7 @@ class GeminiProvider implements LLMProvider {
 
 // ---------- Compatible OpenAI (Ollama local, Groq, OpenRouter, llama.cpp...) ----------
 
-class OpenAICompatProvider implements LLMProvider {
+export class OpenAICompatProvider implements LLMProvider {
   id = 'openai' as const;
   model: string;
   baseUrl: string;
@@ -195,15 +271,31 @@ class OpenAICompatProvider implements LLMProvider {
       }));
     }
 
-    const key = process.env.HERMES_OPENAI_API_KEY || '';
-    const res = await withTimeout(fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(key ? { Authorization: `Bearer ${key}` } : {})
-      },
-      body: JSON.stringify(body)
-    }), HERMES_LIMITS.LLM_TIMEOUT_MS);
+    // Clé du fournisseur (pool) en priorité, sinon variable d'environnement.
+    // (bug historique : la clé apiKey d'un fournisseur du pool était ignorée
+    //  au profit de HERMES_OPENAI_API_KEY — 401 sur Groq/OpenRouter.)
+    const key = this.key || process.env.HERMES_OPENAI_API_KEY || '';
+    let res: Response;
+    try {
+      res = await withTimeout(fetch(`${this.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(key ? { Authorization: `Bearer ${key}` } : {})
+        },
+        body: JSON.stringify(body)
+      }), HERMES_LIMITS.LLM_TIMEOUT_MS);
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      if (/Délai LLM dépassé/.test(msg)) throw e;
+      // « fetch failed » nu : on explicite l'endpoint et la cause réseau pour
+      // un diagnostic immédiat (service non démarré, mauvais port, DNS…).
+      const cause = (e?.cause && (e.cause.code || e.cause.message)) || msg || 'erreur réseau';
+      throw new Error(`Endpoint OpenAI-compatible injoignable : ${this.baseUrl} (${cause}). ` +
+        (this.baseUrl.includes('//localhost') || this.baseUrl.includes('//127.0.0.1')
+          ? `Vérifiez que le serveur local tourne — ex. Ollama : \`ollama serve\` puis \`ollama pull ${this.model}\`, ou lancez \`node scripts/setup-local-llm.mjs\`.`
+          : 'Vérifiez l\'URL (HERMES_OPENAI_BASE_URL), le port et votre réseau.'));
+    }
 
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
@@ -462,9 +554,15 @@ export async function getPoolStatus(): Promise<Array<Record<string, any>>> {
   const now = Date.now();
   return entries.map(e => {
     const st = stat(e.name);
+    // Modèle Gemini réellement utilisé après repli automatique (404 dépréciation).
+    // NB : buildPool recrée les instances — la résolution vit dans la chaîne
+    // (geminiModelChain place le modèle résolu en tête), pas sur l'instance.
+    const chain = e.kind === 'gemini' ? geminiModelChain(e.model) : null;
+    const effectiveModel = chain && chain[0] !== e.model ? chain[0] : undefined;
     return {
       name: e.name, kind: e.kind, model: e.model, baseUrl: e.baseUrl, local: e.local || undefined,
       priority: e.priority, source: e.source, label: e.provider.label,
+      ...(effectiveModel && effectiveModel !== e.model ? { modelEffective: effectiveModel, modelNote: `modèle configuré « ${e.model} » indisponible — repli automatique sur « ${effectiveModel} »` } : {}),
       key: e.keyMasked,
       inCooldown: st.cooldownUntil > now,
       cooldownRemainingSec: st.cooldownUntil > now ? Math.ceil((st.cooldownUntil - now) / 1000) : 0,

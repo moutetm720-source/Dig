@@ -10,7 +10,7 @@ et une sécurité durcie (voir [`AUDIT_SECURITE.md`](AUDIT_SECURITE.md)).
 - **Serveur** : Node.js + Express (TypeScript, `tsx`), PostgreSQL (drizzle-orm, key-value store), `server.ts`
 - **Client** : React 18 + Vite + Tailwind (`src/`)
 - **IA** : moteur d'agent Hermes (`hermes/`) — boucle tool-calling réelle, **pool multi-fournisseurs avec bascule automatique** (anti rate-limit), gestionnaire d'API & tokens pilotable par Hermes, **docteur de code** (`code_doctor`) qui détecte et corrige les erreurs d'intégration client ↔ API, **autonomie serveur** (cycles planifiés, actions sûres, journal) et skills **repos GitHub / liens / référentiels locaux**
-- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (82 tests — fournisseur IA **réel** requis, les tests d'interprétation sont ignorés si aucun n'est configuré), `scripts/verify-diagnostics.mjs` (40 tests — docteur de code)
+- **Tests** : `scripts/verify-security.mjs` (43 tests), `scripts/verify-hermes.mjs` (82 tests — fournisseur IA **réel** requis, les tests d'interprétation sont ignorés si aucun n'est configuré), `scripts/verify-diagnostics.mjs` (40 tests — docteur de code), `scripts/verify-providers.mjs` (8 tests — transport fournisseurs : repli de modèle Gemini, erreurs réseau, clés du pool), `scripts/verify-capabilities.mjs` (9 tests — capacités « agent évolutif » : implantation de code, clone GitHub live, mémoire, skills custom webhook)
 
 ## Mode « 100 % réel »
 
@@ -108,13 +108,50 @@ Render n'est fournie ici.
 |---|---|
 | `HERMES_PROVIDER` | `auto` (défaut) \| `gemini` \| `openai` — **fournisseurs réels uniquement** (`mock` supprimé) |
 | `GEMINI_API_KEY` | Clé Google AI Studio (gratuit) — source **env uniquement**, jamais en base |
-| `HERMES_GEMINI_MODEL` | Modèle Gemini (défaut `gemini-2.5-flash`) |
-| `HERMES_OPENAI_BASE_URL` / `_MODEL` / `_API_KEY` | Endpoint compatible OpenAI : **Ollama local** (`http://127.0.0.1:11434/v1`), Groq, OpenRouter… |
+| `HERMES_GEMINI_MODEL` | Modèle Gemini (défaut `gemini-3.5-flash-lite`). ⚠️ `gemini-2.5-flash` est **déprécié pour les nouvelles clés API** (404 « no longer available to new users », arrêt officiel 20/10/2026) — sur ce 404, Hermes **bascule automatiquement** sur un modèle disponible (`GEMINI_MODEL_FALLBACKS`, `hermes/providers.ts`) |
+| `HERMES_OPENAI_BASE_URL` / `_MODEL` / `_API_KEY` | Endpoint compatible OpenAI : **IA locale** (`http://127.0.0.1:11434/v1` — installation guidée : `node scripts/setup-local-llm.mjs`), Groq, OpenRouter… |
 
 Sans fournisseur réel : le serveur reste **honnête** (`status: offline`,
 `providerReason` explicite + métriques réelles issues des skills) — les skills exécutent
 toujours les actions réelles, l'interprétation libre est simplement indisponible. Aucune
 réponse n'est simulée.
+
+#### IA 100 % locale (aucune clé cloud) — `scripts/setup-local-llm.mjs`
+
+```bash
+node scripts/setup-local-llm.mjs            # Ollama + qwen2.5:1.5b (tools OK, ~1 Go)
+node scripts/setup-local-llm.mjs --check    # diagnostic (rien n'est modifié)
+node scripts/setup-local-llm.mjs --engine llama-cpp   # secours : llama-server + GGUF
+```
+
+Installe et démarre un moteur LLM **réel et local** (endpoint compatible OpenAI),
+télécharge un modèle qui supporte le *function calling*, vérifie le tool-calling
+par un appel réel, puis affiche les lignes `.env` exactes (`HERMES_OPENAI_BASE_URL`
+etc.). Hermes fonctionne ainsi même sans `GEMINI_API_KEY` — et le pool bascule
+automatiquement cloud → local en cas d'erreur.
+
+#### Capacités « agent intelligent, apprenant, évolutif » (vérifiées par `scripts/verify-capabilities.mjs`)
+
+| Capacité | Skills | Réel comment ? |
+|---|---|---|
+| **Implanter du code** | `code_read`, `code_write` | Lecture/écriture RÉELLE de fichiers projet (src/, hermes/, scripts/, public/ — périmètre + extensions contrôlés, secrets `.env*` refusés, backup automatique dans `.dig-doctor/backups/`, **confirmation obligatoire**, puis `npm run lint`/`build`) |
+| **Recherche internet** | `web_search`, `web_fetch`, `web_link_check` | DuckDuckGo SANS clé (repli automatique html → lite), lecture de pages (https, anti-SSRF), contrôle de liens |
+| **Télécharger des skills** | `skills_custom_list/install/remove` | Skills **webhook** installés À CHAUD (KV `df_hermes_custom_skills`) : spec JSON inline ou servie par URL — GET (lecture) ou POST (confirmation), endpoint https public ou localhost déclaré ; rejoués au démarrage, visibles de tous les agents immédiatement |
+| **Implanter des repos** | `repo_clone`, `repo_files`, `repo_remove` | `git clone --depth 1` RÉEL d'un repo GitHub public dans `references/_clones/` (25 max, gitignoré), puis liste / lecture / grep de ses fichiers |
+| **Apprendre / se souvenir** | `memory_search` (+ injection auto) | Les 50 derniers échanges (KV `df_hermes_memories`) sont **rappelés automatiquement** dans le prompt système et **consultables** par recherche plein-texte |
+| **Multi-agents & autonomie** | `list_agents`, `dispatch_agent`, cycles planifiés | Orchestrateur + 8 spécialistes, sous-agents budgétés, cycles autonomes en lecture/brouillons uniquement (skills custom exclus du périmètre d'autonomie) |
+
+Sécurité : toutes les écritures destructives passent par la **porte de confirmation** (`confirm: true` → `POST /api/hermes/confirm`), la garde anti-SSRF s'applique à tout appel sortant (y compris webhooks des skills custom), et aucun secret n'est jamais exposé en clair.
+
+#### Dépannage : « Tous les fournisseurs IA réels sont indisponibles »
+
+- `gemini-env (… 404 … no longer available)` : modèle déprécié pour votre clé.
+  Corrigé automatiquement par la chaîne de repli ; pour figer un modèle à jour :
+  `HERMES_GEMINI_MODEL=gemini-3.5-flash-lite` (ou `POST /api/hermes/config`).
+- `openai-env (fetch failed)` : l'endpoint compatible OpenAI ne répond pas —
+  l'erreur affiche désormais l'URL exacte et la cause (`ECONNREFUSED`…).
+  Pour l'IA locale : `node scripts/setup-local-llm.mjs --check`.
+
 
 ### Gestionnaire d'API & tokens — pool multi-fournisseurs (« ne jamais être bloqué »)
 
@@ -251,8 +288,9 @@ node scripts/start-test-pg.mjs
 PORT=3211 DB_HOST=127.0.0.1 DB_USER=postgres DB_PASSWORD=*** DB_NAME=applet \
   MODERATOR_PASSCODE=*** GEMINI_API_KEY=<votre-clé> \
   node_modules/.bin/tsx server.ts
-#   (alternative sans clé : Ollama local — HERMES_OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-#    HERMES_OPENAI_MODEL=llama3.1 HERMES_OPENAI_API_KEY=ollama)
+#   (alternative sans clé : IA locale — node scripts/setup-local-llm.mjs
+#    puis HERMES_OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+#    HERMES_OPENAI_MODEL=qwen2.5:1.5b HERMES_OPENAI_API_KEY=ollama)
 #   Sans fournisseur : la suite tourne quand même, les tests d'interprétation sont SKIPPÉS
 #   (jamais validés par une réponse simulée).
 
@@ -260,6 +298,8 @@ PORT=3211 DB_HOST=127.0.0.1 DB_USER=postgres DB_PASSWORD=*** DB_NAME=applet \
 node scripts/verify-security.mjs --base http://127.0.0.1:3211 --passcode <code> --whsec <secret>
 node scripts/verify-hermes.mjs    --base http://127.0.0.1:3211 --passcode <code>
 node scripts/verify-diagnostics.mjs --base http://127.0.0.1:3211 --passcode <code>
+node_modules/.bin/tsx scripts/verify-providers.mjs   # transport (stubs locaux, sans serveur ni clé)
+DB_HOST=127.0.0.1 node_modules/.bin/tsx scripts/verify-capabilities.mjs   # capacités réelles (clone GitHub live si réseau)
 
 # 4. Audit statique du mode « 100 % réel » (aucun serveur requis)
 node scripts/verify-real-data.mjs

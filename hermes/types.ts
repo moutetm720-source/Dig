@@ -126,7 +126,11 @@ export interface HermesConfig {
 
 export const DEFAULT_HERMES_CONFIG: HermesConfig = {
   provider: 'auto',
-  geminiModel: process.env.HERMES_GEMINI_MODEL || 'gemini-2.5-flash',
+  // ⚠️ gemini-2.5-flash est déprécié pour les NOUVELLES clés API (404 « no longer
+  // available to new users » — arrêt officiel 20/10/2026). Défaut actuel :
+  // gemini-3.5-flash-lite (remplaçant recommandé par Google). Une chaîne de
+  // repli automatique existe dans hermes/providers.ts (GEMINI_MODEL_FALLBACKS).
+  geminiModel: process.env.HERMES_GEMINI_MODEL || 'gemini-3.5-flash-lite',
   openaiBaseUrl: process.env.HERMES_OPENAI_BASE_URL || '',
   openaiModel: process.env.HERMES_OPENAI_MODEL || 'llama3.1'
 };

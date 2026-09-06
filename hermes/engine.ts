@@ -26,7 +26,8 @@ import { eq, inArray } from 'drizzle-orm';
 import { AgentEvent, AgentStep, HermesChatResponse, HERMES_LIMITS, HermesContext, LLMChatResult } from './types';
 import type { PoolEntry } from './providers';
 import { buildPool, chatWithFailover, truncateForLLM, maskSecret, getHermesConfig } from './providers';
-import { getSkill, declareSkills, skillRegistry } from './tools';
+import { getSkill, declareSkills, skillRegistry, getAllSkills, ensureCustomSkillsLoaded } from './tools';
+import { recentMemories } from './extendSkills';
 import { getAgent, getAgents } from './agents';
 
 // ---------- Audit ----------
@@ -114,7 +115,7 @@ async function executeSkill(
   try {
     const result = await Promise.race([
       skill.run(args, ctx),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('Délai d\u2019exécution du skill dépassé (20 s).')), 20000))
+      new Promise((_, rej) => setTimeout(() => rej(new Error('Délai d\u2019exécution du skill dépassé (55 s).')), 55000))
     ]);
     const summary = summarizeResult(result);
     steps.push({ tool: skill.name, args: safeArgs, status: 'ok', summary });
@@ -241,8 +242,23 @@ export async function runAgentChat(opts: {
   }
   events.push({ type: 'text', role: 'user', text: opts.prompt.slice(0, 4000) });
 
+  // Skills custom installés à chaud (webhook tools) rechargés à chaque tour :
+  // une installation récente est immédiatement visible pour tous les agents.
+  await ensureCustomSkillsLoaded();
   const tools = declareSkills(agent.skills, opts.allowedTools);
-  const system = `${agent.systemPrompt}\n\n${opts.systemAddition ? `${opts.systemAddition}\n\n` : ''}${await platformContext()}\n\nAgent en cours : ${agent.name} (${agent.id})`;
+
+  // APPRENTISSAGE : rappel des derniers échanges de cet agent (mémoire réelle,
+  // consultable aussi via le skill memory_search) — pas de contexte inventé.
+  let memoryBlock = '';
+  try {
+    const mems = await recentMemories(agent.id, 3);
+    if (mems.length > 0) {
+      memoryBlock = '\n\n## Souvenirs récents (tes échanges précédents — rappel-toi des décisions)\n' +
+        mems.map((m: any) => `- ${String(m.at || '').slice(0, 10)} « ${String(m.prompt || '').slice(0, 100)} » → ${String(m.response || '').slice(0, 140).replace(/\n/g, ' ')}`).join('\n') +
+        '\n(skill memory_search pour approfondir)';
+    }
+  } catch {}
+  const system = `${agent.systemPrompt}\n\n${opts.systemAddition ? `${opts.systemAddition}\n\n` : ''}${await platformContext()}\n\nAgent en cours : ${agent.name} (${agent.id})${memoryBlock}`;
   const steps: AgentStep[] = [];
   const callCount = { n: 0 };
   let usage: { inputTokens?: number; outputTokens?: number } = {};
@@ -291,10 +307,15 @@ export async function runAgentChat(opts: {
 
   await pushMemory(agent.id, opts.prompt, steps, finalText);
 
+  // Modèle réellement utilisé : après un repli automatique (ex. 404 modèle
+  // Gemini déprécié), on rapporte le modèle EFFECTIF, pas le configuré.
+  const effectiveModel = (active?.provider as any)?.effectiveModel;
+  const reportedModel = effectiveModel && active ? `${active.model} → ${effectiveModel} (repli auto)` : active?.model || '-';
+
   return {
     response: finalText,
     provider: active?.provider.label || 'aucun',
-    model: active?.model || '-',
+    model: reportedModel,
     agent: agent.id,
     steps,
     pendingConfirmation,
@@ -322,6 +343,7 @@ export async function confirmPendingAction(actionId: string): Promise<{ ok: bool
 // ---------- Sous-agent (dispatch_agent) ----------
 
 export async function runSubAgent(agent: { id: string; name: string; systemPrompt: string; skills?: string[]; maxSteps?: number }, task: string): Promise<any> {
+  await ensureCustomSkillsLoaded(); // skills custom visibles aussi des sous-agents
   const pool = await buildPool();
   if (pool.length === 0) {
     return { agent: agent.id, report: 'Sous-agent indisponible : aucun fournisseur LLM configuré.', steps: [] };
@@ -397,4 +419,5 @@ async function pushMemory(agentId: string, prompt: string, steps: AgentStep[], r
 // ---------- Export pour le routeur ----------
 
 export { getAgents, getAgent };
-export { skillRegistry as skills };
+/** Skills exposés au routeur : builtin + custom installés à chaud (chargés de façon asynchrone par le routeur). */
+export { getAllSkills as skills };

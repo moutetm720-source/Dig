@@ -7,3 +7,5 @@ coverage/
 .env*
 !.env.example
 .dig-doctor/
+.local-llm/
+references/_clones/
