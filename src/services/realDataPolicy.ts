@@ -13,7 +13,9 @@
  * (uniquement pour un environnement de démonstration isolé — jamais en prod).
  */
 
-export const REAL_DATA_ONLY: boolean = (process.env.DIG_REAL_DATA_ONLY || '1').trim() !== '0';
+// Ce module est partagé Node/navigateur : Vite ne fournit pas de global process.
+// Dans le navigateur, la politique sûre est toujours active (pas de secret injecté).
+export const REAL_DATA_ONLY: boolean = typeof process === 'undefined' || (process.env.DIG_REAL_DATA_ONLY || '1').trim() !== '0';
 
 const warned = new Set<string>();
 

@@ -11,7 +11,9 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "db:push": "drizzle-kit push --config=src/db/drizzle.config.ts",
-    "db:studio": "drizzle-kit studio --config=src/db/drizzle.config.ts"
+    "db:studio": "drizzle-kit studio --config=src/db/drizzle.config.ts",
+    "test:hermes": "tsx --test scripts/hermes-*.test.mjs && tsx scripts/verify-providers.mjs",
+    "test:hermes:ui": "node scripts/verify-hermes-ui.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.18.0",
@@ -30,10 +32,13 @@
     "qrcode": "^1.5.4",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "tsx": "^4.23.12",
     "vite": "^6.2.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/canvas-confetti": "^1.9.0",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",

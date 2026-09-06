@@ -16,6 +16,7 @@ import { db } from '../src/db/db';
 import { keyValueStore } from '../src/db/schema';
 import { eq } from 'drizzle-orm';
 import { buildPool } from './providers';
+import { providerCostPolicy } from './providerPolicy';
 import { runAgentChat } from './engine';
 import { getSkill, AUTONOMY_SAFE_SKILLS, checkUrlHealth } from './tools';
 
@@ -45,7 +46,7 @@ export interface AutonomyReport {
 }
 
 const DEFAULT_CONFIG: AutonomyConfig = {
-  enabled: true,
+  enabled: false,
   intervalMinutes: 30,
   lastRunAt: null,
   lastReportAt: null,
@@ -88,7 +89,7 @@ export async function getAutonomyConfig(): Promise<AutonomyConfig> {
   const v = await kvGet(CONFIG_KEY);
   if (!v || typeof v !== 'object') return { ...DEFAULT_CONFIG };
   return {
-    enabled: v.enabled !== false,
+    enabled: v.enabled === true,
     intervalMinutes: Number.isFinite(Number(v.intervalMinutes)) ? Math.min(240, Math.max(5, Number(v.intervalMinutes))) : DEFAULT_CONFIG.intervalMinutes,
     lastRunAt: typeof v.lastRunAt === 'string' ? v.lastRunAt : null,
     lastReportAt: typeof v.lastReportAt === 'string' ? v.lastReportAt : null,
@@ -240,7 +241,7 @@ export async function runAutonomyCycle(trigger: 'timer' | 'api' = 'api'): Promis
     let provider = 'déterministe (sans LLM réel)';
 
     // 2) PLAN → ACTION
-    const pool = await buildPool();
+    const pool = (await buildPool()).filter(p => providerCostPolicy(p).eligible);
     // Pool 100 % réel : le moindre fournisseur disponible pilote le cycle en langage naturel.
     const real = pool[0];
     if (real) {

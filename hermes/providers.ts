@@ -27,6 +27,8 @@ import { eq } from 'drizzle-orm';
 import { assertProviderBaseUrl } from '../ssrfGuard';
 import { AgentEvent, LLMChatOptions, LLMChatResult, LLMProvider, HermesConfig, DEFAULT_HERMES_CONFIG, HERMES_LIMITS, ProviderSpec, HERMES_POOL } from './types';
 
+import { freeOnlyEnabled, isLoopbackUrl, providerCostPolicy } from './providerPolicy';
+
 // ---------- Config (env + KV) ----------
 
 let configCache: { at: number; cfg: HermesConfig } | null = null;
@@ -36,13 +38,13 @@ const REAL_PROVIDER_CHOICES = ['auto', 'gemini', 'openai'] as const;
 
 /** Message d'aide, réutilisé partout (status, erreurs de chat, autonomie). */
 export function realProviderHelp(): string {
-  return 'Configurez un fournisseur IA RÉEL : GEMINI_API_KEY (Google AI Studio, gratuit — modèle conseillé : gemini-3.5-flash-lite) — ou HERMES_OPENAI_BASE_URL + HERMES_OPENAI_MODEL + HERMES_OPENAI_API_KEY (Ollama local : `node scripts/setup-local-llm.mjs`, Groq, OpenRouter…) — ou ajoutez un fournisseur au pool (POST /api/hermes/providers). Providers gratuits sans clé disponibles automatiquement : OVHcloud AI Endpoints (2 RPM/IP), LLM7.io (free tier), OpenRouter :free, Groq (free tier). Voir GET /api/hermes/providers et skill free_llm_lookup.';
+  return 'Configurez un modèle réellement local (HERMES_OPENAI_BASE_URL + HERMES_OPENAI_MODEL ; aide : node scripts/setup-local-llm.mjs) ou OpenRouter :free. Le mode sans API payante exclut les clés à facturation inconnue, dont GEMINI_API_KEY. Les endpoints anonymes ne sont essayés que si le repli est activé ; disponibilité et quotas non garantis. Voir GET /api/hermes/providers et /api/hermes/free-catalog.';
 }
 
-// ---------- Fournisseurs gratuits sans clé (toujours disponibles en fallback) ----------
-// Ces endpoints sont 100% gratuits et ne nécessitent pas de clé API.
-// Ils sont ajoutés automatiquement au pool avec basse priorité (800+) pour
-// garantir qu'Hermes fonctionne même sans GEMINI_API_KEY ni Ollama local.
+// ---------- Endpoints anonymes (repli optionnel, disponibilité non garantie) ----------
+// Ces endpoints sans clé sont des candidats de repli, pas une garantie de service.
+// Ils sont ajoutés en mode auto avec basse priorité (800+), sauf
+// HERMES_ANONYMOUS_FALLBACK=0. Ne jamais y transmettre la clé d’un autre endpoint.
 // Source : hermes/knowledge/free-llm-apis.json
 // Seuls OVH et LLM7 sont vraiment anonymes ; Groq/OpenRouter exigent une clé gratuite.
 export const FREE_ANONYMOUS_PROVIDERS: ProviderSpec[] = [
@@ -184,6 +186,7 @@ export class GeminiProvider implements LLMProvider {
         }
         return result;
       } catch (e: any) {
+        opts.signal?.throwIfAborted();
         const msg = String(e?.message || e);
         // 404 « modèle déprécié / inexistant » → essai du modèle suivant.
         if (GEMINI_MODEL_GONE_RE.test(msg)) {
@@ -207,27 +210,12 @@ export class GeminiProvider implements LLMProvider {
         contents.push({ role: ev.role === 'model' ? 'model' : 'user', parts: [{ text: ev.text }] });
       } else if (ev.type === 'tool_call') {
         const sig = (ev as any).thoughtSignature || (ev as any).thought_signature;
-        const fc: any = { name: ev.name, args: ev.args || {} };
-        // Le SDK @google/genai attend thoughtSignature en camelCase, mais on met les deux pour compat
-        if (sig) {
-          fc.thoughtSignature = sig;
-          fc.thought_signature = sig;
-        }
-        // Si la signature était dans un champ séparé du part, on doit aussi l'injecter comme part thoughtSignature
-        if (sig) {
-          contents.push({
-            role: 'model',
-            parts: [
-              { thoughtSignature: sig } as any,
-              { functionCall: fc }
-            ]
-          });
-        } else {
-          contents.push({
-            role: 'model',
-            parts: [{ functionCall: fc }]
-          });
-        }
+        // Une signature appartient au Part qui porte functionCall (pas au
+        // FunctionCall ni à un Part vide séparé).
+        contents.push({
+          role: 'model',
+          parts: [{ functionCall: { name: ev.name, args: ev.args || {} }, ...(sig ? { thoughtSignature: sig } : {}) }]
+        });
       } else if (ev.type === 'tool_result') {
         contents.push({
           role: 'user',
@@ -241,11 +229,12 @@ export class GeminiProvider implements LLMProvider {
       contents,
       config: {
         systemInstruction: opts.system,
-        tools: [{ functionDeclarations: opts.tools.map(t => ({
+        abortSignal: AbortSignal.any([...(opts.signal ? [opts.signal] : []), AbortSignal.timeout(HERMES_LIMITS.LLM_TIMEOUT_MS)]),
+        ...(opts.tools.length ? { tools: [{ functionDeclarations: opts.tools.map(t => ({
           name: t.name,
           description: t.description,
           parameters: t.parameters as any
-        })) }],
+        })) }] } : {}),
         temperature: 0.3
       }
     }), HERMES_LIMITS.LLM_TIMEOUT_MS);
@@ -259,7 +248,6 @@ export class GeminiProvider implements LLMProvider {
       // Le thoughtSignature peut arriver comme part séparée juste avant functionCall
       if (p.thoughtSignature || p.thought_signature) {
         lastThoughtSignature = p.thoughtSignature || p.thought_signature;
-        continue;
       }
       if (p.functionCall) {
         const sig = p.functionCall.thoughtSignature || p.functionCall.thought_signature || lastThoughtSignature || p.thoughtSignature || (p as any).thought_signature;
@@ -269,7 +257,7 @@ export class GeminiProvider implements LLMProvider {
           ...(sig ? { thoughtSignature: sig, thought_signature: sig } : {})
         });
         lastThoughtSignature = undefined;
-      } else if (typeof p.text === 'string') {
+      } else if (typeof p.text === 'string' && !p.thought) {
         text += p.text;
         lastThoughtSignature = undefined;
       }
@@ -295,7 +283,7 @@ export class OpenAICompatProvider implements LLMProvider {
   constructor(baseUrl: string, model: string, apiKey?: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.model = model;
-    this.key = apiKey || undefined;
+    this.key = apiKey; // chaîne vide explicite = ne JAMAIS hériter d’une clé d’un autre endpoint
     this.label = `OpenAI-compatible ${this.baseUrl} (${model})`;
   }
 
@@ -331,7 +319,7 @@ export class OpenAICompatProvider implements LLMProvider {
     // Clé du fournisseur (pool) en priorité, sinon variable d'environnement.
     // (bug historique : la clé apiKey d'un fournisseur du pool était ignorée
     //  au profit de HERMES_OPENAI_API_KEY — 401 sur Groq/OpenRouter.)
-    const key = this.key || process.env.HERMES_OPENAI_API_KEY || '';
+    const key = this.key ?? process.env.HERMES_OPENAI_API_KEY ?? '';
     let res: Response;
     try {
       res = await withTimeout(fetch(`${this.baseUrl}/chat/completions`, {
@@ -340,9 +328,12 @@ export class OpenAICompatProvider implements LLMProvider {
           'Content-Type': 'application/json',
           ...(key ? { Authorization: `Bearer ${key}` } : {})
         },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        redirect: 'error',
+        signal: AbortSignal.any([...(opts.signal ? [opts.signal] : []), AbortSignal.timeout(HERMES_LIMITS.LLM_TIMEOUT_MS)])
       }), HERMES_LIMITS.LLM_TIMEOUT_MS);
     } catch (e: any) {
+      opts.signal?.throwIfAborted();
       const msg = String(e?.message || e);
       if (/Délai LLM dépassé/.test(msg)) throw e;
       // « fetch failed » nu : on explicite l'endpoint et la cause réseau pour
@@ -365,13 +356,15 @@ export class OpenAICompatProvider implements LLMProvider {
     if (Array.isArray(msg?.tool_calls)) {
       for (const tc of msg.tool_calls) {
         let args: Record<string, any> = {};
-        try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { args = {}; }
+        try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { throw new Error('Arguments JSON invalides dans un appel d’outil.'); }
+        if (!args || typeof args !== 'object' || Array.isArray(args) || !tc.function?.name) throw new Error('Appel d’outil mal formé.');
         toolCalls.push({ name: String(tc.function?.name || ''), args });
       }
     }
     return {
       text: typeof msg?.content === 'string' && msg.content ? msg.content : undefined,
-      toolCalls: toolCalls.length > 0 ? toolCalls : undefined
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      usage: data?.usage ? { inputTokens: data.usage.prompt_tokens, outputTokens: data.usage.completion_tokens } : undefined
     };
   }
 }
@@ -498,7 +491,7 @@ async function savePoolSpecs(specs: ProviderSpec[]): Promise<void> {
 
 function providerFromSpec(spec: ProviderSpec): LLMProvider {
   if (spec.kind === 'gemini') return new GeminiProvider(spec.model || DEFAULT_HERMES_CONFIG.geminiModel);
-  if (spec.kind === 'openai') return new OpenAICompatProvider(spec.baseUrl || '', spec.model || '', spec.apiKey);
+  if (spec.kind === 'openai') return new OpenAICompatProvider(spec.baseUrl || '', spec.model || '', spec.apiKey ?? '');
   throw new Error(`Fournisseur « ${spec.name} » de type inconnu (fournisseurs réels uniquement : gemini, openai).`);
 }
 
@@ -513,7 +506,7 @@ export async function buildPool(): Promise<PoolEntry[]> {
     choice = 'auto';
   }
   const specs: ProviderSpec[] = [];
-  const envLocal = cfg.openaiBaseUrl ? /localhost|127\.0\.0\.1|\[::1\]/i.test(cfg.openaiBaseUrl) : false;
+  const envLocal = isLoopbackUrl(cfg.openaiBaseUrl);
 
   if (choice === 'gemini' || choice === 'auto') {
     if (process.env.GEMINI_API_KEY) specs.push(specFromEnv('gemini-env', 'gemini', cfg.geminiModel, 10));
@@ -528,15 +521,10 @@ export async function buildPool(): Promise<PoolEntry[]> {
     // OVH et LLM7 sont sans clé, donc disponibles immédiatement.
     // Les autres (Groq, OpenRouter) ne seront utilisables que si une clé est fournie via env ou pool.
     // On filtre ceux qui nécessitent une clé si elle est absente, sauf si déjà en pool géré.
-    const hasOvh = specs.some(s => s.baseUrl?.includes('kepler.ai.cloud.ovh.net'));
-    const hasLlm7 = specs.some(s => s.baseUrl?.includes('llm7.io'));
-    if (!hasOvh) {
-      const ovh = FREE_ANONYMOUS_PROVIDERS.find(p => p.name === 'ovh-free')!;
-      specs.push(specFromEnv(ovh.name, ovh.kind, ovh.model!, ovh.priority, ovh.baseUrl, undefined, false));
-    }
-    if (!hasLlm7) {
-      const llm7 = FREE_ANONYMOUS_PROVIDERS.find(p => p.name === 'llm7-free')!;
-      specs.push(specFromEnv(llm7.name, llm7.kind, llm7.model!, llm7.priority, llm7.baseUrl, undefined, false));
+    if (process.env.HERMES_ANONYMOUS_FALLBACK !== '0') {
+      for (const anonymous of FREE_ANONYMOUS_PROVIDERS) {
+        if (!specs.some(s => s.baseUrl === anonymous.baseUrl)) specs.push({ ...anonymous });
+      }
     }
     // Si une clé Groq/OpenRouter est dispo dans l'env, on les ajoute aussi comme gratuits
     const groqKey = (process.env.GROQ_API_KEY || '').trim();
@@ -553,7 +541,7 @@ export async function buildPool(): Promise<PoolEntry[]> {
     }
   }
   // Si le pool reste vide (aucun env, aucun KV), on garde quand même les anonymes gratuits en dernier recours
-  if (specs.length === 0) {
+  if (specs.length === 0 && choice === 'auto' && process.env.HERMES_ANONYMOUS_FALLBACK !== '0') {
     for (const fp of FREE_ANONYMOUS_PROVIDERS.slice(0, 2)) {
       specs.push(specFromEnv(fp.name, fp.kind, fp.model!, fp.priority, fp.baseUrl, undefined, false));
     }
@@ -584,8 +572,8 @@ export async function buildPool(): Promise<PoolEntry[]> {
 }
 
 /** Pool utilisable : les fournisseurs en cooldown sont décalés en fin de file (retentés si tous sont en échec). */
-export async function getUsablePool(): Promise<PoolEntry[]> {
-  const all = await buildPool();
+export async function getUsablePool(freeOnly = true): Promise<PoolEntry[]> {
+  const all = (await buildPool()).filter(e => !freeOnly || providerCostPolicy(e).eligible);
   const now = Date.now();
   const cooling = all.filter(e => stat(e.name).cooldownUntil > now);
   const ready = all.filter(e => stat(e.name).cooldownUntil <= now);
@@ -598,6 +586,7 @@ export function reportOutcome(name: string, kind: 'ok' | 'rate_limited' | 'error
   st.calls += 1;
   if (kind === 'ok') {
     st.ok += 1;
+    st.cooldownUntil = 0;
   } else {
     st.errors += 1;
     const ms = kind === 'rate_limited'
@@ -618,16 +607,24 @@ const RETRY_AFTER_RE = /retry[- ]after[:\s=]*(\d+)/i;
  * et le suivant est essayé. Échec final seulement si TOUS ont échoué.
  */
 export async function chatWithFailover(opts: LLMChatOptions): Promise<{ result: LLMChatResult; entry: PoolEntry }> {
-  const entries = (await getUsablePool()).slice(0, HERMES_POOL.MAX_FALLBACKS_PER_CALL);
+  const entries = (await getUsablePool(freeOnlyEnabled(opts.freeOnly))).slice(0, HERMES_POOL.MAX_FALLBACKS_PER_CALL);
   if (entries.length === 0) throw new Error(`Aucun fournisseur IA RÉEL disponible (pool vide — le mode mock de test a été supprimé). ${realProviderHelp()}`);
   const tried: string[] = [];
   for (const entry of entries) {
+    opts.signal?.throwIfAborted();
+    opts.onProviderEvent?.(`Connexion à ${entry.name} (${entry.model})…`);
     try {
       const result = await entry.provider.chat(opts);
+      opts.signal?.throwIfAborted();
+      if (!result.text?.trim() && !result.toolCalls?.length) {
+        throw new Error('Réponse vide : aucun texte ni appel d’outil reçu.');
+      }
       reportOutcome(entry.name, 'ok');
       return { result, entry };
     } catch (err: any) {
+      opts.signal?.throwIfAborted();
       const msg = String(err?.message || err);
+      opts.onProviderEvent?.(`${entry.name} indisponible : ${msg.slice(0, 160)}. Essai du prochain fournisseur autorisé.`);
       tried.push(`${entry.name} (${msg.slice(0, 100)})`);
       const rate = RATE_LIMIT_RE.test(msg);
       const m = RETRY_AFTER_RE.exec(msg);
@@ -653,6 +650,7 @@ export async function getPoolStatus(): Promise<Array<Record<string, any>>> {
       priority: e.priority, source: e.source, label: e.provider.label,
       ...(effectiveModel && effectiveModel !== e.model ? { modelEffective: effectiveModel, modelNote: `modèle configuré « ${e.model} » indisponible — repli automatique sur « ${effectiveModel} »` } : {}),
       key: e.keyMasked,
+      costPolicy: providerCostPolicy(e),
       inCooldown: st.cooldownUntil > now,
       cooldownRemainingSec: st.cooldownUntil > now ? Math.ceil((st.cooldownUntil - now) / 1000) : 0,
       calls: st.calls, ok: st.ok, errors: st.errors,
@@ -719,6 +717,7 @@ export async function testProvider(name: string): Promise<{ ok: boolean; name: s
   const entries = await buildPool();
   const entry = entries.find(e => e.name === n);
   if (!entry) throw new Error(`Fournisseur inconnu : ${n}`);
+  if (freeOnlyEnabled() && !providerCostPolicy(entry).eligible) throw new Error('Test bloqué par le mode sans API payante : facturation inconnue.');
   const t0 = Date.now();
   try {
     const res = await withTimeout(entry.provider.chat({
@@ -726,6 +725,7 @@ export async function testProvider(name: string): Promise<{ ok: boolean; name: s
       events: [{ type: 'text', role: 'user', text: 'Réponds uniquement : OK' }],
       tools: []
     }), 30 * 1000);
+    if (!res.text?.trim()) throw new Error('Réponse vide du fournisseur.');
     return { ok: true, name: n, ms: Date.now() - t0, sample: String(res.text || '').slice(0, 120) };
   } catch (e: any) {
     return { ok: false, name: n, ms: Date.now() - t0, error: String(e?.message || e).slice(0, 300) };

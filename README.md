@@ -39,6 +39,92 @@ Trois règles, sans exception ni repli silencieux :
 Au démarrage, le serveur affiche un bandeau : IA réelle / passerelle de paiement / politique
 de données.
 
+## Hermes : espace agent interactif
+
+La console **Hermes Agent IA** et sa fenêtre flottante partagent désormais le même chat :
+
+- **Suivi en direct (SSE)** : connexion au fournisseur, points d'étape, outil en cours,
+  résultat, durée et spécialiste responsable. Les détails sont dépliables. Il s'agit
+  d'événements réellement reçus, pas d'une animation simulée ni de raisonnement privé.
+  La réponse LLM arrive par message, **pas token par token**.
+- **Dialogue à choix** : la skill `ask_user` affiche 2–4 réponses et une saisie libre
+  facultative. L'exécution s'arrête jusqu'à votre réponse.
+- **Consentement serveur** : prix, publication, suppression, diffusion, configuration
+  et installation sensibles passent par les boutons de confirmation. Un `confirm:true`
+  produit par le modèle est ignoré. Une autorisation est liée à la session, valable
+  10 minutes et consommable une seule fois. Le refus la révoque vraiment côté serveur.
+- **Sous-agents** : étapes et confirmations remontent dans la conversation principale ;
+  périmètre et budgets partagés, délégation récursive interdite.
+- **Arrêt et reprise** : Arrêter empêche de nouvelles étapes, mais ne revient pas sur une
+  écriture déjà engagée. En cas de résultat incertain, vérifiez le journal avant de
+  poursuivre. Une déconnexion n'est jamais affichée comme un succès.
+- **Markdown sûr**, tableaux, blocs de code copiables, téléchargement d'une réponse ou
+  de la discussion. Les 60 derniers messages sont conservés **dans ce navigateur**
+  (`hermes:conversation:v1`, hors synchronisation du store public). Un rechargement
+  ne rejoue jamais automatiquement une action. Les anciens messages v4 ne sont pas migrés.
+- **Registres réels** : les agents et compétences viennent du serveur, plus de compteur
+  « 47 » figé ni de sélecteur d'agent ignoré.
+- **Audit sans IA / Mes chiffres réels** : diagnostics déterministes accessibles même
+  sans fournisseur disponible. Les montants Hermes proviennent des commandes du registre
+  de paiement protégé, avec confirmation Stripe **live** ou crypto, pas des compteurs UI.
+  Ils sont bruts, bornés à l'historique conservé, sans conversion entre devises ni
+  déduction des frais/remboursements ; ce n'est pas un solde bancaire.
+
+### Gratuité : une politique, pas une promesse illimitée
+
+`HERMES_FREE_ONLY=1` est le défaut. Le chat et l'autonomie utilisent uniquement :
+
+1. un endpoint **local explicitement déclaré** (modèle réellement local requis) ;
+2. les modèles OpenRouter `:free` / `openrouter/free` ;
+3. les endpoints anonymes connus sans clé, si leur repli est activé.
+
+Les fournisseurs à facturation inconnue sont **exclus avant l'appel**, y compris si
+leur nom contient « free ». Une clé Gemini/Groq/autre peut appartenir à un compte
+facturable : elle ne suffit donc pas à autoriser un appel en mode strict. Il n'y a
+**aucun repli payant** en cas de quota épuisé. Les tests de connexion suivent aussi
+cette politique. L'onglet **Coûts** montre les fournisseurs autorisés et bloqués.
+
+`HERMES_ANONYMOUS_FALLBACK=0` désactive l'ajout automatique des services anonymes ;
+utilisez `HERMES_PROVIDER=openai` avec un endpoint local pour rester sur votre serveur.
+Un fournisseur distant reçoit le contexte envoyé : n'y collez pas de secrets.
+Un administrateur peut déverrouiller les appels non gratuits avec
+`HERMES_FREE_ONLY=0` **et** `freeOnly:false` dans une requête API ; l'interface, elle,
+continue d'envoyer `freeOnly:true`.
+
+L'interface n'ajoute aucun abonnement, mais **les quotas, l'hébergement, les ressources
+locales et les frais de paiement restent distincts**. L'autonomie est désactivée par
+défaut pour une nouvelle installation (une préférence existante est conservée).
+Aucun objectif de chiffre d'affaires, notamment 10 000 € dans la journée, n'est garanti.
+Le mode gratuit bloque aussi la création d'une campagne avec un budget positif.
+
+### Contrat et vérifications
+
+- `POST /api/hermes/chat` : `{ prompt, agentId, history, stream: true, freeOnly: true }`.
+  `agent` et la réponse JSON restent compatibles. Une seule exécution active par session.
+- `POST /api/hermes/chat/stop` : `{ runId }` (même session).
+- `POST /api/hermes/confirm` : `{ actionId, decision: "approve" | "refuse" }`.
+- `POST /api/hermes/inspect` : `{ tool: "audit_system" | "metrics_summary" | "platform_overview" }`.
+- Contrat partagé : `src/types/hermes.ts`. Flux : `run_started`, `status`, `step`,
+  `message`, `question`, `confirmation`, `done`, `error` ; heartbeat de 15 s.
+- Budgets : 6 pas principaux, 3 par sous-agent, 12 tours LLM partagés et 10 outils au total
+  (jusqu’à 8 fournisseurs essayés par tour en cas d’échec), durée de requête plafonnée à 4 minutes. Le dernier pas est réservé à la synthèse.
+- Les confirmations en attente et exécutions sont en mémoire : un redémarrage les
+  invalide. En multi-instance, prévoir un stockage partagé avant de répartir ces routes.
+
+```bash
+npm run lint
+npm run build
+npm run test:hermes       # transport + moteur, PostgreSQL éphémère isolé, aucun cloud
+# Tests navigateur : démarrer npm run dev dans un autre terminal
+npx playwright install chromium
+npm run test:hermes:ui    # fixtures UI locales ; jamais de vente ou d'IA simulée dans le produit
+```
+
+La correction couvre notamment les réponses vides et les signatures Gemini portées
+sur le même `Part` que l'appel d'outil (auparavant ignoré). Les tests utilisent des
+fixtures de transport clairement isolées ; ils ne garantissent pas la disponibilité
+ni la qualité des fournisseurs externes.
+
 ## Démarrage
 
 ```bash
@@ -139,9 +225,9 @@ automatiquement cloud → local en cas d'erreur.
 | **Télécharger des skills** | `skills_custom_list/install/remove` | Skills **webhook** installés À CHAUD (KV `df_hermes_custom_skills`) : spec JSON inline ou servie par URL — GET (lecture) ou POST (confirmation), endpoint https public ou localhost déclaré ; rejoués au démarrage, visibles de tous les agents immédiatement |
 | **Implanter des repos** | `repo_clone`, `repo_files`, `repo_remove` | `git clone --depth 1` RÉEL d'un repo GitHub public dans `references/_clones/` (25 max, gitignoré), puis liste / lecture / grep de ses fichiers |
 | **Apprendre / se souvenir** | `memory_search` (+ injection auto) | Les 50 derniers échanges (KV `df_hermes_memories`) sont **rappelés automatiquement** dans le prompt système et **consultables** par recherche plein-texte |
-| **Multi-agents & autonomie** | `list_agents`, `dispatch_agent`, cycles planifiés | Orchestrateur + 8 spécialistes, sous-agents budgétés, cycles autonomes en lecture/brouillons uniquement (skills custom exclus du périmètre d'autonomie) |
+| **Multi-agents & autonomie** | `list_agents`, `dispatch_agent`, cycles planifiés | Orchestrateur + 9 spécialistes, sous-agents budgétés, cycles autonomes en lecture/brouillons uniquement (skills custom exclus du périmètre d'autonomie) |
 
-Sécurité : toutes les écritures destructives passent par la **porte de confirmation** (`confirm: true` → `POST /api/hermes/confirm`), la garde anti-SSRF s'applique à tout appel sortant (y compris webhooks des skills custom), et aucun secret n'est jamais exposé en clair.
+Sécurité : toutes les écritures destructives passent par la **porte de confirmation** (`actionId` → `POST /api/hermes/confirm` ; le modèle ne peut pas se confirmer lui-même), la garde anti-SSRF s'applique à tout appel sortant (y compris webhooks des skills custom), et aucun secret n'est jamais exposé en clair.
 
 #### Dépannage : « Tous les fournisseurs IA réels sont indisponibles »
 
@@ -152,23 +238,23 @@ Sécurité : toutes les écritures destructives passent par la **porte de confir
   l'erreur affiche désormais l'URL exacte et la cause (`ECONNREFUSED`…).
   Pour l'IA locale : `node scripts/setup-local-llm.mjs --check`.
 - `openai-env (ECONNREFUSED 127.0.0.1:11434)` : Ollama local non démarré. Le pool
-  bascule désormais automatiquement sur **OVHcloud (2 RPM/IP, anonyme)** et **LLM7.io (turbo anonyme)** —
-  aucun blocage même sans Gemini ni Ollama. Voir `GET /api/hermes/free-catalog`.
+  peut essayer les endpoints anonymes autorisés en mode `auto` (si ce repli est activé).
+  Ils restent soumis à leur disponibilité et leurs quotas. Voir `GET /api/hermes/free-catalog`.
 
-#### Providers 100% gratuits — « un modèle comme le tien avec toutes les clés gratuites »
+#### Catalogue de fournisseurs avec offres gratuites
 
-Hermes intègre un **pool de 9 fournisseurs gratuits** (sans simulation mock) :
+Hermes intègre un **catalogue de fournisseurs avec offres gratuites** (sans simulation mock), distinct du pool autorisé par la politique de coût :
 
-- **Anonymes toujours actifs (0 clé, 0 CB)** : `ovh-free` (EU, 2 RPM/IP), `llm7-free` (turbo models) — garantissent une réponse même sans `GEMINI_API_KEY`.
+- **Anonymes optionnels** : `ovh-free`, `llm7-free` — sans clé ; disponibilité et limites à vérifier, aucune réponse garantie.
 - **Free tier avec clé gratuite (sans CB)** : Groq (ultra-rapide LPU), OpenRouter (`:free` models), Mistral, Cohere, HuggingFace, Together, NVIDIA NIM.
 
 Catalogue : `GET /api/hermes/free-catalog` (total, configuredEnv, anonymousAlwaysOn, howTo) ou skill `free_catalog`.
-Installation : `POST /api/hermes/free-install/:id { apiKey }` ou skill `free_install` (confirmation si clé fournie).
+Installation : `POST /api/hermes/free-install/:id { apiKey }` ou skill `free_install` (confirmation serveur dans le chat).
 Auto-install au boot : `server.ts` lit `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`… depuis l'env et les persiste dans `df_hermes_provider_pool`.
 Voir `hermes/freeProviders.ts` et `hermes/knowledge/free-llm-apis.json` (16 providers / 118 modèles curés).
 
 
-### Gestionnaire d'API & tokens — pool multi-fournisseurs (« ne jamais être bloqué »)
+### Gestionnaire d'API & tokens — pool multi-fournisseurs
 
 Hermes ne dépend plus d'un seul fournisseur. Un **pool** mélange, par priorité :
 
@@ -180,7 +266,7 @@ Le pool ne contient que des fournisseurs **réels** : l'ancien filet « mock » 
 
 À chaque appel LLM, un fournisseur qui rate-limite (429) ou échoue (5xx/timeout) passe en
 **cooldown** (30 s sur rate-limit — ou `Retry-After` — ; 15 s sur erreur) et le **suivant est
-essayé automatiquement**. Échec annoncé seulement si TOUS les fournisseurs ont échoué.
+essayé automatiquement**. Seuls les fournisseurs autorisés par la politique de coût sont essayés. Si tous échouent (y compris réponse vide), un échec explicite remplace tout faux succès.
 
 Sémantique de `HERMES_PROVIDER` : `auto` = env + pool géré · `gemini`/`openai` = verrou
 exclusif sur ce type · `mock` = **refusé** (avertissement + repli `auto`).
@@ -203,12 +289,14 @@ open-source** (la skill `free_llm_lookup` fournit la liste + baseUrl).
 | Module | Rôle |
 |---|---|
 | `types.ts` | Types + limites (budgets 6 pas / 10 outils, timeouts, tailles) |
-| `providers.ts` | Gemini (`@google/genai`), compatible OpenAI (fetch natif), mock (tests) — **pool multi-fournisseurs + bascule automatique (cooldowns 429/erreur) + gestionnaire de tokens** |
-| `tools.ts` | **47 skills réelles** : catalogue, pricing, contenu/SEO, canaux, ventes agrégées (sans PII), système, **internet**, **gestion du pool de fournisseurs IA**, **repos GitHub** (`repos_list`/`repos_get`/`repos_harvest` — veille live + harvest de la plateforme), **référentiels locaux** (`reference_repos`), **liens** (`platform_links` + contrôle de santé), **vue globale** (`platform_overview`) |
+| `providers.ts` | Gemini (`@google/genai`), compatible OpenAI (fetch natif), sans fournisseur mock — **pool multi-fournisseurs + bascule automatique (cooldowns 429/erreur) + gestionnaire de tokens** |
+| `tools.ts` | **Registre dynamique de skills réelles** : catalogue, pricing, contenu/SEO, canaux, ventes agrégées (sans PII), système, **internet**, **gestion du pool de fournisseurs IA**, **repos GitHub** (`repos_list`/`repos_get`/`repos_harvest` — veille live + harvest de la plateforme), **référentiels locaux** (`reference_repos`), **liens** (`platform_links` + contrôle de santé), **vue globale** (`platform_overview`) |
 | `agents.ts` | **10 agents** : orchestrateur + 9 spécialistes (dont l'**Agent Internet** `web_explorer`) |
+| `providerPolicy.ts` | Filtrage conservateur sans API payante (pas de clé cloud réutilisée vers un endpoint anonyme) |
+| `salesFacts.ts` | Agrégats de paiements confirmés, tests/démos exclus, devises séparées |
 | `engine.ts` | Boucle plan → outil → observation, confirmation des actions sensibles (actionId), journal d'audit, mémoire, **contexte plateforme enrichi** (repos, liens, auto-pilot, autonomie) |
 | `autonomy.ts` | **Autonomie serveur** : cycle planifié (observation → plan → actions SÛRES → rapport), journal en base, planificateur (intervalle 5-240 min), repli déterministe sans LLM (zéro simulation) |
-| `index.ts` | Router `/api/hermes` : `status`, `agents`, `skills`, `chat`, `confirm`, `autonomous-loop`, **`autonomy` (GET/POST), `autonomy/run`, `autonomy/log`**, `config`, `activity`, **`providers` (GET/POST/DELETE/:name/test)** |
+| `index.ts` | Router `/api/hermes` : `status`, `agents`, `skills`, `chat` (JSON/SSE), `chat/stop`, `inspect`, `confirm`, `autonomous-loop`, **`autonomy` (GET/POST), `autonomy/run`, `autonomy/log`**, `config`, `activity`, **`providers` (GET/POST/DELETE/:name/test)** |
 | `knowledge/free-for.json` | Base de connaissances **~106 services à tiers gratuit** (snapshot curé de [free-for.dev](https://free-for.dev)) |
 | `knowledge/free-llm-apis.json` | Base des **API LLM gratuites** : ~16 providers / 118 modèles (snapshot de [mnfst/awesome-free-llm-apis](https://github.com/mnfst/awesome-free-llm-apis)) |
 

@@ -235,6 +235,9 @@ const SENSITIVE_READ_KEYS = new Set([
   'df_french_invoices_v1',
   'df_crypto_pending_reviews',
   'df_hermes_provider_pool',
+  'df_hermes_activity', 'df_hermes_memories', 'df_hermes_config',
+  'df_hermes_custom_skills', 'df_hermes_repo_clones',
+  'df_hermes_agent_state_v4', 'df_hermes_agent_state_v5',
 ]);
 
 // Clés dont l'écriture est refusée via l'API (les secrets Stripe et le passcode
@@ -259,6 +262,9 @@ const SENSITIVE_WRITE_KEYS = new Set([
   'df_french_invoices_v1',
   'df_crypto_pending_reviews',
   'df_hermes_provider_pool',
+  'df_hermes_activity', 'df_hermes_memories', 'df_hermes_config',
+  'df_hermes_custom_skills', 'df_hermes_repo_clones',
+  'df_hermes_agent_state_v4', 'df_hermes_agent_state_v5',
 ]);
 
 // ============================================================
