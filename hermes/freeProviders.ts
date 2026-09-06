@@ -182,7 +182,7 @@ export function getFreeProvidersFromEnv(): ProviderSpec[] {
   const specs: ProviderSpec[] = [];
 
   // Toujours inclure les anonymes gratuits (pas de clé)
-  for (const fp of FREE_CATALOG.filter(f => !f.needsKey)) {
+  for (const fp of FREE_CATALOG.filter(f => !f.needsKey && process.env.HERMES_ANONYMOUS_FALLBACK !== '0')) {
     specs.push({
       name: fp.id,
       kind: 'openai',
@@ -283,6 +283,6 @@ export function getFreeCatalogForUI() {
     envKey: f.envKey,
     priority: f.priority,
     docsUrl: f.docsUrl,
-    configured: f.envKey ? Boolean(process.env[f.envKey]) : true, // anonymes toujours configurés
+    configured: f.envKey ? Boolean(process.env[f.envKey]) : process.env.HERMES_ANONYMOUS_FALLBACK !== '0', // présence de config ≠ disponibilité/coût vérifiés
   }));
 }

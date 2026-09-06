@@ -149,7 +149,9 @@ async function reseed() {
 
   // H1 : re-pricing réel via tool calling
   r = await aiChat('Change le prix de prod-test-1 à 39 €');
-  checkLLM('chat re-pricing → réponse + étapes d\u2019outils', r.status === 200 && Array.isArray(r.json.steps) && r.json.steps.some(s => s.tool === 'catalog_set_price' && s.status === 'ok'), JSON.stringify(r.json.steps || []).slice(0, 160));
+  checkLLM('chat re-pricing → confirmation requise', r.status === 200 && r.json.pendingConfirmation?.tool === 'catalog_set_price', JSON.stringify(r.json.steps || []).slice(0, 160));
+  if (r.json.pendingConfirmation) r = await req('POST', '/api/hermes/confirm', { body: { actionId: r.json.pendingConfirmation.actionId }, ...A });
+  checkLLM('re-pricing confirmé → exécution', r.json.confirmed === true);
   let store = await req('GET', '/api/store');
   let prods = (store.json || []).filter(x => x.key === 'dpf_app_v2_products');
   let price1 = prods[0]?.value?.find(p => p.id === 'prod-test-1')?.pricing?.recommendedPrice;
@@ -363,13 +365,15 @@ async function reseed() {
   checkLLM('chat « liste les fournisseurs » → skill providers_list', r.status === 200 && listStep && listStep.status === 'ok', JSON.stringify(listStep || {}).slice(0, 120));
   r = await aiChat('ajoute groq au pool: baseUrl https://api.groq.com/openai/v1 modèle: llama-3.3-70b-versatile clé: sk-groq-suite-123456789');
   const addStep = (r.json.steps || []).find(s => s.tool === 'providers_add');
-  checkLLM('chat « ajoute groq au pool » → skill providers_add exécutée', r.status === 200 && addStep && addStep.status === 'ok', JSON.stringify(addStep || {}).slice(0, 140));
+  checkLLM('chat « ajoute groq au pool » → confirmation providers_add', r.status === 200 && addStep && addStep.status === 'confirmation_required', JSON.stringify(addStep || {}).slice(0, 140));
+  if (r.json.pendingConfirmation) await req('POST', '/api/hermes/confirm', { body: { actionId: r.json.pendingConfirmation.actionId }, ...A });
   r = await req('GET', '/api/hermes/activity', A);
   const addAudit = (r.json.activity || []).find(a => a.tool === 'providers_add');
   checkLLM('audit : apiKey du providers_add MASQUÉE (jamais en clair)', addAudit && !String(addAudit.args || '').includes('sk-groq-suite-123456789') && /•/.test(String(addAudit.args || '')), String(addAudit?.args || '').slice(0, 120));
   r = await aiChat('supprime le fournisseur groq');
   const rmStep = (r.json.steps || []).find(s => s.tool === 'providers_remove');
-  checkLLM('chat « supprime le fournisseur groq » → skill providers_remove', r.status === 200 && rmStep && rmStep.status === 'ok', JSON.stringify(rmStep || {}).slice(0, 120));
+  checkLLM('chat « supprime le fournisseur groq » → confirmation providers_remove', r.status === 200 && rmStep && rmStep.status === 'confirmation_required', JSON.stringify(rmStep || {}).slice(0, 120));
+  if (r.json.pendingConfirmation) await req('POST', '/api/hermes/confirm', { body: { actionId: r.json.pendingConfirmation.actionId }, ...A });
 
   // P9 : nettoyage — retour au pool minimal (mock-env seul)
   r = await req('DELETE', '/api/hermes/providers/test-broken', A);

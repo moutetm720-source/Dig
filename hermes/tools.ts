@@ -21,6 +21,7 @@ import { keyValueStore } from '../src/db/schema';
 import { eq } from 'drizzle-orm';
 import { assertSafeOutbound } from '../ssrfGuard';
 import { HermesContext, HermesTool, ToolParameterSchema } from './types';
+import { confirmedSales, salesFacts } from './salesFacts';
 import {
   customSkillTools, ensureCustomSkillsLoaded, installCustomSkill, removeCustomSkill,
   listCustomSkillSpecs, cloneRepo, listClones, readCloneFile, grepClone, removeClone,
@@ -344,6 +345,29 @@ function repoAngle(item: any): { format: string; angle: string } {
 
 export function buildSkillRegistry(): HermesTool[] {
   return [
+    {
+      name: 'ask_user',
+      description: "Pose UNE question utile avec 2 à 4 choix cliquables. Suspend l'exécution pour attendre la réponse. Utilise-le quand une précision est indispensable (offre, audience, priorité). Ce n'est jamais une autorisation d'achat ou de publication.",
+      access: 'read',
+      parameters: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: 'Question courte en français' },
+          options: { type: 'array', items: { type: 'string' }, description: '2 à 4 réponses concrètes, sans secret' },
+          allowCustom: { type: 'boolean', description: 'Autoriser une autre réponse libre (défaut oui)' }
+        },
+        required: ['question', 'options']
+      },
+      async run(args) {
+        const question = str(args.question, 600).trim();
+        if (!question || !Array.isArray(args.options) || args.options.length < 2 || args.options.length > 4 || args.options.some((o: any) => typeof o !== 'string' || !o.trim() || o.length > 200)) {
+          throw new Error('Question invalide : texte et 2 à 4 choix non vides requis.');
+        }
+        const options = [...new Set(args.options.map((o: string) => o.trim()))];
+        if (options.length < 2) throw new Error('Les choix doivent être distincts.');
+        return { question, options, allowCustom: args.allowCustom !== false };
+      }
+    },
     // ════════════ CATALOGUE ════════════
     {
       name: 'catalog_list',
@@ -526,11 +550,12 @@ export function buildSkillRegistry(): HermesTool[] {
         const idx = products.findIndex(p => p.id === id);
         if (idx === -1) throw new Error(`Produit introuvable : ${id}`);
         const p = products[idx];
+        const oldPrice = p.pricing?.recommendedPrice ?? p.price ?? null;
         p.pricing = { ...p.pricing, recommendedPrice: price, compareAtPrice: args.compareAtPrice ? num(args.compareAtPrice, 1, 20000) : Math.round(price * 1.6 * 100) / 100, isFlashSale: Boolean(args.flashSale) };
         p.price = price;
         products[idx] = p;
         await writeList('dpf_app_v2_products', products);
-        return { updated: true, scope: 'one', id, oldPrice: p.pricing?.recommendedPrice ?? null, newPrice: price };
+        return { updated: true, scope: 'one', id, oldPrice, newPrice: price };
       }
     },
     {
@@ -727,7 +752,8 @@ export function buildSkillRegistry(): HermesTool[] {
         },
         required: ['name', 'platform', 'budget']
       },
-      async run(args) {
+      async run(args, ctx) {
+        if (ctx.freeOnly) throw new Error('Budget zéro : aucune campagne publicitaire payante, même en brouillon. Préparez plutôt un contenu organique.');
         const name = str(args.name, 120);
         const platforms = ['google_ads', 'meta_ads', 'tiktok_ads', 'linkedin_ads', 'reddit_ads'];
         if (!platforms.includes(args.platform)) throw new Error('Plateforme non supportée.');
@@ -898,7 +924,7 @@ export function buildSkillRegistry(): HermesTool[] {
         },
         required: ['endpointUrl', 'message']
       },
-      async run(args) {
+      async run(args, ctx) {
         const url = str(args.endpointUrl, 500);
         const message = str(args.message, 2000);
         if (!url) throw new Error('endpointUrl manquant.');
@@ -910,8 +936,10 @@ export function buildSkillRegistry(): HermesTool[] {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ source: 'hermes-agent', message, at: new Date().toISOString() }),
-            signal: ctrl.signal
+            redirect: 'error',
+            signal: AbortSignal.any([ctrl.signal, ...(ctx.signal ? [ctx.signal] : [])])
           });
+          if (!res.ok) throw new Error(`Le canal a refusé le message (HTTP ${res.status}). Aucun envoi confirmé.`);
           return { sent: true, status: res.status, url: new URL(url).hostname };
         } catch (e: any) {
           throw new Error(`Échec de l'envoi : ${e?.message || e}`);
@@ -924,25 +952,11 @@ export function buildSkillRegistry(): HermesTool[] {
     // ════════════ VENTES & ANALYTIQUE (AGRÉGATS SEULEMENT — PAS DE PII) ════════════
     {
       name: 'metrics_summary',
-      description: "Métriques agrégées : CA total, commandes, top produits par ventes, conversion moyenne. AUCUNE donnée client nominative.",
+      description: "Chiffres des paiements confirmés dans le registre serveur : montants bruts, ventes du jour UTC, commandes, top produits. Exclut tests/démos/impayés. Aucune donnée client nominative.",
       access: 'read',
       parameters: { type: 'object', properties: {} },
       async run() {
-        const orders = await readList('dpf_app_v2_orders');
-        const products = await readList('dpf_app_v2_products');
-        const totalRevenue = orders.reduce((s: number, o: any) => s + (Number(o.totalAmount) || 0), 0);
-        const top = [...products]
-          .sort((a: any, b: any) => (b.salesCount || 0) - (a.salesCount || 0))
-          .slice(0, 5)
-          .map((p: any) => ({ id: p.id, title: p.title, sales: p.salesCount || 0, revenue: p.revenue || 0 }));
-        return {
-          orders: orders.length,
-          totalRevenueEur: Math.round(totalRevenue * 100) / 100,
-          avgOrderValue: orders.length ? Math.round((totalRevenue / orders.length) * 100) / 100 : 0,
-          products: products.length,
-          publishedProducts: products.filter((p: any) => p.status === 'published').length,
-          topProducts: top
-        };
+        return salesFacts(await readList('dpf_server_orders_v1'), await readList('dpf_app_v2_products'));
       }
     },
     {
@@ -954,14 +968,14 @@ export function buildSkillRegistry(): HermesTool[] {
         properties: { limit: { type: 'integer', minimum: 1, maximum: 20, description: 'Nombre max (défaut 10)' } }
       },
       async run(args) {
-        const limit = Math.min(20, Math.max(1, num(args.limit, 1, 20) || 10));
-        const orders = await readList('dpf_app_v2_orders');
+        const limit = args.limit === undefined ? 10 : num(args.limit, 1, 20);
+        const orders = confirmedSales(await readList('dpf_server_orders_v1')).sort((a, b) => Date.parse(b.confirmedAt) - Date.parse(a.confirmedAt));
         // SÉCURITÉ : aucune donnée client (nom, email, adresse) n'est exposée au LLM.
         return {
           count: orders.length,
           recent: orders.slice(0, limit).map((o: any) => ({
             orderNumber: o.orderNumber || o.id,
-            total: Number(o.totalAmount) || 0,
+            total: o.totalCents / 100,
             currency: o.currency || 'EUR',
             paymentMethod: o.paymentMethod,
             itemsCount: Array.isArray(o.items) ? o.items.length : 0,
@@ -1640,22 +1654,21 @@ export function buildSkillRegistry(): HermesTool[] {
       parameters: { type: 'object', properties: {} },
       async run() {
         const [products, orders, integrations, repos, kits, apEnabled1, apEnabled2, apSpeed1, apSpeed2, autonomyCfg, lastHarvest] = await Promise.all([
-          readList('dpf_app_v2_products'), readList('dpf_app_v2_orders'), readList('dpf_app_v2_integrations'),
+          readList('dpf_app_v2_products'), readList('dpf_server_orders_v1'), readList('dpf_app_v2_integrations'),
           readList('df_github_repositories'), readList('df_affiliate_promo_kits_v1'),
           kvGet('df_auto_pilot_enabled_v1'), kvGet('df_auto_pilot_enabled'),
           kvGet('df_auto_loop_speed_v1'), kvGet('df_auto_loop_speed'),
           kvGet('df_hermes_autonomy_config'), kvGet('df_github_last_harvest')
         ]);
-        const revenue = orders.reduce((s: number, o: any) => s + (Number(o.totalAmount) || 0), 0);
+        const sales = salesFacts(orders, products);
         const base = (process.env.PUBLIC_URL || '').trim().replace(/\/$/, '');
         const published = products.filter(p => p.status === 'published');
         return {
           generatedAt: new Date().toISOString(),
           boutique: {
             products: products.length, published: published.length,
-            orders: orders.length, revenueEur: Math.round(revenue * 100) / 100,
-            topProducts: [...products].sort((a, b) => (b.salesCount || 0) - (a.salesCount || 0)).slice(0, 3)
-              .map(p => ({ id: p.id, title: p.title, sales: p.salesCount || 0, priceEur: p.pricing?.recommendedPrice ?? p.price ?? null }))
+            orders: sales.orders, revenueEur: sales.totalRevenueEur, todayRevenueEur: sales.todayRevenueEur,
+            topProducts: sales.topProducts, revenueNote: sales.note
           },
           canaux: {
             total: integrations.length,
@@ -1709,14 +1722,14 @@ export function buildSkillRegistry(): HermesTool[] {
         },
         required: ['agentId', 'task']
       },
-      async run(args) {
+      async run(args, ctx) {
         const { getAgents } = await import('./agents');
         const { runSubAgent } = await import('./engine');
         const agent = getAgents().find(a => a.id === str(args.agentId, 40));
         if (!agent) throw new Error(`Agent inconnu : ${args.agentId}. Utilisez list_agents.`);
         const task = str(args.task, 500);
         if (!task) throw new Error('task vide.');
-        return runSubAgent(agent, task);
+        return runSubAgent(agent, task, ctx);
       }
     },
     // ---------- Gestionnaire d'API & tokens — pool multi-fournisseurs (jamais bloqué) ----------
@@ -2145,16 +2158,16 @@ export function buildSkillRegistry(): HermesTool[] {
         return {
           total: FREE_CATALOG.length,
           activeInPool: pool.map((p: any) => p.name),
-          anonymousAlwaysOn: ['ovh-free', 'llm7-free'],
-          note: 'Les providers anonymes (OVH, LLM7) sont TOUJOURS actifs en fallback, même sans clé — ils garantissent qu\'Hermes fonctionne à coût zéro.',
+          anonymousAlwaysOn: pool.filter((p: any) => ['ovh-free', 'llm7-free'].includes(p.name)).map((p: any) => p.name),
+          note: 'Offres à quotas limités, disponibilité non garantie. Catalogue/configuration ne signifie pas autorisation : le chat filtre les endpoints à coût inconnu.',
           catalog,
           howToActivate: {
             groq: '1) Allez sur https://console.groq.com/keys 2) Créez une clé gratuite (sans CB) 3) Définissez GROQ_API_KEY dans .env ou dites à Hermes \"ajoute Groq au pool avec cette clé\"',
             openrouter: '1) https://openrouter.ai/keys 2) Créez clé gratuite 3) OPENROUTER_API_KEY — accès aux modèles :free (openai/gpt-oss-20b:free, etc.)',
             mistral: 'https://console.mistral.ai/api-keys — free mode $10 crédits/mois',
             gemini: 'https://aistudio.google.com/app/apikey — gratuit, modèle conseillé gemini-3.5-flash-lite',
-            ovh: 'Aucune clé — déjà actif ! 2 RPM/IP, modèles EU',
-            llm7: 'Aucune clé — déjà actif ! turbo models gratuits'
+            ovh: 'Sans clé, si le repli anonyme est activé ; quotas à vérifier',
+            llm7: 'Sans clé, si le repli anonyme est activé ; quotas à vérifier'
           }
         };
       }
@@ -2182,15 +2195,6 @@ export function buildSkillRegistry(): HermesTool[] {
         const apiKey = args.apiKey ? str(args.apiKey, 500) : (info.envKey ? (process.env[info.envKey] || '').trim() : undefined);
         if (info.needsKey && !apiKey) {
           throw new Error(`Ce provider nécessite une clé gratuite. Obtenez-la gratuitement sur ${info.docsUrl} puis relancez avec apiKey. Variable d'env : ${info.envKey}`);
-        }
-        if (info.needsKey && args.confirm !== true && args.apiKey) {
-          // Porte de confirmation pour les clés
-          return {
-            needsConfirmation: true,
-            summary: `Installation de ${info.name} avec clé ${apiKey ? `•••• (${apiKey.length} car.)` : 'depuis env'} — confirmez avec confirm:true`,
-            actionId: 'pending-free-install',
-            provider: info.id
-          };
         }
         const { entry } = await addProvider({
           name: info.id,
@@ -2290,8 +2294,15 @@ export function getSkill(name: string): HermesTool | undefined {
   return customSkillTools().find(t => t.name === name);
 }
 
+/** Même porte pour le moteur et le registre affiché à l'humain. */
+export function needsUserConfirmation(skill: HermesTool, args: Record<string, any> = {}): boolean {
+  return Boolean(skill.requiresConfirmation || skill.access === 'destructive' || skill.access === 'outbound' ||
+    ['publish_product', 'kv_set', 'providers_add', 'providers_remove', 'free_install'].includes(skill.name) ||
+    (skill.name === 'catalog_update' && args.status === 'published'));
+}
+
 export function declareSkills(names?: string[], allowedOnly?: string[]): ToolDeclarationSchemaList {
-  let list = names ? getAllSkills().filter(t => names.includes(t.name)) : getAllSkills();
+  let list = names ? getAllSkills().filter(t => names.includes(t.name) || t.name === 'ask_user') : getAllSkills();
   if (allowedOnly) list = list.filter(t => allowedOnly.includes(t.name));
   return list.map(t => ({ name: t.name, description: t.description, parameters: t.parameters }));
 }

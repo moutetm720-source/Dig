@@ -1,3 +1,6 @@
+import type { AgentStep, HermesConfirmation, HermesProgressEvent, HermesQuestion } from '../src/types/hermes';
+export type { AgentStep, HermesChatResponse, HermesProgressEvent } from '../src/types/hermes';
+
 /**
  * hermes/types.ts — Types du moteur agent Hermes (v4 réelle).
  *
@@ -39,6 +42,10 @@ export interface LLMChatOptions {
   system: string;
   events: AgentEvent[];
   tools: ToolDeclaration[];
+  signal?: AbortSignal;
+  /** Filtrage côté serveur : aucun repli vers un endpoint payant/inconnu. */
+  freeOnly?: boolean;
+  onProviderEvent?: (message: string) => void;
 }
 
 export interface LLMChatResult {
@@ -65,13 +72,30 @@ export interface HermesContext {
   agentId: string;
   // Session en cours (messages récents, pour le contexte)
   conversation: string;
+  ownerId?: string;
+  signal?: AbortSignal;
+  freeOnly?: boolean;
+  allowedTools?: string[];
+  parentId?: string;
+  depth?: number;
+  runtime?: HermesRuntime;
+}
+
+export interface HermesRuntime {
+  toolCalls: number;
+  llmCalls: number;
+  steps: AgentStep[];
+  confirmations: HermesConfirmation[];
+  question?: HermesQuestion;
+  haltReason?: string;
+  onEvent?: (event: HermesProgressEvent) => void;
 }
 
 export interface HermesTool {
   name: string;
   description: string;
   access: SkillAccess;
-  /** Les skills destructifs exigent args.confirm === true (flux de confirmation). */
+  /** Le moteur exige une décision HTTP authentifiée ; un confirm:true du LLM ne vaut pas accord. */
   requiresConfirmation?: boolean;
   parameters: ToolParameterSchema;
   run(args: Record<string, any>, ctx: HermesContext): Promise<any>;
@@ -92,27 +116,6 @@ export interface HermesAgent {
 }
 
 // ---------- Moteur ----------
-
-export interface AgentStep {
-  tool: string;
-  args: Record<string, any>;
-  status: 'ok' | 'denied' | 'error' | 'confirmation_required';
-  summary: string;
-}
-
-export interface HermesChatResponse {
-  response: string;
-  provider: string;
-  model: string;
-  agent: string;
-  steps: AgentStep[];
-  pendingConfirmation?: {
-    actionId: string;
-    tool: string;
-    summary: string;
-  };
-  usage?: { inputTokens?: number; outputTokens?: number };
-}
 
 // ---------- Config ----------
 
@@ -136,7 +139,9 @@ export const DEFAULT_HERMES_CONFIG: HermesConfig = {
 };
 
 export const HERMES_LIMITS = {
-  MAX_STEPS: 6,            // appels LLM max par requête
+  MAX_STEPS: 6,            // tours LLM de l’agent principal
+  MAX_LLM_CALLS: 12,       // tours partagés avec les sous-agents (hors tentatives de repli)
+  RUN_TIMEOUT_MS: 4 * 60 * 1000,
   MAX_TOOL_CALLS: 10,      // exécutions d'outils max par requête
   TOOL_RESULT_CHARS: 4000, // troncature des résultats d'outils
   SUB_AGENT_STEPS: 3,      // budget des sous-agents (dispatch_agent)

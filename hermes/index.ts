@@ -12,11 +12,14 @@
  *  - GET  /activity        : audit des actions exécutées (auth)
  */
 import { Router } from 'express';
-import { runAgentChat, confirmPendingAction, getAgents } from './engine';
-import { getAllSkills, ensureCustomSkillsLoaded } from './tools';
+import crypto from 'node:crypto';
+import { runAgentChat, confirmPendingAction, runInspection, getAgents } from './engine';
+import { getAllSkills, ensureCustomSkillsLoaded, needsUserConfirmation } from './tools';
 import { buildPool, getPoolStatus, addProvider, removeProvider, testProvider, getHermesConfig, saveHermesConfig, realProviderHelp } from './providers';
 import { getAutonomyConfig, saveAutonomyConfig, runAutonomyCycle, getRecentAutonomyReports, isAutonomyRunning } from './autonomy';
-import { DEFAULT_HERMES_CONFIG } from './types';
+import { freeOnlyEnabled, providerCostPolicy } from './providerPolicy';
+import type { HermesProgressEvent } from '../src/types/hermes';
+import { DEFAULT_HERMES_CONFIG, HERMES_LIMITS } from './types';
 import { db } from '../src/db/db';
 import { keyValueStore } from '../src/db/schema';
 import { eq } from 'drizzle-orm';
@@ -30,12 +33,22 @@ export interface HermesRouterDeps {
 export function createHermesRouter(deps: HermesRouterDeps): Router {
   const router = Router();
   const { requireAuth, aiLimiter, apiLimiter } = deps;
+  const runs = new Map<string, { ownerId: string; controller: AbortController }>();
+  const ownerFor = (req: any) => crypto.createHash('sha256').update(String(req.headers.authorization || '')).digest('hex');
+  const skillInfo = (t: ReturnType<typeof getAllSkills>[number]) => ({
+    name: t.name, description: t.description, access: t.access, requiresConfirmation: needsUserConfirmation(t)
+  });
+  const agentInfo = (a: ReturnType<typeof getAgents>[number]) => ({
+    id: a.id, name: a.name, emoji: a.emoji, role: a.role, skills: a.skills || 'tous', maxSteps: a.maxSteps || null
+  });
 
   // ---- État réel ----
   router.get('/status', apiLimiter, async (req, res) => {
     try {
+      await ensureCustomSkillsLoaded();
       const pool = await buildPool();
-      const active = pool[0] || null;
+      const eligible = pool.filter(e => providerCostPolicy(e).eligible);
+      const active = eligible[0] || null;
       const [memories, repos, autonomyCfg] = await Promise.all([
         db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_hermes_memories')),
         db.select().from(keyValueStore).where(eq(keyValueStore.key, 'df_github_repositories')),
@@ -54,7 +67,13 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
         mockProvider: 'supprimé', // ancien mode test — retiré du moteur
         model: active?.model || '-',
         failover: pool.length > 1 ? `bascule automatique : ${pool.length} fournisseurs en cascade (rate-limit/erreur → cooldown → suivant)` : undefined,
-        providerPool: pool.map(e => ({ name: e.name, kind: e.kind, model: e.model, priority: e.priority, source: e.source, key: e.keyMasked })),
+        providerPool: pool.map(e => ({ name: e.name, kind: e.kind, model: e.model, priority: e.priority, source: e.source, key: e.keyMasked, costPolicy: providerCostPolicy(e) })),
+        budgetPolicy: {
+          freeOnly: true, enforced: freeOnlyEnabled(false), eligibleProviders: eligible.length, blockedProviders: pool.length - eligible.length,
+          notice: 'Aucun repli vers une API payante ou au coût inconnu. Quotas et disponibilité non garantis. Hébergement, ressources locales et frais d’encaissement éventuels restent distincts.'
+        },
+        skills: getAllSkills().map(skillInfo),
+        agents: getAgents().map(agentInfo),
         hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
         skillsCount: getAllSkills().length,
         agentsCount: getAgents().length,
@@ -70,10 +89,7 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
 
   router.get('/agents', apiLimiter, async (req, res) => {
     try {
-      res.json({ agents: getAgents().map(a => ({
-        id: a.id, name: a.name, emoji: a.emoji, role: a.role,
-        skills: a.skills || 'tous', maxSteps: a.maxSteps || null
-      })) });
+      res.json({ agents: getAgents().map(agentInfo) });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -85,51 +101,86 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
       const skills = getAllSkills();
       res.json({
         count: skills.length,
-        skills: skills.map(t => ({
-          name: t.name,
-          description: t.description,
-          access: t.access,
-          requiresConfirmation: Boolean(t.requiresConfirmation)
-        }))
+        skills: skills.map(skillInfo)
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // ---- Chat (boucle agent) ----
+  // ---- Chat JSON historique + flux SSE authentifié (fetch, pas EventSource) ----
   router.post('/chat', requireAuth, aiLimiter, async (req, res) => {
+    const { prompt, history, agent, agentId } = req.body || {};
+    if (typeof prompt !== 'string' || !prompt.trim()) return res.status(400).json({ error: 'Le champ prompt est obligatoire.' });
+    const selected = agentId ?? agent ?? 'orchestrator'; // anciens clients : agent ; nouveau contrat : agentId
+    if (typeof selected !== 'string' || !getAgents().some(a => a.id === selected)) return res.status(400).json({ error: 'Agent inconnu.' });
+    const ownerId = ownerFor(req);
+    if ([...runs.values()].some(r => r.ownerId === ownerId)) return res.status(409).json({ error: 'Une exécution est déjà en cours dans cette session. Arrêtez-la ou attendez sa conclusion.' });
+    const runId = crypto.randomUUID();
+    const controller = new AbortController();
+    runs.set(runId, { ownerId, controller });
+    const streaming = req.body?.stream === true || req.headers.accept?.includes('text/event-stream');
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const timeout = setTimeout(() => controller.abort(new Error('Délai maximum de 4 minutes atteint.')), HERMES_LIMITS.RUN_TIMEOUT_MS);
+    const onClose = () => { if (!res.writableEnded) controller.abort(new Error('Connexion client interrompue.')); };
+    res.on('close', onClose);
+    const send = (event: HermesProgressEvent) => {
+      if (streaming && !res.destroyed && !res.writableEnded) res.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
     try {
-      const { prompt, history, agent } = req.body || {};
-      if (!prompt || typeof prompt !== 'string') {
-        return res.status(400).json({ error: 'Le champ prompt est obligatoire.' });
+      if (streaming) {
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders();
+        heartbeat = setInterval(() => { if (!res.destroyed) res.write(': heartbeat\n\n'); }, 15_000);
+        send({ type: 'run_started', runId, agent: selected, freeOnly: freeOnlyEnabled(req.body?.freeOnly) });
       }
       const result = await runAgentChat({
-        agentId: typeof agent === 'string' ? agent : undefined,
-        prompt: prompt.slice(0, 4000),
+        agentId: selected, prompt: prompt.trim().slice(0, 4000),
         history: Array.isArray(history) ? history.slice(-10) : undefined,
-        actor: 'modérateur'
+        actor: 'modérateur', ownerId, freeOnly: req.body?.freeOnly,
+        signal: controller.signal, onEvent: send
       });
-      res.json(result);
+      if (!res.destroyed) {
+        if (streaming) { send({ type: 'done', result }); res.end(); }
+        else res.json(result);
+      }
     } catch (err: any) {
-      console.error('Hermes chat error:', err);
-      res.status(500).json({ response: '⚠️ Erreur du moteur Hermes.', error: err.message, provider: 'erreur', model: '-', agent: 'orchestrator', steps: [] });
+      if (!res.destroyed) {
+        if (streaming) { send({ type: 'error', message: 'Erreur du moteur : la demande n’a pas abouti. Consultez les étapes conservées avant de réessayer.' }); res.end(); }
+        else res.status(500).json({ error: 'Erreur du moteur Hermes.', steps: [], outcome: 'error' });
+      }
+    } finally {
+      clearTimeout(timeout);
+      if (heartbeat) clearInterval(heartbeat);
+      res.off('close', onClose);
+      runs.delete(runId);
     }
   });
 
-  // ---- Confirmation d'action sensible ----
+  router.post('/chat/stop', requireAuth, apiLimiter, (req, res) => {
+    const run = runs.get(String(req.body?.runId || ''));
+    if (!run || run.ownerId !== ownerFor(req)) return res.status(404).json({ error: 'Exécution inconnue ou déjà terminée.' });
+    run.controller.abort(new Error('Arrêt demandé par l’utilisateur.'));
+    res.json({ stopping: true, note: 'Aucune nouvelle étape. Une action déjà engagée peut se terminer et ne sera pas annulée.' });
+  });
+
+  router.post('/inspect', requireAuth, apiLimiter, async (req, res) => {
+    try { res.json(await runInspection(String(req.body?.tool || 'audit_system'), 'modérateur')); }
+    catch (err: any) { res.status(400).json({ error: err.message }); }
+  });
+
+  // ---- Confirmation OU refus, consommé côté serveur et lié à la session ----
   router.post('/confirm', requireAuth, apiLimiter, async (req, res) => {
     try {
       const actionId = String(req.body?.actionId || '').slice(0, 64);
-      if (!/^[a-f0-9]{16,64}$/.test(actionId)) {
-        return res.status(400).json({ error: 'actionId invalide.' });
-      }
-      const result = await confirmPendingAction(actionId);
-      if (!result.ok) return res.status(400).json({ error: result.error });
-      res.json({ confirmed: true, tool: 'pending', result: result.result });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
+      const decision = req.body?.decision || 'approve';
+      if (!/^[a-f0-9]{16,64}$/.test(actionId) || !['approve', 'refuse'].includes(decision)) return res.status(400).json({ error: 'Confirmation invalide.' });
+      const result = await confirmPendingAction(actionId, ownerFor(req), decision === 'approve');
+      if (!result.ok) return res.status(400).json({ error: result.error, steps: result.steps });
+      res.json({ confirmed: decision === 'approve', refused: decision === 'refuse', tool: result.tool, result: result.result, steps: result.steps });
+    } catch (err: any) { res.status(500).json({ error: err.message }); }
   });
 
   // ---- Cycle autonome (analyse lecture seule) ----
@@ -168,7 +219,10 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
     try {
       const { enabled, intervalMinutes } = req.body || {};
       const patch: any = {};
-      if (enabled !== undefined) patch.enabled = Boolean(enabled);
+      if (enabled !== undefined) {
+        if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled doit être un booléen.' });
+        patch.enabled = enabled;
+      }
       if (intervalMinutes !== undefined) patch.intervalMinutes = Number(intervalMinutes);
       const config = await saveAutonomyConfig(patch);
       res.json({ updated: true, config });
@@ -250,7 +304,7 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
       const pool = await getPoolStatus();
       res.json({
         count: pool.length,
-        policy: 'bascule automatique : 429/erreur → cooldown (30 s sur rate-limit, 15 s sur erreur) → fournisseur suivant — jamais bloqué',
+        policy: 'bascule automatique : 429/erreur → cooldown (30 s sur rate-limit, 15 s sur erreur) → fournisseur suivant autorisé — échec explicite si tous échouent',
         pool
       });
     } catch (err: any) {
@@ -298,12 +352,13 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
       res.json({
         total: FREE_CATALOG.length,
         configuredEnv: FREE_CATALOG.filter(f => f.envKey && process.env[f.envKey]).map(f => f.id),
-        anonymousAlwaysOn: ['ovh-free', 'llm7-free'],
+        anonymousAlwaysOn: pool.filter(p => ['ovh-free', 'llm7-free'].includes(p.name)).map(p => p.name),
+        costNotice: 'Catalogue d’offres gratuites, pas une garantie : seuls les fournisseurs autorisés par le mode sans API payante seront appelés.',
         poolActive: pool.map(p => p.name),
         catalog: getFreeCatalogForUI(),
         howTo: {
-          ovh: 'Aucune clé nécessaire — fonctionne directement (2 RPM/IP). Déjà actif en fallback.',
-          llm7: 'Aucune clé nécessaire — turbo models en anonyme. Déjà actif en fallback.',
+          ovh: 'Endpoint sans clé, si le repli anonyme est activé. Quotas et disponibilité non garantis.',
+          llm7: 'Endpoint sans clé, si le repli anonyme est activé. Quotas et disponibilité non garantis.',
           groq: 'Inscrivez-vous sur https://console.groq.com/keys (gratuit, sans CB) puis définissez GROQ_API_KEY dans .env — auto-détecté au démarrage.',
           openrouter: 'Inscrivez-vous sur https://openrouter.ai/keys (gratuit) puis OPENROUTER_API_KEY — donne accès aux modèles :free',
           mistral: 'https://console.mistral.ai/api-keys — free mode $10 crédits',

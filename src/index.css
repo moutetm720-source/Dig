@@ -40,3 +40,26 @@
     background: #6366F1;
   }
 }
+
+/* Markdown du chat : pas de HTML brut, contenu sélectionnable et lisible sur mobile. */
+.hermes-markdown > :first-child { margin-top: 0; }
+.hermes-markdown > :last-child { margin-bottom: 0; }
+.hermes-markdown p { margin: .65em 0; }
+.hermes-markdown h1, .hermes-markdown h2, .hermes-markdown h3,
+.hermes-markdown h4 { color: #e2e8f0; font-weight: 600; line-height: 1.5; margin: 1.2em 0 .5em; }
+.hermes-markdown h1 { font-size: 1.25em; }
+.hermes-markdown h2 { font-size: 1.15em; }
+.hermes-markdown h3, .hermes-markdown h4 { font-size: 1.05em; }
+.hermes-markdown ul { list-style: disc; padding-left: 1.4em; margin: .65em 0; }
+.hermes-markdown ol { list-style: decimal; padding-left: 1.4em; margin: .65em 0; }
+.hermes-markdown li { padding-left: .2em; margin: .3em 0; }
+.hermes-markdown strong { color: #e2e8f0; font-weight: 600; }
+.hermes-markdown a { color: #a5b4fc; text-decoration: underline; text-underline-offset: 3px; overflow-wrap: anywhere; }
+.hermes-markdown a:hover { color: #c7d2fe; }
+.hermes-markdown :not(pre) > code { border-radius: 4px; background: #20222e; padding: .12em .35em; font-size: .9em; color: #c7d2fe; }
+.hermes-markdown blockquote { border-left: 2px solid #6366f1; padding-left: 1em; color: #94a3b8; margin: 1em 0; }
+.hermes-markdown table { width: 100%; border-collapse: collapse; margin: 1em 0; font-size: .9em; }
+.hermes-markdown th, .hermes-markdown td { border: 1px solid #272b3a; padding: .5em .7em; text-align: left; }
+.hermes-markdown th { background: #181a25; color: #e2e8f0; }
+.hermes-markdown hr { border-color: #272b3a; margin: 1em 0; }
+.hermes-markdown input[type='checkbox'] { margin-right: .4em; }

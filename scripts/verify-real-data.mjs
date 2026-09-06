@@ -38,7 +38,8 @@ check('hermes/types.ts : type de provider sans « mock »', !/:\s*'gemini'\s*\|\
 
 const engine = read('hermes/engine.ts');
 check('hermes/engine.ts : aucune branche « onlyMock »', !/onlyMock/.test(engine));
-check('hermes/engine.ts : sans fournisseur réel → skills sur données réelles, zéro simulation', /pool\.length === 0/.test(engine));
+check('hermes/engine.ts : sans fournisseur autorisé → blocage explicite, pas de succès simulé', /if \(!pool\.length\) \{\s*outcome = 'blocked'/.test(engine));
+check('hermes/engine.ts : diagnostic sans IA explicite sur les données serveur', /export async function runInspection/.test(engine) && /await executeSkill\(tool, \{\}/.test(engine));
 
 // ---------- 2. Paiement réel uniquement ----------
 const server = read('server.ts');

@@ -91,7 +91,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentView, setCurrentView, o
       title: 'BOTS EN CONTINU (23 BOTS)',
       items: [
         { id: 'agents_synergy', label: 'Centre Multi-Agents', icon: Flame, pulse: true, badge: 'Hermes v4' },
-        { id: 'hermes_agent', label: 'Hermes Agent IA', icon: Brain, pulse: true, badge: 'Moteur réel v4' },
+        { id: 'hermes_agent', label: 'Hermes Agent IA', icon: Brain, pulse: false, badge: 'Interactif' },
         { id: 'agent', label: 'Bots en Continu (23 Bots)', icon: Bot, pulse: true, badge: '23 Bots' },
         { id: 'cross_ai', label: 'Méta-Optimiseur Cross-IA', icon: Sparkles, badge: 'Cross-IA 0€' },
         { id: 'tokens', label: 'Moteur Zéro-Token', icon: Cpu, badge: '100% Free' },

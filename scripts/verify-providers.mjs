@@ -44,11 +44,14 @@ async function test(name, fn) {
 
 // ---- Stub Gemini (API generateContent, format Google réel) ----
 const geminiHits = [];
+let geminiResponse = null;
+let geminiRequest = null;
 let geminiAllDead = false; // bascule : tue tous les modèles (test « aucun modèle »)
 const geminiStub = http.createServer((req, res) => {
   let body = '';
   req.on('data', c => { body += c; });
   req.on('end', () => {
+    geminiRequest = body ? JSON.parse(body) : null;
     const m = /\/models\/([^:]+):generateContent/.exec(req.url || '');
     const model = m ? m[1] : '?';
     geminiHits.push(model);
@@ -64,7 +67,7 @@ const geminiStub = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
+    res.end(JSON.stringify(geminiResponse || {
       candidates: [{ content: { parts: [{ text: `réponse-réelle-de-${model}` }] } }],
       usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 }
     }));
@@ -73,13 +76,14 @@ const geminiStub = http.createServer((req, res) => {
 
 // ---- Stub OpenAI-compatible ----
 let openaiAuthHeader = null;
+let openaiResponse = null;
 const openaiStub = http.createServer((req, res) => {
   openaiAuthHeader = req.headers['authorization'] || null;
   let body = '';
   req.on('data', c => { body += c; });
   req.on('end', () => {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
+    res.end(JSON.stringify(openaiResponse || {
       choices: [{
         message: {
           content: null,
@@ -181,6 +185,42 @@ await test('OpenAI-compat : parsing des tool_calls', async () => {
   const r = await p.chat({ system: 's', events: EVENTS, tools: TOOLS });
   assert.equal(r.toolCalls?.[0]?.name, 'catalog_list');
   assert.deepEqual(r.toolCalls?.[0]?.args, { limit: 3 });
+});
+
+await test('Gemini : signature et functionCall sur le MÊME Part (régression réponse vide)', async () => {
+  geminiResponse = { candidates: [{ content: { parts: [{ thoughtSignature: 'test-signature', functionCall: { name: 'catalog_list', args: { limit: 2 } } }] } }] };
+  const p = new GeminiProvider('gemini-3.5-flash-lite');
+  const result = await p.chat({ system: 's', events: EVENTS, tools: TOOLS });
+  assert.equal(result.toolCalls[0].name, 'catalog_list');
+  assert.equal(result.toolCalls[0].thoughtSignature, 'test-signature');
+  await p.chat({ system: 's', events: [...EVENTS, { type: 'tool_call', ...result.toolCalls[0] }, { type: 'tool_result', name: 'catalog_list', result: { count: 0 } }], tools: TOOLS });
+  const part = geminiRequest.contents.find(c => c.parts.some(p => p.functionCall)).parts[0];
+  assert.equal(part.thoughtSignature, 'test-signature');
+  assert.equal(part.functionCall.thoughtSignature, undefined);
+  geminiResponse = null;
+});
+
+await test('Gemini : texte signé conservé, raisonnement interne jamais affiché', async () => {
+  geminiResponse = { candidates: [{ content: { parts: [
+    { thought: true, text: 'raisonnement privé TEST' },
+    { thoughtSignature: 'sig-text', text: 'Conclusion visible TEST' }
+  ] } }] };
+  const result = await new GeminiProvider('gemini-3.5-flash-lite').chat({ system: 's', events: EVENTS, tools: [] });
+  assert.equal(result.text, 'Conclusion visible TEST');
+  geminiResponse = null;
+});
+
+await test('OpenAI : endpoint anonyme ne reçoit pas la clé de l’environnement', async () => {
+  process.env.HERMES_OPENAI_API_KEY = 'ne-pas-exfiltrer-cette-cle-test';
+  await new OpenAICompatProvider(`http://127.0.0.1:${openaiPort}/v1`, 'test', '').chat({ system: 's', events: EVENTS, tools: [] });
+  assert.equal(openaiAuthHeader, null);
+  delete process.env.HERMES_OPENAI_API_KEY;
+});
+
+await test('OpenAI : JSON de tool-call invalide refusé, pas d’exécution avec args vides', async () => {
+  openaiResponse = { choices: [{ message: { tool_calls: [{ function: { name: 'catalog_delete', arguments: '{oops' } }] } }] };
+  await assert.rejects(() => new OpenAICompatProvider(`http://127.0.0.1:${openaiPort}/v1`, 'test', '').chat({ system: 's', events: EVENTS, tools: TOOLS }), /JSON invalides/);
+  openaiResponse = null;
 });
 
 // ---- Bilan ----
