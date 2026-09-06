@@ -151,6 +151,21 @@ Sécurité : toutes les écritures destructives passent par la **porte de confir
 - `openai-env (fetch failed)` : l'endpoint compatible OpenAI ne répond pas —
   l'erreur affiche désormais l'URL exacte et la cause (`ECONNREFUSED`…).
   Pour l'IA locale : `node scripts/setup-local-llm.mjs --check`.
+- `openai-env (ECONNREFUSED 127.0.0.1:11434)` : Ollama local non démarré. Le pool
+  bascule désormais automatiquement sur **OVHcloud (2 RPM/IP, anonyme)** et **LLM7.io (turbo anonyme)** —
+  aucun blocage même sans Gemini ni Ollama. Voir `GET /api/hermes/free-catalog`.
+
+#### Providers 100% gratuits — « un modèle comme le tien avec toutes les clés gratuites »
+
+Hermes intègre un **pool de 9 fournisseurs gratuits** (sans simulation mock) :
+
+- **Anonymes toujours actifs (0 clé, 0 CB)** : `ovh-free` (EU, 2 RPM/IP), `llm7-free` (turbo models) — garantissent une réponse même sans `GEMINI_API_KEY`.
+- **Free tier avec clé gratuite (sans CB)** : Groq (ultra-rapide LPU), OpenRouter (`:free` models), Mistral, Cohere, HuggingFace, Together, NVIDIA NIM.
+
+Catalogue : `GET /api/hermes/free-catalog` (total, configuredEnv, anonymousAlwaysOn, howTo) ou skill `free_catalog`.
+Installation : `POST /api/hermes/free-install/:id { apiKey }` ou skill `free_install` (confirmation si clé fournie).
+Auto-install au boot : `server.ts` lit `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`… depuis l'env et les persiste dans `df_hermes_provider_pool`.
+Voir `hermes/freeProviders.ts` et `hermes/knowledge/free-llm-apis.json` (16 providers / 118 modèles curés).
 
 
 ### Gestionnaire d'API & tokens — pool multi-fournisseurs (« ne jamais être bloqué »)

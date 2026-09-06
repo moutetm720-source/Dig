@@ -2401,6 +2401,17 @@ app.get('*', (req, res) => {
 
 await ensureSchema();
 
+// Auto-install des providers gratuits détectés dans l'env (Groq, OpenRouter, etc.)
+// Non bloquant : si la DB n'est pas encore prête, on log et on continue.
+try {
+  const { autoInstallFreeProviders } = await import('./hermes/freeProviders');
+  void autoInstallFreeProviders().then(r => {
+    if (r.installed > 0) console.log(`[hermes] Auto-install free providers: ${r.installed} installé(s)`);
+  });
+} catch (e) {
+  console.warn('[hermes] freeProviders auto-install indisponible:', (e as any)?.message);
+}
+
 // ---------- Bandeau de démarrage « 100 % RÉEL » ----------
 // Le serveur annonce explicitement s'il dispose d'une IA réelle, d'une
 // passerelle de paiement réelle, et si la politique « données réelles » est

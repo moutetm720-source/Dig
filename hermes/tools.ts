@@ -2130,6 +2130,85 @@ export function buildSkillRegistry(): HermesTool[] {
       }
     },
 
+    // ════════════ PROVIDERS GRATUITS — 100% FREE, SANS CLÉ OU FREE TIER ════════════
+    // Implémente "un modèle comme le tien avec toutes les clés gratuites"
+    {
+      name: 'free_catalog',
+      description: "CATALOGUE DES LLM GRATUITS : liste tous les fournisseurs IA gratuits disponibles (OVHcloud anonyme 2 RPM/IP, LLM7.io anonyme, Groq free tier ultra-rapide, OpenRouter :free, Mistral free, Cohere, HuggingFace, NVIDIA NIM...). Indique ceux déjà configurés, ceux sans clé (toujours actifs en fallback), et comment obtenir une clé gratuite. Utilisez ce skill pour activer Hermes à coût zéro.",
+      access: 'read',
+      parameters: { type: 'object', properties: {} },
+      async run() {
+        const { getFreeCatalogForUI, FREE_CATALOG } = await import('./freeProviders');
+        const { getPoolStatus } = await import('./providers');
+        const pool = await getPoolStatus();
+        const catalog = getFreeCatalogForUI();
+        return {
+          total: FREE_CATALOG.length,
+          activeInPool: pool.map((p: any) => p.name),
+          anonymousAlwaysOn: ['ovh-free', 'llm7-free'],
+          note: 'Les providers anonymes (OVH, LLM7) sont TOUJOURS actifs en fallback, même sans clé — ils garantissent qu\'Hermes fonctionne à coût zéro.',
+          catalog,
+          howToActivate: {
+            groq: '1) Allez sur https://console.groq.com/keys 2) Créez une clé gratuite (sans CB) 3) Définissez GROQ_API_KEY dans .env ou dites à Hermes \"ajoute Groq au pool avec cette clé\"',
+            openrouter: '1) https://openrouter.ai/keys 2) Créez clé gratuite 3) OPENROUTER_API_KEY — accès aux modèles :free (openai/gpt-oss-20b:free, etc.)',
+            mistral: 'https://console.mistral.ai/api-keys — free mode $10 crédits/mois',
+            gemini: 'https://aistudio.google.com/app/apikey — gratuit, modèle conseillé gemini-3.5-flash-lite',
+            ovh: 'Aucune clé — déjà actif ! 2 RPM/IP, modèles EU',
+            llm7: 'Aucune clé — déjà actif ! turbo models gratuits'
+          }
+        };
+      }
+    },
+    {
+      name: 'free_install',
+      description: "INSTALLE un fournisseur IA GRATUIT dans le pool (ex: groq-free, openrouter-free, mistral-free, cohere-free, ovh-free, llm7-free). Pour les providers avec clé gratuite, fournissez apiKey (obtenue gratuitement sur leur site). Les anonymes (ovh-free, llm7-free) fonctionnent sans clé et sont déjà actifs en fallback, mais vous pouvez les installer explicitement pour changer le modèle. Confirmation requise si apiKey fournie.",
+      access: 'write',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'ID du provider gratuit (ovh-free, llm7-free, groq-free, openrouter-free, mistral-free, cohere-free, huggingface-free, together-free, nvidia-free)' },
+          apiKey: { type: 'string', description: 'Clé API gratuite (si le provider en nécessite une — voir free_catalog pour les URLs)' },
+          model: { type: 'string', description: 'Modèle à utiliser (optionnel, défaut selon provider)' },
+          confirm: { type: 'boolean', description: 'Confirmation si apiKey fournie' }
+        },
+        required: ['id']
+      },
+      async run(args) {
+        const { FREE_CATALOG } = await import('./freeProviders');
+        const { addProvider } = await import('./providers');
+        const id = str(args.id, 40).toLowerCase();
+        const info = FREE_CATALOG.find(f => f.id === id);
+        if (!info) throw new Error(`Provider gratuit inconnu : ${id}. Disponibles : ${FREE_CATALOG.map(f => f.id).join(', ')} (voir free_catalog)`);
+        const apiKey = args.apiKey ? str(args.apiKey, 500) : (info.envKey ? (process.env[info.envKey] || '').trim() : undefined);
+        if (info.needsKey && !apiKey) {
+          throw new Error(`Ce provider nécessite une clé gratuite. Obtenez-la gratuitement sur ${info.docsUrl} puis relancez avec apiKey. Variable d'env : ${info.envKey}`);
+        }
+        if (info.needsKey && args.confirm !== true && args.apiKey) {
+          // Porte de confirmation pour les clés
+          return {
+            needsConfirmation: true,
+            summary: `Installation de ${info.name} avec clé ${apiKey ? `•••• (${apiKey.length} car.)` : 'depuis env'} — confirmez avec confirm:true`,
+            actionId: 'pending-free-install',
+            provider: info.id
+          };
+        }
+        const { entry } = await addProvider({
+          name: info.id,
+          kind: 'openai',
+          model: args.model ? str(args.model, 120) : info.model,
+          baseUrl: info.baseUrl,
+          apiKey: apiKey || undefined,
+          priority: info.priority
+        });
+        return {
+          installed: true,
+          provider: info.id,
+          entry,
+          note: `Provider gratuit ${info.name} installé ! Modèle : ${entry.model} — baseUrl : ${info.baseUrl}. Testez avec providers_test.`
+        };
+      }
+    },
+
     // ════════════ SKILLS CUSTOM — ÉVOLUTION À CHAUD (webhook tools) ════════════
     {
       name: 'skills_custom_list',
@@ -2233,7 +2312,7 @@ export const AUTONOMY_SAFE_SKILLS: string[] = [
   'catalog_list', 'catalog_get', 'pricing_audit', 'bundles_list', 'content_list',
   'campaigns_list', 'channels_list', 'seo_get', 'kv_get', 'logs_add',
   'list_agents', 'web_search', 'web_fetch', 'web_link_check',
-  'free_tier_lookup', 'free_llm_lookup',
+  'free_tier_lookup', 'free_llm_lookup', 'free_catalog', 'providers_list',
   'code_read', 'repo_files', 'memory_search', 'skills_custom_list',
   // Veille & création de brouillons (jamais de publication)
   'repos_harvest', 'catalog_create', 'content_create', 'bundles_create', 'opportunities_add'

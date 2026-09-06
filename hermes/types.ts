@@ -32,7 +32,7 @@ export interface ToolDeclaration {
 /** Événement d'une conversation (log plat converti par chaque fournisseur). */
 export type AgentEvent =
   | { type: 'text'; role: 'user' | 'model'; text: string }
-  | { type: 'tool_call'; name: string; args: Record<string, any> }
+  | { type: 'tool_call'; name: string; args: Record<string, any>; thoughtSignature?: string; thought_signature?: string }
   | { type: 'tool_result'; name: string; result: any };
 
 export interface LLMChatOptions {
@@ -43,7 +43,7 @@ export interface LLMChatOptions {
 
 export interface LLMChatResult {
   text?: string;
-  toolCalls?: Array<{ name: string; args: Record<string, any> }>;
+  toolCalls?: Array<{ name: string; args: Record<string, any>; thoughtSignature?: string; thought_signature?: string }>;
   usage?: { inputTokens?: number; outputTokens?: number };
 }
 
@@ -158,8 +158,8 @@ export interface ProviderSpec {
 
 export const HERMES_POOL = {
   KV_KEY: 'df_hermes_provider_pool',
-  MAX_PROVIDERS: 12,
-  MAX_FALLBACKS_PER_CALL: 4,      // max de fournisseurs essayés par appel chat (anti-blocage sans spam)
+  MAX_PROVIDERS: 20,
+  MAX_FALLBACKS_PER_CALL: 8,      // max de fournisseurs essayés par appel chat (anti-blocage sans spam) — augmenté pour les free tiers
   COOLDOWN_429_MS: 30 * 1000,     // rate-limit → 30 s (ou Retry-After si fourni)
   COOLDOWN_ERROR_MS: 15 * 1000    // erreur réseau/5xx → 15 s
 };
