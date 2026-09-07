@@ -35,7 +35,7 @@ export interface HermesServerStatus {
   skills: HermesSkillInfo[];
   agents: HermesAgent[];
   budgetPolicy?: { freeOnly: boolean; eligibleProviders: number; blockedProviders: number; notice: string };
-  providerPool?: Array<{ name: string; model: string; costPolicy: { eligible: boolean; label: string } }>;
+  providerPool?: Array<{ name: string; model: string; models?: string[]; costPolicy: { eligible: boolean; label: string } }>;
 }
 export interface HermesMessage {
   id: string;

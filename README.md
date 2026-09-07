@@ -107,7 +107,7 @@ Le mode gratuit bloque aussi la création d'une campagne avec un budget positif.
 - Contrat partagé : `src/types/hermes.ts`. Flux : `run_started`, `status`, `step`,
   `message`, `question`, `confirmation`, `done`, `error` ; heartbeat de 15 s.
 - Budgets : 6 pas principaux, 3 par sous-agent, 12 tours LLM partagés et 10 outils au total
-  (jusqu’à 8 fournisseurs essayés par tour en cas d’échec), durée de requête plafonnée à 4 minutes. Le dernier pas est réservé à la synthèse.
+  (jusqu’à 8 fournisseurs essayés par tour en cas d’échec, chacun avec sa cascade de modèles — jusqu’à 6 —, le tout dans le même appel), durée de requête plafonnée à 4 minutes. Le dernier pas est réservé à la synthèse.
 - Les confirmations en attente et exécutions sont en mémoire : un redémarrage les
   invalide. En multi-instance, prévoir un stockage partagé avant de répartir ces routes.
 
@@ -240,17 +240,37 @@ Sécurité : toutes les écritures destructives passent par la **porte de confir
 - `openai-env (ECONNREFUSED 127.0.0.1:11434)` : Ollama local non démarré. Le pool
   peut essayer les endpoints anonymes autorisés en mode `auto` (si ce repli est activé).
   Ils restent soumis à leur disponibilité et leurs quotas. Voir `GET /api/hermes/free-catalog`.
+- `openrouter-free (Cascade épuisée … : google/gemma-4-31b-it:free: HTTP 404 No endpoints found | …)` :
+  les 4 modèles gratuits ont échoué dans le même appel. Chaque modèle cité indique sa cause
+  (404 = retiré du catalogue `:free`, en cooldown 10 min ; 429 = quota minute ; 5xx = panne).
+  Remède : attendre, ou changer la cascade via `HERMES_OPENROUTER_FREE_MODELS`
+  (liste vivante : https://openrouter.ai/models?max_price=0&supported_parameters=tools).
+- `openrouter-free (HTTP 429 … free-models-per-day)` : quota **journalier** de la clé
+  (50 req/jour ; 1000/jour avec 10 $ de crédits achetés une fois). La cascade s'arrête
+  volontairement — changer de modèle ne contourne pas une limite de clé — et le
+  fournisseur suivant est essayé.
 
 #### Catalogue de fournisseurs avec offres gratuites
 
 Hermes intègre un **catalogue de fournisseurs avec offres gratuites** (sans simulation mock), distinct du pool autorisé par la politique de coût :
 
-- **Anonymes optionnels** : `ovh-free`, `llm7-free` — sans clé ; disponibilité et limites à vérifier, aucune réponse garantie.
-- **Free tier avec clé gratuite (sans CB)** : Groq (ultra-rapide LPU), OpenRouter (`:free` models), Mistral, Cohere, HuggingFace, Together, NVIDIA NIM.
+- **OpenRouter `:free`** (`openrouter-free`, recommandé) : **cascade de 4 modèles gratuits
+  avec function calling**, essayés automatiquement l'un après l'autre **au sein d'un même
+  appel** : `google/gemma-4-31b-it:free` → `openai/gpt-oss-120b:free` →
+  `qwen/qwen3-next-80b-a3b-instruct:free` → `openrouter/free` (routeur gratuit ; le
+  modèle réellement servi est affiché dans la réponse). Clé gratuite sans CB :
+  `OPENROUTER_API_KEY`. Quota : 20 req/min, 50 req/jour. Cascade modifiable :
+  `HERMES_OPENROUTER_FREE_MODELS=a:free,b:free,…` (les modèles payants sont ignorés).
+- **Anonymes optionnels** : `ovh-free` (cascade `gpt-oss-20b` → `gpt-oss-120b` → `Qwen3-32B`
+  → `Llama-3.3-70B` → `Mistral-Small-3.2`, 2 req/min par IP et par modèle), `llm7-free` —
+  sans clé ; disponibilité et limites à vérifier, aucune réponse garantie.
+- **Free tier avec clé gratuite (sans CB)** : Groq, Mistral, Cohere, HuggingFace, Together,
+  NVIDIA NIM — chacun avec sa cascade de modèles ; **bloqués** par la politique « sans API
+  payante » (facturation inconnue), utilisables seulement avec `HERMES_FREE_ONLY=0`.
 
-Catalogue : `GET /api/hermes/free-catalog` (total, configuredEnv, anonymousAlwaysOn, howTo) ou skill `free_catalog`.
-Installation : `POST /api/hermes/free-install/:id { apiKey }` ou skill `free_install` (confirmation serveur dans le chat).
-Auto-install au boot : `server.ts` lit `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `MISTRAL_API_KEY`… depuis l'env et les persiste dans `df_hermes_provider_pool`.
+Catalogue : `GET /api/hermes/free-catalog` (total, configuredEnv, anonymousAlwaysOn, openRouterCascade, howTo) ou skill `free_catalog`.
+Installation dans le pool KV : `POST /api/hermes/free-install/:id { apiKey?, model?, models? }` ou skill `free_install` (confirmation serveur dans le chat).
+Les clés d'environnement (`OPENROUTER_API_KEY`, `GROQ_API_KEY`) sont lues directement par `buildPool()` : rien n'est recopié en base.
 Voir `hermes/freeProviders.ts` et `hermes/knowledge/free-llm-apis.json` (16 providers / 118 modèles curés).
 
 
@@ -264,16 +284,30 @@ Hermes ne dépend plus d'un seul fournisseur. Un **pool** mélange, par priorit�
 Le pool ne contient que des fournisseurs **réels** : l'ancien filet « mock » a été retiré
 (les specs mock encore présentes en base sont purgées automatiquement au chargement).
 
-À chaque appel LLM, un fournisseur qui rate-limite (429) ou échoue (5xx/timeout) passe en
-**cooldown** (30 s sur rate-limit — ou `Retry-After` — ; 15 s sur erreur) et le **suivant est
-essayé automatiquement**. Seuls les fournisseurs autorisés par la politique de coût sont essayés. Si tous échouent (y compris réponse vide), un échec explicite remplace tout faux succès.
+La bascule automatique se fait à **deux niveaux, dans un même appel** :
+
+1. **Cascade de modèles** au sein d'un fournisseur compatible OpenAI (`model` + `fallbackModels`,
+   6 max) : `404`/« No endpoints found » (modèle retiré du catalogue → cooldown 10 min sur ce
+   modèle), `429` (→ 30 s ou `Retry-After`), `5xx`/timeout (→ 15 s) et réponse vide font passer
+   **au modèle suivant immédiatement**. Les modèles en cooldown passent en fin de file (zéro
+   requête gaspillée au tour suivant). Une erreur qui ne dépend pas du modèle — `401`, requête
+   invalide, JSON d'outil corrompu, limite **journalière** de la clé — arrête la cascade.
+2. **Fournisseur suivant** : quand un fournisseur a épuisé sa cascade (ou renvoie 429/5xx), il
+   passe en **cooldown** (30 s sur rate-limit — ou `Retry-After` — ; 15 s sur erreur) et le
+   suivant autorisé est essayé.
+
+Seuls les fournisseurs autorisés par la politique de coût sont essayés (pour OpenRouter : **tous**
+les modèles de la cascade doivent être `:free` ou `openrouter/free`). Si tout échoue, un échec
+explicite listant chaque modèle et sa cause remplace tout faux succès. La réponse porte le
+modèle qui a **réellement** répondu (`model`), y compris derrière le routeur `openrouter/free`.
 
 Sémantique de `HERMES_PROVIDER` : `auto` = env + pool géré · `gemini`/`openai` = verrou
 exclusif sur ce type · `mock` = **refusé** (avertissement + repli `auto`).
 
-**Hermes gère le pool lui-même** (4 skills : `providers_list`, `providers_add`,
-`providers_remove`, `providers_test` — agent Ops + orchestrateur) : « ajoute Groq au pool »,
-« liste les fournisseurs », « supprime le fournisseur X » — sans redéploiement.
+**Hermes gère le pool lui-même** (4 skills : `providers_list`, `providers_add`
+(avec `fallbackModels`), `providers_remove`, `providers_test` — agent Ops + orchestrateur) :
+« ajoute Groq au pool », « liste les fournisseurs » (cascade et cooldown par modèle),
+« supprime le fournisseur X » — sans redéploiement.
 Équivalent REST (auth) : `GET/POST /api/hermes/providers`, `DELETE /api/hermes/providers/:name`,
 `POST /api/hermes/providers/:name/test`.
 

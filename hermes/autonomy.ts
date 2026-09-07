@@ -259,7 +259,6 @@ export async function runAutonomyCycle(trigger: 'timer' | 'api' = 'api'): Promis
       recommendations = extractRecommendations(reportText);
     } else {
       // Cycle déterministe : 2 actions sûres fixes si justifiées
-      const overview = obs.overview || {};
       const reposTotal = (obs.repos?.total ?? 0);
       if (reposTotal < 8) {
         const skill = getSkill('repos_harvest');

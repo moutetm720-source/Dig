@@ -83,14 +83,16 @@ class TrafficEngine {
       },
       liveVisitors: [],
       recentEvents: [],
+      // Radar d'indexation : rien n'est présumé indexé tant qu'aucune soumission
+      // réelle n'a été confirmée (pingSearchEngines → /api/seo/indexnow-submit).
       indexingRadar: {
-        googleIndexed: true,
-        googleIndexedPagesCount: 1,
-        bingIndexed: true,
-        perplexityCitationReady: true,
-        chatGptBotAllowed: true,
-        indexNowPingStatus: 'active',
-        lastPingTimestamp: new Date().toISOString(),
+        googleIndexed: false,
+        googleIndexedPagesCount: 0,
+        bingIndexed: false,
+        perplexityCitationReady: true, // llms.txt + robots.txt servis par le serveur
+        chatGptBotAllowed: true,       // robots.txt n'interdit pas GPTBot
+        indexNowPingStatus: 'pending',
+        lastPingTimestamp: '',
         sitemapSubmittedUrl: typeof window !== 'undefined' ? `${window.location.origin}/sitemap.xml` : 'https://nexusdigitallabs.com/sitemap.xml'
       },
       trafficBoostActive: false,
@@ -318,16 +320,19 @@ class TrafficEngine {
   }
 
   /**
-   * Pings search engines and updates indexing radar
+   * Soumet les URL publiques à IndexNow via le serveur (authentifié).
+   * RÉEL UNIQUEMENT : le résultat reflète la réponse effective du serveur ;
+   * un échec (401, 502, réseau) est signalé comme tel, jamais maquillé en succès.
+   * Le nombre de pages réellement indexées par Google n'est pas mesurable ici :
+   * il n'est plus inventé.
    */
   public async pingSearchEngines(): Promise<{ success: boolean; message: string }> {
-    const sitemapUrl = typeof window !== 'undefined' 
-      ? `${window.location.origin}/sitemap.xml` 
+    const sitemapUrl = typeof window !== 'undefined'
+      ? `${window.location.origin}/sitemap.xml`
       : 'https://nexusdigitallabs.com/sitemap.xml';
 
     this.state.indexingRadar.lastPingTimestamp = new Date().toISOString();
     this.state.indexingRadar.sitemapSubmittedUrl = sitemapUrl;
-    this.state.indexingRadar.googleIndexedPagesCount = store.getProducts().length + 5;
 
     try {
       const bearer = getAuthBearer();
@@ -338,21 +343,26 @@ class TrafficEngine {
           ...(bearer ? { Authorization: bearer } : {})
         }
       });
-      if (res.ok) {
-        const data = await res.json();
+      const data: any = await res.json().catch(() => ({}));
+      if (res.ok && data?.success) {
         this.state.indexingRadar.indexNowPingStatus = 'synced';
-        store.addLog('success', 'marketing', `IndexNow & Crawlers notifiés (${data.urlsSubmittedCount || 10} URLs indexées avec succès).`);
+        store.addLog('success', 'marketing', `IndexNow : ${data.urlsSubmittedCount} URL soumises (${data.statusText}).`);
         this.saveState();
-        return { success: true, message: `IndexNow & Googlebot pingés avec succès (${data.urlsSubmittedCount} URLs transmises) !` };
+        return { success: true, message: `IndexNow : ${data.urlsSubmittedCount} URL soumises (${data.statusText}).` };
       }
+      const reason = res.status === 401
+        ? 'session modérateur requise'
+        : data?.statusText || data?.error || `HTTP ${res.status}`;
+      this.state.indexingRadar.indexNowPingStatus = 'pending';
+      store.addLog('warn', 'marketing', `IndexNow : soumission NON effectuée (${reason}).`);
+      this.saveState();
+      return { success: false, message: `IndexNow : soumission non effectuée — ${reason}.` };
     } catch (e: any) {
-      // Fallback
+      this.state.indexingRadar.indexNowPingStatus = 'pending';
+      store.addLog('warn', 'marketing', `IndexNow : serveur injoignable (${e?.message || 'erreur réseau'}).`);
+      this.saveState();
+      return { success: false, message: `IndexNow : serveur injoignable (${e?.message || 'erreur réseau'}).` };
     }
-
-    this.state.indexingRadar.indexNowPingStatus = 'synced';
-    store.addLog('info', 'marketing', `IndexNow & Googlebot Sitemap pingés avec succès (${sitemapUrl}).`);
-    this.saveState();
-    return { success: true, message: "IndexNow & Sitemap pingés avec succès." };
   }
 
   public tickAutonomousTraffic() {

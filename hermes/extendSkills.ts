@@ -83,7 +83,6 @@ async function saveSpecs(specs: CustomSkillSpec[]): Promise<void> {
 
 // Cache process (les tools doivent être synchrones pour le registre)
 let customToolsCache: HermesTool[] = [];
-let customLoadedAt = 0;
 
 /** Construit l'outil HermesTool d'une spec (exécution webhook sécurisée). */
 function specToTool(spec: CustomSkillSpec): HermesTool {
@@ -135,7 +134,6 @@ function truncate(v: any): any {
 export async function ensureCustomSkillsLoaded(): Promise<HermesTool[]> {
   const specs = await loadSpecs();
   customToolsCache = specs.map(specToTool);
-  customLoadedAt = Date.now();
   return customToolsCache;
 }
 

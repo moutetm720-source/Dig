@@ -15,7 +15,8 @@ import { Router } from 'express';
 import crypto from 'node:crypto';
 import { runAgentChat, confirmPendingAction, runInspection, getAgents } from './engine';
 import { getAllSkills, ensureCustomSkillsLoaded, needsUserConfirmation } from './tools';
-import { buildPool, getPoolStatus, addProvider, removeProvider, testProvider, getHermesConfig, saveHermesConfig, realProviderHelp } from './providers';
+import { buildPool, getPoolStatus, addProvider, removeProvider, testProvider, getHermesConfig, saveHermesConfig, realProviderHelp, openRouterFreeCascade } from './providers';
+import { FREE_CATALOG, findFreeProvider, catalogSpec, getFreeCatalogForUI } from './freeProviders';
 import { getAutonomyConfig, saveAutonomyConfig, runAutonomyCycle, getRecentAutonomyReports, isAutonomyRunning } from './autonomy';
 import { freeOnlyEnabled, providerCostPolicy } from './providerPolicy';
 import type { HermesProgressEvent } from '../src/types/hermes';
@@ -66,8 +67,8 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
         realOnly: true,           // aucun fournisseur mock/simulé : IA réelle ou rien
         mockProvider: 'supprimé', // ancien mode test — retiré du moteur
         model: active?.model || '-',
-        failover: pool.length > 1 ? `bascule automatique : ${pool.length} fournisseurs en cascade (rate-limit/erreur → cooldown → suivant)` : undefined,
-        providerPool: pool.map(e => ({ name: e.name, kind: e.kind, model: e.model, priority: e.priority, source: e.source, key: e.keyMasked, costPolicy: providerCostPolicy(e) })),
+        failover: pool.length > 1 ? `bascule automatique : ${pool.length} fournisseurs en cascade (rate-limit/erreur → cooldown → suivant) ; cascade de modèles au sein d'un fournisseur (404/429/5xx → modèle suivant, même appel)` : undefined,
+        providerPool: pool.map(e => ({ name: e.name, kind: e.kind, model: e.model, models: e.models, priority: e.priority, source: e.source, key: e.keyMasked, costPolicy: providerCostPolicy(e) })),
         budgetPolicy: {
           freeOnly: true, enforced: freeOnlyEnabled(false), eligibleProviders: eligible.length, blockedProviders: pool.length - eligible.length,
           notice: 'Aucun repli vers une API payante ou au coût inconnu. Quotas et disponibilité non garantis. Hébergement, ressources locales et frais d’encaissement éventuels restent distincts.'
@@ -304,7 +305,7 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
       const pool = await getPoolStatus();
       res.json({
         count: pool.length,
-        policy: 'bascule automatique : 429/erreur → cooldown (30 s sur rate-limit, 15 s sur erreur) → fournisseur suivant autorisé — échec explicite si tous échouent',
+        policy: 'bascule automatique à deux niveaux dans un même appel : (1) modèle suivant de la cascade du fournisseur (404 catalogue → 10 min, 429 → 30 s ou Retry-After, 5xx → 15 s) ; (2) fournisseur suivant autorisé (cooldown 30 s / 15 s) — échec explicite si tous échouent',
         pool
       });
     } catch (err: any) {
@@ -314,9 +315,10 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
 
   router.post('/providers', requireAuth, apiLimiter, async (req, res) => {
     try {
-      const { name, kind, model, baseUrl, apiKey, priority, local } = req.body || {};
+      const { name, kind, model, fallbackModels, baseUrl, apiKey, priority, local } = req.body || {};
       const { entry } = await addProvider({
         name, kind, model, baseUrl, apiKey,
+        fallbackModels: Array.isArray(fallbackModels) ? fallbackModels.map((m: unknown) => String(m)) : undefined,
         priority: priority !== undefined && priority !== null ? Number(priority) : undefined,
         local: Boolean(local)
       });
@@ -345,23 +347,24 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
   });
 
   // ---- Catalogue des providers gratuits (sans clé / free tier) ----
-  router.get('/free-catalog', apiLimiter, async (req, res) => {
+  router.get('/free-catalog', apiLimiter, async (_req, res) => {
     try {
-      const { getFreeCatalogForUI, FREE_CATALOG } = await import('./freeProviders');
       const pool = await getPoolStatus();
+      const anonymousIds = FREE_CATALOG.filter(f => !f.needsKey).map(f => f.id);
       res.json({
         total: FREE_CATALOG.length,
         configuredEnv: FREE_CATALOG.filter(f => f.envKey && process.env[f.envKey]).map(f => f.id),
-        anonymousAlwaysOn: pool.filter(p => ['ovh-free', 'llm7-free'].includes(p.name)).map(p => p.name),
+        anonymousAlwaysOn: pool.filter(p => anonymousIds.includes(p.name)).map(p => p.name),
         costNotice: 'Catalogue d’offres gratuites, pas une garantie : seuls les fournisseurs autorisés par le mode sans API payante seront appelés.',
         poolActive: pool.map(p => p.name),
+        openRouterCascade: openRouterFreeCascade(),
         catalog: getFreeCatalogForUI(),
         howTo: {
+          openrouter: 'Inscrivez-vous sur https://openrouter.ai/keys (gratuit, sans CB) puis OPENROUTER_API_KEY dans .env — pris en compte au redémarrage : cascade gemma-4-31b → gpt-oss-120b → qwen3-next → openrouter/free, tous :free avec function calling. Surcharge : HERMES_OPENROUTER_FREE_MODELS=a:free,b:free,…',
           ovh: 'Endpoint sans clé, si le repli anonyme est activé. Quotas et disponibilité non garantis.',
           llm7: 'Endpoint sans clé, si le repli anonyme est activé. Quotas et disponibilité non garantis.',
-          groq: 'Inscrivez-vous sur https://console.groq.com/keys (gratuit, sans CB) puis définissez GROQ_API_KEY dans .env — auto-détecté au démarrage.',
-          openrouter: 'Inscrivez-vous sur https://openrouter.ai/keys (gratuit) puis OPENROUTER_API_KEY — donne accès aux modèles :free',
-          mistral: 'https://console.mistral.ai/api-keys — free mode $10 crédits',
+          groq: 'https://console.groq.com/keys (gratuit, sans CB) puis GROQ_API_KEY — présent dans le pool mais bloqué en mode strict (facturation inconnue).',
+          mistral: 'https://console.mistral.ai/api-keys — free mode ; bloqué en mode strict (facturation inconnue).'
         }
       });
     } catch (err: any) {
@@ -369,33 +372,24 @@ export function createHermesRouter(deps: HermesRouterDeps): Router {
     }
   });
 
-  // ---- Installation rapide d'un provider gratuit ----
+  // ---- Installation rapide d'un provider gratuit (persisté dans le pool KV) ----
   router.post('/free-install/:id', requireAuth, apiLimiter, async (req, res) => {
     try {
-      const { FREE_CATALOG } = await import('./freeProviders');
       const id = String(req.params.id || '').toLowerCase();
-      const info = FREE_CATALOG.find(f => f.id === id);
+      const info = findFreeProvider(id);
       if (!info) return res.status(404).json({ error: `Provider gratuit inconnu : ${id}. Disponibles : ${FREE_CATALOG.map(f => f.id).join(', ')}` });
 
-      const apiKey = req.body?.apiKey ? String(req.body.apiKey).trim() : undefined;
-      if (info.needsKey && !apiKey && !process.env[info.envKey || '']) {
+      const apiKey = req.body?.apiKey ? String(req.body.apiKey).trim() : (info.envKey ? (process.env[info.envKey] || '').trim() : '');
+      if (info.needsKey && !apiKey) {
         return res.status(400).json({
-          error: `Ce provider nécessite une clé gratuite. Obtenez-la sur ${info.docsUrl} puis fournissez {\"apiKey\":\"...\"} ou définissez ${info.envKey} dans .env`,
+          error: `Ce provider nécessite une clé gratuite. Obtenez-la sur ${info.docsUrl} puis fournissez {"apiKey":"..."} ou définissez ${info.envKey} dans .env`,
           docsUrl: info.docsUrl,
           envKey: info.envKey
         });
       }
-
-      const { addProvider } = await import('./providers');
-      const { entry } = await addProvider({
-        name: info.id,
-        kind: 'openai',
-        model: req.body?.model ? String(req.body.model) : info.model,
-        baseUrl: info.baseUrl,
-        apiKey: apiKey || (info.envKey ? process.env[info.envKey] : undefined),
-        priority: info.priority
-      });
-      res.json({ installed: true, entry, catalog: info });
+      const models = Array.isArray(req.body?.models) ? req.body.models.map((m: unknown) => String(m)) : undefined;
+      const { entry } = await addProvider(catalogSpec(info, { model: req.body?.model ? String(req.body.model) : undefined, models, apiKey: apiKey || undefined }));
+      res.json({ installed: true, entry, catalog: { ...info, envKey: info.envKey } });
     } catch (err: any) {
       res.status(400).json({ error: err.message });
     }

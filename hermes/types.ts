@@ -52,13 +52,20 @@ export interface LLMChatResult {
   text?: string;
   toolCalls?: Array<{ name: string; args: Record<string, any>; thoughtSignature?: string; thought_signature?: string }>;
   usage?: { inputTokens?: number; outputTokens?: number };
+  /** Modèle qui a RÉELLEMENT répondu (après cascade de modèles / routeur) — pour l'affichage honnête. */
+  model?: string;
 }
 
 export interface LLMProvider {
   /** RÉEL UNIQUEMENT : le fournisseur mock de test a été supprimé du moteur. */
   id: 'gemini' | 'openai';
   label: string;
+  /** Modèle principal (tête de la cascade). */
   model: string;
+  /** Cascade complète de modèles essayés dans l'ordre au sein d'un même appel (≥ 1). */
+  models: string[];
+  /** Dernier modèle ayant réellement répondu (diagnostic). */
+  effectiveModel?: string;
   chat(opts: LLMChatOptions): Promise<LLMChatResult>;
 }
 
@@ -154,7 +161,14 @@ export const HERMES_LIMITS = {
 export interface ProviderSpec {
   name: string;                    // identifiant ^[a-z0-9-_]{2,40}$
   kind: 'gemini' | 'openai';       // fournisseurs RÉELS uniquement (plus de mock)
-  model?: string;                  // openai : requis ; gemini : défaut gemini-2.5-flash
+  model?: string;                  // openai : requis ; gemini : défaut DEFAULT_HERMES_CONFIG.geminiModel
+  /**
+   * Cascade de modèles de secours (openai) essayés APRÈS `model`, dans l'ordre,
+   * au sein d'un même appel : si un modèle est absent du catalogue (404),
+   * rate-limité (429) ou en panne (5xx), le suivant est tenté immédiatement.
+   * Chaque modèle garde son propre cooldown. Max HERMES_POOL.MAX_MODEL_CASCADE.
+   */
+  fallbackModels?: string[];
   baseUrl?: string;                // openai : requis (Ollama local autorisé via local:true)
   apiKey?: string;                 // stockée KV protégée, JAMAIS exposée (UI, audit, logs, /api/store)
   local?: boolean;                 // true = endpoint local (Ollama http loopback) — exception SSRF documentée
@@ -165,6 +179,28 @@ export const HERMES_POOL = {
   KV_KEY: 'df_hermes_provider_pool',
   MAX_PROVIDERS: 20,
   MAX_FALLBACKS_PER_CALL: 8,      // max de fournisseurs essayés par appel chat (anti-blocage sans spam) — augmenté pour les free tiers
+  MAX_MODEL_CASCADE: 6,           // max de modèles essayés par fournisseur et par appel (cascade intra-fournisseur)
   COOLDOWN_429_MS: 30 * 1000,     // rate-limit → 30 s (ou Retry-After si fourni)
-  COOLDOWN_ERROR_MS: 15 * 1000    // erreur réseau/5xx → 15 s
+  COOLDOWN_ERROR_MS: 15 * 1000,   // erreur réseau/5xx → 15 s
+  COOLDOWN_MODEL_GONE_MS: 10 * 60 * 1000 // modèle absent du catalogue (404) → 10 min avant nouvel essai
 };
+
+/**
+ * Cascade OpenRouter gratuite par défaut — 4 modèles `:free` supportant le
+ * function calling (paramètre `tools`), essayés automatiquement les uns après
+ * les autres AU SEIN D'UN MÊME APPEL :
+ *   1. google/gemma-4-31b-it:free               — dense 31B, function calling natif
+ *   2. openai/gpt-oss-120b:free                 — MoE 117B, raisonnement + tool use
+ *   3. qwen/qwen3-next-80b-a3b-instruct:free    — MoE 80B, sorties stables (sans « thinking »)
+ *   4. openrouter/free                          — routeur OpenRouter : choisit un modèle gratuit
+ *                                                 disponible (dernier recours, modèle non fixé)
+ * Le catalogue :free tourne : un modèle retiré (404) est mis en cooldown 10 min
+ * et la cascade continue. Surcharge : HERMES_OPENROUTER_FREE_MODELS (liste
+ * séparée par des virgules ; chaque entrée doit rester :free ou openrouter/free).
+ */
+export const OPENROUTER_FREE_CASCADE: readonly string[] = [
+  'google/gemma-4-31b-it:free',
+  'openai/gpt-oss-120b:free',
+  'qwen/qwen3-next-80b-a3b-instruct:free',
+  'openrouter/free'
+];

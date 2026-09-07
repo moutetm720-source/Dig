@@ -20,7 +20,7 @@ import { db } from '../src/db/db';
 import { keyValueStore } from '../src/db/schema';
 import { eq } from 'drizzle-orm';
 import { assertSafeOutbound } from '../ssrfGuard';
-import { HermesContext, HermesTool, ToolParameterSchema } from './types';
+import { HermesTool, ToolParameterSchema } from './types';
 import { confirmedSales, salesFacts } from './salesFacts';
 import {
   customSkillTools, ensureCustomSkillsLoaded, installCustomSkill, removeCustomSkill,
@@ -1746,10 +1746,10 @@ export function buildSkillRegistry(): HermesTool[] {
         const pool = await getPoolStatus();
         return {
           count: pool.length,
-          policy: 'bascule automatique : 429/erreur → cooldown (30 s sur rate-limit, 15 s sur erreur) → fournisseur suivant',
+          policy: 'bascule automatique à deux niveaux dans un même appel : modèle suivant de la cascade du fournisseur (404 catalogue/429/5xx), puis fournisseur suivant (cooldown 30 s sur rate-limit, 15 s sur erreur)',
           pool: pool.map(e => ({
-            name: e.name, kind: e.kind, model: e.model, baseUrl: e.baseUrl, local: e.local,
-            priority: e.priority, source: e.source, key: e.key,
+            name: e.name, kind: e.kind, model: e.model, models: e.models, cascade: e.cascade, baseUrl: e.baseUrl, local: e.local,
+            priority: e.priority, source: e.source, key: e.key, costPolicy: e.costPolicy,
             inCooldown: e.inCooldown, cooldownRemainingSec: e.cooldownRemainingSec,
             calls: e.calls, ok: e.ok, errors: e.errors, lastError: e.lastError
           }))
@@ -1758,14 +1758,15 @@ export function buildSkillRegistry(): HermesTool[] {
     },
     {
       name: 'providers_add',
-      description: "AJOUTE un fournisseur IA au pool (runtime, sans redéploiement) pour la bascule automatique anti-blocage. kind='gemini' (apiKey requis, gratuit) ou 'priority' plus bas = plus prioritaire. kind='openai' : baseUrl + model (Groq, OpenRouter, Mistral, Ollama local avec local=true), apiKey optionnel. Utilisez free_llm_lookup pour trouver un endpoint gratuit compatible.",
+      description: "AJOUTE un fournisseur IA au pool (runtime, sans redéploiement) pour la bascule automatique anti-blocage. kind='gemini' (apiKey requis) ; kind='openai' : baseUrl + model (Groq, OpenRouter, Mistral, Ollama local avec local=true), apiKey optionnel, fallbackModels = cascade de modèles de secours essayés dans l'ordre au sein du même appel (ex. OpenRouter : ['openai/gpt-oss-120b:free','qwen/qwen3-next-80b-a3b-instruct:free','openrouter/free']). priority plus bas = plus prioritaire. Utilisez free_llm_lookup pour trouver un endpoint gratuit compatible.",
       access: 'write',
       parameters: {
         type: 'object',
         properties: {
           name: { type: 'string', description: 'Identifiant 2-40 car. [a-z0-9-_-]' },
           kind: { type: 'string', enum: ['gemini', 'openai'], description: "Type d'endpoint" },
-          model: { type: 'string', description: "Modèle (openai : requis ; gemini : défaut gemini-3.5-flash-lite — repli automatique sur un modèle disponible si déprécié)" },
+          model: { type: 'string', description: "Modèle principal (openai : requis ; gemini : défaut gemini-3.5-flash-lite — repli automatique sur un modèle disponible si déprécié)" },
+          fallbackModels: { type: 'array', items: { type: 'string' }, description: "openai : modèles de secours essayés automatiquement après `model`, dans l'ordre, au sein d'un même appel (max 5). En mode sans API payante sur OpenRouter, chacun doit être :free ou openrouter/free." },
           baseUrl: { type: 'string', description: "URL de base compatible OpenAI (openai : requis) — https public, ou http localhost si local=true" },
           apiKey: { type: 'string', description: "Clé API (jamais exposée : stockée KV protégée, masquée partout) — requise pour gemini" },
           priority: { type: 'number', description: '1 = le plus prioritaire (défaut 500)' },
@@ -1779,6 +1780,7 @@ export function buildSkillRegistry(): HermesTool[] {
           name: str(args.name, 40),
           kind: str(args.kind, 10) as any,
           model: str(args.model, 120) || undefined,
+          fallbackModels: Array.isArray(args.fallbackModels) ? args.fallbackModels.map((m: unknown) => str(m, 120)).filter(Boolean) : undefined,
           baseUrl: str(args.baseUrl, 300) || undefined,
           apiKey: str(args.apiKey, 500) || undefined,
           priority: Number.isFinite(Number(args.priority)) ? Number(args.priority) : undefined,
@@ -1961,7 +1963,7 @@ export function buildSkillRegistry(): HermesTool[] {
         },
         required: []
       },
-      async run(args) {
+      async run() {
         const isDemo = (o: any) => Boolean(o && (o.source === 'demo' || o.paymentMethod === 'demo' || o.source === 'simulation' || o.mode === 'demo'));
         const serverOrders = await readList('dpf_server_orders_v1');
         const uiOrders = await readList('dpf_app_v2_orders');
@@ -2147,26 +2149,28 @@ export function buildSkillRegistry(): HermesTool[] {
     // Implémente "un modèle comme le tien avec toutes les clés gratuites"
     {
       name: 'free_catalog',
-      description: "CATALOGUE DES LLM GRATUITS : liste tous les fournisseurs IA gratuits disponibles (OVHcloud anonyme 2 RPM/IP, LLM7.io anonyme, Groq free tier ultra-rapide, OpenRouter :free, Mistral free, Cohere, HuggingFace, NVIDIA NIM...). Indique ceux déjà configurés, ceux sans clé (toujours actifs en fallback), et comment obtenir une clé gratuite. Utilisez ce skill pour activer Hermes à coût zéro.",
+      description: "CATALOGUE DES LLM GRATUITS : liste les fournisseurs IA à offre gratuite (OpenRouter :free avec cascade gemma-4-31b → gpt-oss-120b → qwen3-next → openrouter/free, OVHcloud anonyme 2 RPM/IP/modèle, LLM7.io anonyme, Groq, Mistral, Cohere, HuggingFace, NVIDIA NIM). Indique ceux configurés, ceux sans clé (repli anonyme), la cascade de modèles de chacun et comment obtenir une clé gratuite. Utilisez ce skill pour activer Hermes à coût zéro.",
       access: 'read',
       parameters: { type: 'object', properties: {} },
       async run() {
         const { getFreeCatalogForUI, FREE_CATALOG } = await import('./freeProviders');
-        const { getPoolStatus } = await import('./providers');
+        const { getPoolStatus, openRouterFreeCascade } = await import('./providers');
         const pool = await getPoolStatus();
-        const catalog = getFreeCatalogForUI();
+        const anonymousIds = FREE_CATALOG.filter(f => !f.needsKey).map(f => f.id);
         return {
           total: FREE_CATALOG.length,
           activeInPool: pool.map((p: any) => p.name),
-          anonymousAlwaysOn: pool.filter((p: any) => ['ovh-free', 'llm7-free'].includes(p.name)).map((p: any) => p.name),
-          note: 'Offres à quotas limités, disponibilité non garantie. Catalogue/configuration ne signifie pas autorisation : le chat filtre les endpoints à coût inconnu.',
-          catalog,
+          eligibleInPool: pool.filter((p: any) => p.costPolicy?.eligible).map((p: any) => p.name),
+          anonymousAlwaysOn: pool.filter((p: any) => anonymousIds.includes(p.name)).map((p: any) => p.name),
+          openRouterCascade: openRouterFreeCascade(),
+          note: 'Offres à quotas limités, disponibilité non garantie. Catalogue/configuration ne signifie pas autorisation : le chat filtre les endpoints à coût inconnu (seuls OpenRouter :free, local et anonymes connus sont appelés en mode strict).',
+          catalog: getFreeCatalogForUI(),
           howToActivate: {
-            groq: '1) Allez sur https://console.groq.com/keys 2) Créez une clé gratuite (sans CB) 3) Définissez GROQ_API_KEY dans .env ou dites à Hermes \"ajoute Groq au pool avec cette clé\"',
-            openrouter: '1) https://openrouter.ai/keys 2) Créez clé gratuite 3) OPENROUTER_API_KEY — accès aux modèles :free (google/gemma-4-31b-it:free, etc.) ; le catalogue :free tourne, voir https://openrouter.ai/models?max_price=0&modality=text',
-            mistral: 'https://console.mistral.ai/api-keys — free mode $10 crédits/mois',
-            gemini: 'https://aistudio.google.com/app/apikey — gratuit, modèle conseillé gemini-3.5-flash-lite',
-            ovh: 'Sans clé, si le repli anonyme est activé ; quotas à vérifier',
+            openrouter: '1) https://openrouter.ai/keys 2) Créez une clé gratuite (sans CB) 3) OPENROUTER_API_KEY dans .env (redémarrage) ou free_install openrouter-free avec apiKey — cascade automatique de 4 modèles :free supportant les outils ; surcharge HERMES_OPENROUTER_FREE_MODELS=a:free,b:free',
+            groq: '1) https://console.groq.com/keys 2) clé gratuite (sans CB) 3) GROQ_API_KEY — présent dans le pool mais BLOQUÉ en mode strict (facturation inconnue)',
+            mistral: 'https://console.mistral.ai/api-keys — free mode ; bloqué en mode strict',
+            gemini: 'https://aistudio.google.com/app/apikey — GEMINI_API_KEY ; bloqué en mode strict (facturation inconnue)',
+            ovh: 'Sans clé, si le repli anonyme est activé ; 2 RPM par IP et par modèle (cascade de 5 modèles)',
             llm7: 'Sans clé, si le repli anonyme est activé ; quotas à vérifier'
           }
         };
@@ -2174,41 +2178,36 @@ export function buildSkillRegistry(): HermesTool[] {
     },
     {
       name: 'free_install',
-      description: "INSTALLE un fournisseur IA GRATUIT dans le pool (ex: groq-free, openrouter-free, mistral-free, cohere-free, ovh-free, llm7-free). Pour les providers avec clé gratuite, fournissez apiKey (obtenue gratuitement sur leur site). Les anonymes (ovh-free, llm7-free) fonctionnent sans clé et sont déjà actifs en fallback, mais vous pouvez les installer explicitement pour changer le modèle. Confirmation requise si apiKey fournie.",
+      description: "INSTALLE un fournisseur IA GRATUIT dans le pool avec sa cascade de modèles (ex: openrouter-free = gemma-4-31b → gpt-oss-120b → qwen3-next → openrouter/free ; groq-free, mistral-free, cohere-free, ovh-free, llm7-free). Pour les providers avec clé gratuite, fournissez apiKey (obtenue gratuitement sur leur site). Les anonymes (ovh-free, llm7-free) fonctionnent sans clé et sont déjà actifs en repli, mais vous pouvez les installer explicitement pour changer la cascade. Confirmation requise si apiKey fournie.",
       access: 'write',
       parameters: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: 'ID du provider gratuit (ovh-free, llm7-free, groq-free, openrouter-free, mistral-free, cohere-free, huggingface-free, together-free, nvidia-free)' },
+          id: { type: 'string', description: 'ID du provider gratuit (openrouter-free, groq-free, mistral-free, cohere-free, huggingface-free, together-free, nvidia-free, ovh-free, llm7-free)' },
           apiKey: { type: 'string', description: 'Clé API gratuite (si le provider en nécessite une — voir free_catalog pour les URLs)' },
-          model: { type: 'string', description: 'Modèle à utiliser (optionnel, défaut selon provider)' },
+          model: { type: 'string', description: 'Modèle principal (optionnel, défaut : tête de la cascade du catalogue)' },
+          models: { type: 'array', items: { type: 'string' }, description: 'Cascade complète à utiliser (optionnel, défaut : cascade du catalogue)' },
           confirm: { type: 'boolean', description: 'Confirmation si apiKey fournie' }
         },
         required: ['id']
       },
       async run(args) {
-        const { FREE_CATALOG } = await import('./freeProviders');
+        const { FREE_CATALOG, findFreeProvider, catalogSpec } = await import('./freeProviders');
         const { addProvider } = await import('./providers');
         const id = str(args.id, 40).toLowerCase();
-        const info = FREE_CATALOG.find(f => f.id === id);
+        const info = findFreeProvider(id);
         if (!info) throw new Error(`Provider gratuit inconnu : ${id}. Disponibles : ${FREE_CATALOG.map(f => f.id).join(', ')} (voir free_catalog)`);
-        const apiKey = args.apiKey ? str(args.apiKey, 500) : (info.envKey ? (process.env[info.envKey] || '').trim() : undefined);
+        const apiKey = args.apiKey ? str(args.apiKey, 500) : (info.envKey ? (process.env[info.envKey] || '').trim() : '');
         if (info.needsKey && !apiKey) {
           throw new Error(`Ce provider nécessite une clé gratuite. Obtenez-la gratuitement sur ${info.docsUrl} puis relancez avec apiKey. Variable d'env : ${info.envKey}`);
         }
-        const { entry } = await addProvider({
-          name: info.id,
-          kind: 'openai',
-          model: args.model ? str(args.model, 120) : info.model,
-          baseUrl: info.baseUrl,
-          apiKey: apiKey || undefined,
-          priority: info.priority
-        });
+        const models = Array.isArray(args.models) ? args.models.map((m: unknown) => str(m, 120)).filter(Boolean) : undefined;
+        const { entry } = await addProvider(catalogSpec(info, { model: args.model ? str(args.model, 120) : undefined, models, apiKey: apiKey || undefined }));
         return {
           installed: true,
           provider: info.id,
           entry,
-          note: `Provider gratuit ${info.name} installé ! Modèle : ${entry.model} — baseUrl : ${info.baseUrl}. Testez avec providers_test.`
+          note: `Provider gratuit ${info.name} installé. Cascade : ${(entry.models || [entry.model]).join(' → ')} — baseUrl : ${info.baseUrl}. Testez avec providers_test.`
         };
       }
     },

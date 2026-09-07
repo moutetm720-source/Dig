@@ -1881,29 +1881,31 @@ app.post('/api/seo/indexnow-submit', requireAuth, webhookLimiter, async (req, re
       urlList: urlList.slice(0, 100)
     };
 
+    // RÉEL UNIQUEMENT : la réponse reflète l'appel IndexNow effectif. Un échec
+    // réseau ou un refus HTTP n'est jamais présenté comme un succès.
     let indexNowSuccess = false;
-    let statusText = 'Notifié';
-    let statusCode = 200;
-
+    let statusText: string;
+    let statusCode = 0;
     try {
       const indexNowRes = await fetch('https://api.indexnow.org/indexnow', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json; charset=utf-8' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15_000)
       });
       statusCode = indexNowRes.status;
-      indexNowSuccess = indexNowRes.ok || statusCode === 200 || statusCode === 202;
-      statusText = `Réponse IndexNow API: HTTP ${statusCode}`;
+      // IndexNow : 200 = reçu, 202 = reçu, clé à valider ultérieurement.
+      indexNowSuccess = statusCode === 200 || statusCode === 202;
+      statusText = indexNowSuccess ? `Soumission acceptée par IndexNow (HTTP ${statusCode})` : `IndexNow a refusé la soumission (HTTP ${statusCode})`;
     } catch (fetchErr: any) {
-      statusText = `IndexNow local queue synced: ${fetchErr?.message || 'OK'}`;
-      indexNowSuccess = true;
+      statusText = `api.indexnow.org injoignable depuis le serveur : ${fetchErr?.message || 'erreur réseau'}`;
     }
 
-    res.json({
-      success: true,
+    res.status(indexNowSuccess ? 200 : 502).json({
+      success: indexNowSuccess,
       statusCode,
       statusText,
-      urlsSubmittedCount: urlList.length,
+      urlsSubmittedCount: indexNowSuccess ? urlList.length : 0,
       urls: urlList,
       timestamp: new Date().toISOString(),
       sitemapUrl: `${baseUrl}/sitemap.xml`,
@@ -2407,16 +2409,9 @@ app.get('*', (req, res) => {
 
 await ensureSchema();
 
-// Auto-install des providers gratuits détectés dans l'env (Groq, OpenRouter, etc.)
-// Non bloquant : si la DB n'est pas encore prête, on log et on continue.
-try {
-  const { autoInstallFreeProviders } = await import('./hermes/freeProviders');
-  void autoInstallFreeProviders().then(r => {
-    if (r.installed > 0) console.log(`[hermes] Auto-install free providers: ${r.installed} installé(s)`);
-  });
-} catch (e) {
-  console.warn('[hermes] freeProviders auto-install indisponible:', (e as any)?.message);
-}
+// NB : les clés gratuites d'environnement (OPENROUTER_API_KEY, GROQ_API_KEY) ne
+// sont plus recopiées en base au démarrage : hermes/providers.ts → buildPool()
+// les lit directement (l'environnement fait foi, aucune clé dupliquée en KV).
 
 // ---------- Bandeau de démarrage « 100 % RÉEL » ----------
 // Le serveur annonce explicitement s'il dispose d'une IA réelle, d'une
@@ -2427,8 +2422,8 @@ async function logRealModeBanner(): Promise<void> {
     const { buildPool } = await import('./hermes/providers');
     const pool = await buildPool();
     const llm = pool.length > 0
-      ? `IA RÉELLE : ${pool.map(e => `${e.name} (${e.kind})`).join(' → ')}`
-      : 'IA RÉELLE : AUCUNE (configurez GEMINI_API_KEY ou un endpoint compatible OpenAI — le mode mock a été supprimé)';
+      ? `IA RÉELLE : ${pool.map(e => `${e.name} (${e.models.length > 1 ? `cascade ${e.models.join(' → ')}` : e.model})`).join(' ⇒ ')}`
+      : 'IA RÉELLE : AUCUNE (configurez OPENROUTER_API_KEY, un endpoint compatible OpenAI ou GEMINI_API_KEY — le mode mock a été supprimé)';
     const stripeSk = await readStripeSk();
     const realData = (process.env.DIG_REAL_DATA_ONLY || '1').trim() !== '0';
     console.log('============================================================');
