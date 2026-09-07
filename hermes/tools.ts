@@ -2163,7 +2163,7 @@ export function buildSkillRegistry(): HermesTool[] {
           catalog,
           howToActivate: {
             groq: '1) Allez sur https://console.groq.com/keys 2) Créez une clé gratuite (sans CB) 3) Définissez GROQ_API_KEY dans .env ou dites à Hermes \"ajoute Groq au pool avec cette clé\"',
-            openrouter: '1) https://openrouter.ai/keys 2) Créez clé gratuite 3) OPENROUTER_API_KEY — accès aux modèles :free (openai/gpt-oss-20b:free, etc.)',
+            openrouter: '1) https://openrouter.ai/keys 2) Créez clé gratuite 3) OPENROUTER_API_KEY — accès aux modèles :free (google/gemma-4-31b-it:free, etc.) ; le catalogue :free tourne, voir https://openrouter.ai/models?max_price=0&modality=text',
             mistral: 'https://console.mistral.ai/api-keys — free mode $10 crédits/mois',
             gemini: 'https://aistudio.google.com/app/apikey — gratuit, modèle conseillé gemini-3.5-flash-lite',
             ovh: 'Sans clé, si le repli anonyme est activé ; quotas à vérifier',

@@ -526,18 +526,27 @@ export async function buildPool(): Promise<PoolEntry[]> {
         if (!specs.some(s => s.baseUrl === anonymous.baseUrl)) specs.push({ ...anonymous });
       }
     }
-    // Si une clé Groq/OpenRouter est dispo dans l'env, on les ajoute aussi comme gratuits
+    // Si une clé Groq/OpenRouter est dispo dans l'env, la version ENV fait foi :
+    // elle remplace une éventuelle entrée KV périmée (ex. ancien modèle :free
+    // retiré du catalogue → 404 en boucle), y compris l'alias kilo-free.
+    const dropByName = (name: string) => {
+      for (let i = specs.length - 1; i >= 0; i--) if (specs[i].name === name) specs.splice(i, 1);
+    };
     const groqKey = (process.env.GROQ_API_KEY || '').trim();
-    if (groqKey && !specs.some(s => s.name === 'groq-free')) {
+    if (groqKey) {
+      dropByName('groq-free');
       specs.push(specFromEnv('groq-free', 'openai', 'llama-3.1-8b-instant', 100, 'https://api.groq.com/openai/v1', groqKey, false));
     }
     const openRouterKey = (process.env.OPENROUTER_API_KEY || '').trim();
-    if (openRouterKey && !specs.some(s => s.name === 'openrouter-free')) {
-      specs.push(specFromEnv('openrouter-free', 'openai', 'openai/gpt-oss-20b:free', 120, 'https://openrouter.ai/api/v1', openRouterKey, false));
-    }
-    // Compat : ancien nom kilo-free (même endpoint)
-    if (openRouterKey && !specs.some(s => s.name === 'kilo-free') && specs.some(s => s.name === 'openrouter-free')) {
-      // ne duplique pas, openrouter-free suffit
+    if (openRouterKey) {
+      // Modèle :free par défaut = google/gemma-4-31b-it:free (function calling natif,
+      // vivant en 2026). L'ancien défaut openai/gpt-oss-20b:free a été retiré du
+      // catalogue OpenRouter (404) → échec systématique. Surcharge possible via
+      // HERMES_OPENROUTER_FREE_MODEL (doit rester un modèle suffixé :free).
+      const orModel = (process.env.HERMES_OPENROUTER_FREE_MODEL || '').trim() || 'google/gemma-4-31b-it:free';
+      dropByName('openrouter-free');
+      dropByName('kilo-free');
+      specs.push(specFromEnv('openrouter-free', 'openai', orModel, 120, 'https://openrouter.ai/api/v1', openRouterKey, false));
     }
   }
   // Si le pool reste vide (aucun env, aucun KV), on garde quand même les anonymes gratuits en dernier recours
