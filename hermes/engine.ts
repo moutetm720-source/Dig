@@ -192,6 +192,7 @@ export async function runAgentChat(opts: RunAgentOptions): Promise<HermesChatRes
   let finalText = '';
   let outcome: HermesOutcome = 'completed';
   let active: PoolEntry | null = null;
+  let activeModel = '';
   const usage = { inputTokens: 0, outputTokens: 0 };
   const budget = depth ? Math.min(agent.maxSteps || HERMES_LIMITS.SUB_AGENT_STEPS, HERMES_LIMITS.SUB_AGENT_STEPS) : HERMES_LIMITS.MAX_STEPS;
   try {
@@ -216,7 +217,6 @@ export async function runAgentChat(opts: RunAgentOptions): Promise<HermesChatRes
         ctx.signal?.throwIfAborted();
         if (runtime.haltReason || runtime.llmCalls >= HERMES_LIMITS.MAX_LLM_CALLS) break;
         runtime.llmCalls++;
-        let out: LLMChatResult;
         // Dernier pas réservé à la synthèse, sans relancer d'actions.
         const summarize = i === budget - 1 || runtime.toolCalls >= HERMES_LIMITS.MAX_TOOL_CALLS;
         const fo = await chatWithFailover({
@@ -224,8 +224,9 @@ export async function runAgentChat(opts: RunAgentOptions): Promise<HermesChatRes
           events, tools: summarize ? [] : tools, freeOnly, signal: ctx.signal,
           onProviderEvent: message => emit(ctx, { type: 'status', message, agentId: agent.id })
         });
-        out = fo.result;
+        const out: LLMChatResult = fo.result;
         active = fo.entry;
+        activeModel = out.model || fo.entry.provider.effectiveModel || fo.entry.model;
         usage.inputTokens += out.usage?.inputTokens || 0;
         usage.outputTokens += out.usage?.outputTokens || 0;
         if (out.toolCalls?.length && !summarize) {
@@ -278,9 +279,8 @@ export async function runAgentChat(opts: RunAgentOptions): Promise<HermesChatRes
     }
   }
   if (!depth) await pushMemory(agent.id, opts.prompt, steps(), finalText);
-  const effectiveModel = (active?.provider as any)?.effectiveModel;
   return {
-    response: finalText, provider: active?.name || 'aucun', model: effectiveModel || active?.model || '-', agent: agent.id,
+    response: finalText, provider: active?.name || 'aucun', model: activeModel || active?.model || '-', agent: agent.id,
     steps: steps(), outcome, usage,
     pendingConfirmation: runtime.confirmations[0], pendingConfirmations: [...runtime.confirmations], question: runtime.question
   };

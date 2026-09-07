@@ -40,7 +40,7 @@ const EVENTS_PAGE_SIZE = 10;
 export const TrafficAcquisitionView: React.FC = () => {
   const [trafficState, setTrafficState] = useState<TrafficEngineState>(trafficEngine.getState());
   const [isPinging, setIsPinging] = useState<boolean>(false);
-  const [pingSuccessMsg, setPingSuccessMsg] = useState<string | null>(null);
+  const [pingResult, setPingResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [selectedChannelFilter, setSelectedChannelFilter] = useState<string>('all');
   const [visitorSearch, setVisitorSearch] = useState<string>('');
   const [visitorPage, setVisitorPage] = useState<number>(1);
@@ -75,12 +75,12 @@ export const TrafficAcquisitionView: React.FC = () => {
     setIsPinging(true);
     try {
       const res = await trafficEngine.pingSearchEngines();
-      setPingSuccessMsg(res.message || "Sitemap dynamique et IndexNow pingés avec succès ! Crawlers Googlebot, Bing & IA notifiés.");
+      setPingResult({ ok: res.success, message: res.message });
     } catch (e: any) {
-      setPingSuccessMsg("Notification transmise à la file d'indexation.");
+      setPingResult({ ok: false, message: `IndexNow : échec (${e?.message || 'erreur inconnue'}).` });
     } finally {
       setIsPinging(false);
-      setTimeout(() => setPingSuccessMsg(null), 6000);
+      setTimeout(() => setPingResult(null), 8000);
     }
   };
 
@@ -235,11 +235,13 @@ export const TrafficAcquisitionView: React.FC = () => {
         </div>
       </div>
 
-      {/* Ping Notification Banner */}
-      {pingSuccessMsg && (
-        <div className="bg-emerald-950/80 border border-emerald-500/30 p-4 rounded-xl text-emerald-200 text-xs font-semibold flex items-center gap-3 animate-fade-in">
-          <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
-          <span>{pingSuccessMsg}</span>
+      {/* Ping Notification Banner — reflète le résultat réel de la soumission IndexNow */}
+      {pingResult && (
+        <div className={`${pingResult.ok ? 'bg-emerald-950/80 border-emerald-500/30 text-emerald-200' : 'bg-amber-950/80 border-amber-500/30 text-amber-200'} border p-4 rounded-xl text-xs font-semibold flex items-center gap-3 animate-fade-in`}>
+          {pingResult.ok
+            ? <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+            : <AlertCircle className="w-5 h-5 text-amber-400 shrink-0" />}
+          <span>{pingResult.message}</span>
         </div>
       )}
 

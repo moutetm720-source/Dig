@@ -21,6 +21,10 @@
  *   4. OpenAICompatProvider : la clé apiKey DU POOL est bien envoyée
  *      (régression : seule HERMES_OPENAI_API_KEY était lue → 401 Groq/OpenRouter).
  *   5. OpenAICompatProvider : parsing des tool_calls (function calling).
+ *   6. CASCADE DE MODÈLES intra-fournisseur (OpenRouter :free) : 404 « No
+ *      endpoints found » / 429 / 5xx / réponse vide → modèle suivant DANS LE
+ *      MÊME APPEL ; cooldown par modèle ; 401 et limite journalière de clé →
+ *      arrêt immédiat ; modèle réellement servi (routeur openrouter/free) exposé.
  */
 import http from 'node:http';
 import assert from 'node:assert';
@@ -31,8 +35,9 @@ delete process.env.HERMES_OPENAI_API_KEY;
 delete process.env.HERMES_GEMINI_MODEL;
 delete process.env.HERMES_OPENAI_BASE_URL;
 
-const { GeminiProvider, OpenAICompatProvider, GEMINI_MODEL_FALLBACKS, geminiModelChain } = await import('../hermes/providers.js');
-const { DEFAULT_HERMES_CONFIG } = await import('../hermes/types.js');
+const { GeminiProvider, OpenAICompatProvider, GEMINI_MODEL_FALLBACKS, geminiModelChain, openRouterFreeCascade, classifyFailure, modelCooldownRemainingMs, clearModelCooldowns } = await import('../hermes/providers.js');
+const { DEFAULT_HERMES_CONFIG, OPENROUTER_FREE_CASCADE, HERMES_POOL } = await import('../hermes/types.js');
+const { providerCostPolicy } = await import('../hermes/providerPolicy.js');
 
 let passed = 0, failed = 0;
 const ok = (name) => { passed++; console.log(`  ✅ ${name}`); };
@@ -77,11 +82,22 @@ const geminiStub = http.createServer((req, res) => {
 // ---- Stub OpenAI-compatible ----
 let openaiAuthHeader = null;
 let openaiResponse = null;
+const openaiHits = [];          // modèles demandés (body.model), dans l'ordre
+let openaiByModel = null;       // (model) => { status, headers?, body } | null  → scénario de cascade
 const openaiStub = http.createServer((req, res) => {
   openaiAuthHeader = req.headers['authorization'] || null;
   let body = '';
   req.on('data', c => { body += c; });
   req.on('end', () => {
+    let parsed = {};
+    try { parsed = body ? JSON.parse(body) : {}; } catch { /* corps vide */ }
+    openaiHits.push(parsed.model);
+    const scripted = openaiByModel ? openaiByModel(parsed.model, parsed) : null;
+    if (scripted) {
+      res.writeHead(scripted.status, { 'content-type': 'application/json', ...(scripted.headers || {}) });
+      res.end(JSON.stringify(scripted.body));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(openaiResponse || {
       choices: [{
@@ -222,6 +238,141 @@ await test('OpenAI : JSON de tool-call invalide refusé, pas d’exécution avec
   await assert.rejects(() => new OpenAICompatProvider(`http://127.0.0.1:${openaiPort}/v1`, 'test', '').chat({ system: 's', events: EVENTS, tools: TOOLS }), /JSON invalides/);
   openaiResponse = null;
 });
+
+// ---- Cascade de modèles gratuits (OpenRouter :free) ----
+const OR = `http://127.0.0.1:${openaiPort}/api/v1`;
+const [M1, M2, M3, M4] = OPENROUTER_FREE_CASCADE;
+const textOf = (model, servedAs) => ({ status: 200, body: { model: servedAs || model, choices: [{ message: { content: `réponse-de-${servedAs || model}` } }], usage: { prompt_tokens: 3, completion_tokens: 2 } } });
+const gone404 = { status: 404, body: { error: { code: 404, message: 'No endpoints found for this model.' } } };
+const rate429 = { status: 429, headers: { 'retry-after': '7' }, body: { error: { code: 429, message: 'Rate limit exceeded: free-models-per-min.' } } };
+const down502 = { status: 502, body: { error: { code: 502, message: 'Provider returned error' } } };
+
+await test('cascade : ordre par défaut gemma-4-31b → gpt-oss-120b → qwen3-next → openrouter/free (tous :free)', () => {
+  assert.deepEqual(OPENROUTER_FREE_CASCADE, ['google/gemma-4-31b-it:free', 'openai/gpt-oss-120b:free', 'qwen/qwen3-next-80b-a3b-instruct:free', 'openrouter/free']);
+  assert.deepEqual(openRouterFreeCascade({}), OPENROUTER_FREE_CASCADE, 'sans variable d\'env : la cascade par défaut, dans cet ordre');
+  const p = new OpenAICompatProvider(OR, M1, 'sk-or-test', OPENROUTER_FREE_CASCADE.slice(1));
+  assert.deepEqual(p.models, OPENROUTER_FREE_CASCADE, 'le provider expose la cascade complète, dédupliquée');
+  assert.ok(p.label.includes('cascade'));
+  assert.ok(HERMES_POOL.MAX_MODEL_CASCADE >= 4);
+});
+
+await test('cascade : surcharge HERMES_OPENROUTER_FREE_MODELS (CSV) et refus silencieux des modèles payants', () => {
+  const custom = openRouterFreeCascade({ HERMES_OPENROUTER_FREE_MODELS: ' nvidia/nemotron-3-super-120b-a12b:free, openai/gpt-4o ,openrouter/free ' });
+  assert.deepEqual(custom, ['nvidia/nemotron-3-super-120b-a12b:free', 'openrouter/free'], 'gpt-4o (payant) écarté, ordre conservé, espaces tolérés');
+  const legacy = openRouterFreeCascade({ HERMES_OPENROUTER_FREE_MODEL: 'openrouter/free' });
+  assert.equal(legacy[0], 'openrouter/free', 'variable historique = tête de cascade');
+  assert.equal(new Set(legacy).size, legacy.length, 'aucun doublon');
+  assert.deepEqual(openRouterFreeCascade({ HERMES_OPENROUTER_FREE_MODELS: 'openai/gpt-4o' }), OPENROUTER_FREE_CASCADE, 'liste 100 % payante → retour au défaut gratuit');
+});
+
+await test('cascade : politique sans API payante — éligible seulement si TOUS les modèles sont :free', () => {
+  const free = providerCostPolicy({ name: 'openrouter-free', kind: 'openai', baseUrl: 'https://openrouter.ai/api/v1', model: M1, models: OPENROUTER_FREE_CASCADE, hasKey: true });
+  assert.equal(free.eligible, true, free.label);
+  assert.match(free.label, /4 modèles/);
+  const mixed = providerCostPolicy({ name: 'openrouter-mixed', kind: 'openai', baseUrl: 'https://openrouter.ai/api/v1', model: M1, models: [M1, 'openai/gpt-4o'], hasKey: true });
+  assert.equal(mixed.eligible, false, 'un seul modèle payant dans la cascade → bloqué');
+});
+
+await test('cascade : 404 « No endpoints found » puis 429 → 3e modèle répond DANS LE MÊME APPEL', async () => {
+  clearModelCooldowns();
+  openaiHits.length = 0;
+  const events = [];
+  openaiByModel = (model) => model === M1 ? gone404 : model === M2 ? rate429 : textOf(model);
+  const p = new OpenAICompatProvider(OR, M1, 'sk-or-test', OPENROUTER_FREE_CASCADE.slice(1));
+  const r = await p.chat({ system: 's', events: EVENTS, tools: TOOLS, onProviderEvent: (m) => events.push(m) });
+  assert.equal(r.text, `réponse-de-${M3}`);
+  assert.equal(r.model, M3, 'le modèle qui a réellement répondu est exposé');
+  assert.equal(p.effectiveModel, M3);
+  assert.deepEqual(openaiHits, [M1, M2, M3], 'un seul appel HTTP par modèle, dans l\'ordre, arrêt dès le premier succès');
+  assert.equal(events.filter(e => /Modèle suivant de la cascade/.test(e)).length, 2, 'l\'utilisateur voit chaque bascule');
+  assert.ok(modelCooldownRemainingMs(OR, M1) > 9 * 60 * 1000, '404 catalogue → cooldown long (10 min) sur CE modèle seulement');
+  const cd2 = modelCooldownRemainingMs(OR, M2);
+  assert.ok(cd2 > 5000 && cd2 <= 7000, `429 avec retry-after 7 s → cooldown 7 s (obtenu ${cd2} ms)`);
+  assert.equal(modelCooldownRemainingMs(OR, M3), 0, 'le modèle qui a répondu n\'est pas pénalisé');
+  assert.equal(classifyFailure('Fournisseur OpenAI-compatible (x) : HTTP 404 {"error":{"message":"No endpoints found"}}'), 'model_gone');
+});
+
+await test('cascade : 2e appel — les modèles en cooldown passent en fin de file (zéro requête gaspillée)', async () => {
+  openaiHits.length = 0;
+  const p = new OpenAICompatProvider(OR, M1, 'sk-or-test', OPENROUTER_FREE_CASCADE.slice(1));
+  const r = await p.chat({ system: 's', events: EVENTS, tools: [] });
+  assert.equal(r.model, M3);
+  assert.deepEqual(openaiHits, [M3], 'M1/M2 en cooldown → M3 directement, un seul appel HTTP');
+});
+
+await test('cascade : cooldown mémorisé PAR endpoint — un autre baseUrl repart de zéro', async () => {
+  openaiHits.length = 0;
+  const other = new OpenAICompatProvider(`http://127.0.0.1:${openaiPort}/autre/v1`, M1, 'k', [M3]);
+  openaiByModel = (model) => textOf(model);
+  const r = await other.chat({ system: 's', events: EVENTS, tools: [] });
+  assert.equal(r.model, M1);
+  assert.deepEqual(openaiHits, [M1]);
+});
+
+await test('cascade : réponse vide d\'un modèle gratuit → modèle suivant, sans cooldown', async () => {
+  clearModelCooldowns();
+  openaiHits.length = 0;
+  openaiByModel = (model) => model === M1 ? { status: 200, body: { model, choices: [{ message: { content: '' } }] } } : textOf(model);
+  const r = await new OpenAICompatProvider(OR, M1, 'k', [M2]).chat({ system: 's', events: EVENTS, tools: TOOLS });
+  assert.equal(r.model, M2);
+  assert.deepEqual(openaiHits, [M1, M2]);
+  assert.equal(modelCooldownRemainingMs(OR, M1), 0, 'une réponse vide n\'est pas une panne');
+});
+
+await test('cascade : 5xx → suivant ; tous en échec → erreur agrégée listant chaque modèle (jamais de faux succès)', async () => {
+  clearModelCooldowns();
+  openaiHits.length = 0;
+  openaiByModel = (model) => model === M1 ? down502 : model === M2 ? gone404 : rate429;
+  await assert.rejects(
+    () => new OpenAICompatProvider(OR, M1, 'k', OPENROUTER_FREE_CASCADE.slice(1)).chat({ system: 's', events: EVENTS, tools: [] }),
+    (e) => {
+      assert.match(e.message, /Cascade épuisée/);
+      for (const m of OPENROUTER_FREE_CASCADE) assert.ok(e.message.includes(m), `modèle ${m} cité dans l'erreur`);
+      assert.match(e.message, /502/); assert.match(e.message, /No endpoints found/); assert.match(e.message, /429/);
+      return true;
+    });
+  assert.deepEqual(openaiHits, OPENROUTER_FREE_CASCADE, 'les 4 modèles ont été essayés une fois chacun');
+  assert.ok(modelCooldownRemainingMs(OR, M1) > 0 && modelCooldownRemainingMs(OR, M1) <= HERMES_POOL.COOLDOWN_ERROR_MS, '5xx → cooldown court');
+});
+
+await test('cascade : 401 (clé invalide) → arrêt immédiat, aucun autre modèle essayé', async () => {
+  clearModelCooldowns();
+  openaiHits.length = 0;
+  openaiByModel = () => ({ status: 401, body: { error: { code: 401, message: 'No auth credentials found' } } });
+  await assert.rejects(() => new OpenAICompatProvider(OR, M1, 'mauvaise-cle', OPENROUTER_FREE_CASCADE.slice(1)).chat({ system: 's', events: EVENTS, tools: [] }), /HTTP 401/);
+  assert.deepEqual(openaiHits, [M1], 'changer de modèle ne corrige pas une clé : un seul appel');
+  assert.equal(classifyFailure('HTTP 401 No auth credentials found'), 'fatal');
+});
+
+await test('cascade : limite JOURNALIÈRE de la clé (free-models-per-day) → arrêt immédiat, fournisseur suivant', async () => {
+  clearModelCooldowns();
+  openaiHits.length = 0;
+  openaiByModel = () => ({ status: 429, body: { error: { code: 429, message: 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day' } } });
+  await assert.rejects(() => new OpenAICompatProvider(OR, M1, 'k', OPENROUTER_FREE_CASCADE.slice(1)).chat({ system: 's', events: EVENTS, tools: [] }), /per-day/);
+  assert.deepEqual(openaiHits, [M1], 'la limite frappe toute la clé : inutile d\'essayer les 3 autres modèles');
+});
+
+await test('cascade : le routeur openrouter/free renvoie le modèle réellement servi (vérité du routeur)', async () => {
+  clearModelCooldowns();
+  openaiHits.length = 0;
+  openaiByModel = (model) => model === 'openrouter/free' ? textOf(model, 'meta-llama/llama-3.3-70b-instruct:free') : gone404;
+  const p = new OpenAICompatProvider(OR, M1, 'k', OPENROUTER_FREE_CASCADE.slice(1));
+  const r = await p.chat({ system: 's', events: EVENTS, tools: TOOLS });
+  assert.equal(r.model, 'meta-llama/llama-3.3-70b-instruct:free', 'affiché tel quel, pas le slug demandé');
+  assert.deepEqual(openaiHits, OPENROUTER_FREE_CASCADE);
+});
+
+await test('cascade : annulation utilisateur → arrêt net, pas de modèle suivant', async () => {
+  clearModelCooldowns();
+  openaiHits.length = 0;
+  const ac = new AbortController();
+  openaiByModel = () => { ac.abort(); return gone404; };
+  await assert.rejects(() => new OpenAICompatProvider(OR, M1, 'k', OPENROUTER_FREE_CASCADE.slice(1)).chat({ system: 's', events: EVENTS, tools: [], signal: ac.signal }));
+  assert.equal(openaiHits.length, 1, 'aucune requête après l\'annulation');
+});
+
+openaiByModel = null;
+clearModelCooldowns();
 
 // ---- Bilan ----
 geminiStub.close(); openaiStub.close();

@@ -217,6 +217,35 @@ test('gratuit : un fournisseur inconnu prioritaire n’est jamais appelé, même
   await tools.kvSet('df_hermes_provider_pool', []);
 });
 
+test('cascade : 404 → 429 → 3e modèle répond dans le MÊME appel ; cascade épuisée → fournisseur suivant', async () => {
+  process.env.HERMES_PROVIDER = 'auto';
+  providers.clearModelCooldowns();
+  const port = fixtureServer.address().port;
+  // Fournisseur local prioritaire avec une cascade de 3 modèles (loopback → éligible en mode gratuit).
+  await tools.kvSet('df_hermes_provider_pool', [{ name: 'cascade-test', kind: 'openai', baseUrl: `http://127.0.0.1:${port}/cascade`, model: 'c-un', fallbackModels: ['c-deux', 'c-trois'], local: true, priority: 1 }]);
+  const fail = (status, message) => (_body, res) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { code: status, message } })); return null; };
+  // 1) c-un : 404 catalogue, c-deux : 429, c-trois : répond → un seul tour de chat, provider cascade-test, modèle c-trois.
+  replies = [fail(404, 'No endpoints found for this model.'), fail(429, 'Rate limit exceeded: free-models-per-min.'), text('Réponse via le 3e modèle TEST.')];
+  let { data } = await chat('TEST cascade');
+  assert.equal(data.outcome, 'completed'); assert.equal(data.provider, 'cascade-test'); assert.equal(data.model, 'c-trois');
+  assert.deepEqual(calls.map(c => c.model), ['c-un', 'c-deux', 'c-trois']);
+  // 2) Appel suivant : c-un/c-deux en cooldown → c-trois directement (zéro requête gaspillée).
+  calls = []; replies = [text('Direct 3e modèle TEST.')];
+  ({ data } = await chat('TEST cascade 2'));
+  assert.equal(data.model, 'c-trois'); assert.deepEqual(calls.map(c => c.model), ['c-trois']);
+  // 3) Cascade entièrement épuisée (c-trois en 502) → bascule vers le fournisseur suivant (openai-env) dans le même appel.
+  calls = []; replies = [fail(502, 'Provider returned error'), fail(404, 'No endpoints found'), fail(429, 'Rate limit'), text('Repli fournisseur env TEST.')];
+  ({ data } = await chat('TEST cascade 3'));
+  assert.equal(data.outcome, 'completed'); assert.equal(data.provider, 'openai-env'); assert.equal(data.model, 'transport-test-local');
+  assert.deepEqual(calls.map(c => c.model), ['c-trois', 'c-un', 'c-deux', 'transport-test-local'], 'modèles en cooldown retentés en dernier, puis fournisseur suivant');
+  const status = await (await fetch(`${base}/providers`, { headers: { Authorization: 'Bearer test-A' } })).json();
+  const entry = status.pool.find(p => p.name === 'cascade-test');
+  assert.deepEqual(entry.models, ['c-un', 'c-deux', 'c-trois']);
+  assert.equal(entry.cascade.filter(c => c.inCooldown).length, 3, 'l\'état par modèle est exposé, sans faux « disponible »');
+  await tools.kvSet('df_hermes_provider_pool', []);
+  providers.clearModelCooldowns();
+});
+
 test('délégation : pas de récursion vers l’orchestrateur', async () => {
   replies = [tool('dispatch_agent', { agentId: 'orchestrator', task: 'TEST récursion' }), text()];
   const { data } = await chat(); assert.equal(data.steps[0].status, 'error'); assert.equal(calls.length, 2);

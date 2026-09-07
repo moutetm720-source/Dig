@@ -31,7 +31,10 @@ export function HermesBudgetPanel() {
     <div className="space-y-2">
       {(state.serverStatus?.providerPool || []).map(p => <div key={p.name} className="rounded-lg border border-slate-800 p-3">
         <div className="mb-1 flex items-center justify-between gap-2"><span className="font-medium text-slate-300">{p.name}</span><span className={`text-[10px] ${p.costPolicy.eligible ? 'text-emerald-400' : 'text-amber-400'}`}>{p.costPolicy.eligible ? 'Autorisé' : 'Bloqué'}</span></div>
-        <p className="break-all text-[10px] text-slate-500">{p.model}</p><p className="mt-1 text-[10px] leading-5 text-slate-500">{p.costPolicy.label}</p>
+        {(p.models?.length || 0) > 1
+          ? <ol className="space-y-0.5 text-[10px] text-slate-500">{p.models!.map((m, i) => <li key={m} className="break-all"><span className="text-slate-600">{i + 1}.</span> {m}{i === 0 ? '' : ' (repli automatique, même appel)'}</li>)}</ol>
+          : <p className="break-all text-[10px] text-slate-500">{p.model}</p>}
+        <p className="mt-1 text-[10px] leading-5 text-slate-500">{p.costPolicy.label}</p>
       </div>)}
     </div>
     <p className="text-[11px] leading-6 text-slate-500">Les offres gratuites ont des quotas et peuvent être indisponibles. L’hébergement, les ressources d’un modèle local et les frais d’encaissement éventuels sont distincts. Aucun revenu n’est garanti.</p>

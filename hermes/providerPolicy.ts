@@ -3,6 +3,8 @@ export interface ProviderCostInfo {
   kind: 'gemini' | 'openai';
   baseUrl?: string;
   model: string;
+  /** Cascade complète (model + replis). Si absente, seul `model` est évalué. */
+  models?: string[];
   local?: boolean;
   hasKey?: boolean;
 }
@@ -20,20 +22,40 @@ export function isLoopbackUrl(value: string): boolean {
   } catch { return false; }
 }
 
+/** Un modèle OpenRouter est gratuit s'il est suffixé `:free` ou s'il s'agit du routeur gratuit. */
+export function isOpenRouterFreeModel(model: string): boolean {
+  const m = String(model || '').trim();
+  return m.endsWith(':free') || m === 'openrouter/free';
+}
+
+/** Endpoints anonymes connus (sans clé) — la SEULE liste faisant foi pour la politique de coût. */
+export const ANONYMOUS_FREE_BASE_URLS: readonly string[] = [
+  'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1',
+  'https://api.llm7.io/v1'
+];
+
+/**
+ * Éligibilité au mode « sans API payante ». TOUS les modèles de la cascade
+ * doivent être gratuits : un seul modèle payant glissé dans la liste bloque
+ * l'entrée entière (aucun repli payant possible au sein d'un appel).
+ */
 export function providerCostPolicy(p: ProviderCostInfo): { eligible: boolean; label: string } {
-  if (p.kind === 'openai' && p.local && isLoopbackUrl(p.baseUrl || '') && !/:cloud\b/i.test(p.model)) {
+  const models = [...new Set([p.model, ...(p.models || [])].map(m => String(m || '').trim()).filter(Boolean))];
+  if (p.kind === 'openai' && p.local && isLoopbackUrl(p.baseUrl || '') && !models.some(m => /:cloud\b/i.test(m))) {
     return { eligible: true, label: 'Endpoint local — ressources serveur à votre charge, modèle local requis' };
   }
   try {
     const u = new URL(p.baseUrl || '');
     if (p.kind === 'openai' && u.protocol === 'https:' && !u.username && !u.password && !u.port && !u.search && !u.hash) {
-      if (u.hostname === 'openrouter.ai' && u.pathname.replace(/\/$/, '') === '/api/v1' && (p.model.endsWith(':free') || p.model === 'openrouter/free')) {
-        return { eligible: true, label: 'Modèle :free — quota gratuit du fournisseur, sans repli payant' };
+      if (u.hostname === 'openrouter.ai' && u.pathname.replace(/\/$/, '') === '/api/v1' && models.length > 0 && models.every(isOpenRouterFreeModel)) {
+        return {
+          eligible: true,
+          label: models.length > 1
+            ? `Cascade de ${models.length} modèles :free — quota gratuit du fournisseur, sans repli payant`
+            : 'Modèle :free — quota gratuit du fournisseur, sans repli payant'
+        };
       }
-      if (!p.hasKey && [
-        'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1',
-        'https://api.llm7.io/v1'
-      ].includes(u.href.replace(/\/$/, ''))) {
+      if (!p.hasKey && ANONYMOUS_FREE_BASE_URLS.includes(u.href.replace(/\/$/, ''))) {
         return { eligible: true, label: 'Endpoint sans clé — disponibilité et quotas non garantis' };
       }
     }
