@@ -533,7 +533,12 @@ export async function buildPool(): Promise<PoolEntry[]> {
     }
     const openRouterKey = (process.env.OPENROUTER_API_KEY || '').trim();
     if (openRouterKey && !specs.some(s => s.name === 'openrouter-free')) {
-      specs.push(specFromEnv('openrouter-free', 'openai', 'openai/gpt-oss-20b:free', 120, 'https://openrouter.ai/api/v1', openRouterKey, false));
+      // Modèle :free par défaut = google/gemma-4-31b-it:free (function calling natif,
+      // vivant en 2026). L'ancien défaut openai/gpt-oss-20b:free a été retiré du
+      // catalogue OpenRouter (404) → échec systématique. Surcharge possible via
+      // HERMES_OPENROUTER_FREE_MODEL (doit rester un modèle suffixé :free).
+      const orModel = (process.env.HERMES_OPENROUTER_FREE_MODEL || '').trim() || 'google/gemma-4-31b-it:free';
+      specs.push(specFromEnv('openrouter-free', 'openai', orModel, 120, 'https://openrouter.ai/api/v1', openRouterKey, false));
     }
     // Compat : ancien nom kilo-free (même endpoint)
     if (openRouterKey && !specs.some(s => s.name === 'kilo-free') && specs.some(s => s.name === 'openrouter-free')) {
